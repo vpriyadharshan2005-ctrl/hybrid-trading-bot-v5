@@ -1,0 +1,49 @@
+# ══════════════════════════════════════════
+# HYBRID TRADING BOT v5.0 — GITIGNORE
+# ══════════════════════════════════════════
+
+# Environment variables — NEVER commit real credentials!
+.env
+.env.local
+.env.*.local
+.env.production
+
+# Dependencies — install locally with npm install
+node_modules/
+package-lock.json
+yarn.lock
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE and editor config
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+
+# Build directories
+dist/
+build/
+.next/
+out/
+
+# Misc
+.cache/
+*.tmp

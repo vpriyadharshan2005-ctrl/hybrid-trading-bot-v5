@@ -1,0 +1,31 @@
+{
+  "name": "hybrid-trading-bot-v5",
+  "version": "5.0.0",
+  "description": "Professional Hybrid Trading Bot v5.0 — Delta Exchange + Finnhub + Dhan API. 38 Strategies, 14 Symbols, REST + WebSocket, Every 5 Minutes",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [
+    "trading", "bot", "finnhub", "delta-exchange", "dhan",
+    "forex", "crypto", "nifty", "banknifty", "websocket",
+    "signals", "technical-analysis", "india"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "node-cron": "^3.0.2",
+    "moment-timezone": "^0.5.45",
+    "dotenv": "^16.3.1",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
