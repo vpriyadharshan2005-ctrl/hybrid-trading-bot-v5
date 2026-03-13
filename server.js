@@ -1,5 +1,5 @@
 // ============================================================
-// HYBRID TRADING BOT v6.0 — REAL SIGNAL ENGINE
+// HYBRID TRADING BOT v8.2 — PRECISION SIGNAL ENGINE
 // ============================================================
 // Every strategy now has GENUINE condition detection on live
 // candle data. A signal only fires when ALL conditions of that
@@ -48,7 +48,7 @@ const CONFIG = {
   DHAN_ACCESS_TOKEN: process.env.DHAN_ACCESS_TOKEN || 'placeholder',
   DHAN_REST:         'https://api.dhan.co',
 
-  SIGNAL_QUALITY_MIN:  65,   // minimum confluence score to fire signal
+  SIGNAL_QUALITY_MIN:  75,   // minimum confluence score to fire signal
   ANALYSIS_INTERVAL:   '*/5 * * * *',
   MAX_SIGNALS_STORED:  200,
   CANDLE_LIMIT:        100,
@@ -245,8 +245,48 @@ class Indicators {
     if (change < -0.002) return { trend: 'BEARISH', strength: Math.abs(change) };
     return { trend: 'NEUTRAL', strength: 0 };
   }
+
+  // ── #2 Closed-candle confirmation ──────────────────────────
+  // Returns candles with the LAST candle removed (it may still be open).
+  // Strategy detectors should call this so they only read confirmed closes.
+  static confirmedCandles(candles) {
+    if (candles.length < 3) return candles;
+    // Check if last candle is likely still open by comparing its timestamp
+    // to the expected interval. If within 4.5 min of now, drop it.
+    const last = candles[candles.length - 1];
+    const prev = candles[candles.length - 2];
+    const interval = last.time - prev.time; // ms between candles
+    const ageMs    = Date.now() - last.time;
+    // Drop current candle if it hasn't lived at least 80% of its interval
+    if (ageMs < interval * 0.8) return candles.slice(0, -1);
+    return candles;
+  }
+
+  // ── #3 Forex tick-volume proxy ──────────────────────────────
+  // TwelveData free tier gives no real volume for forex.
+  // We approximate activity using candle body+wick range (volatility proxy).
+  // A wide-range candle = high market activity. Scales to 0-100.
+  static forexVolumeProxy(candles, lookback = 20) {
+    if (candles.length < lookback) return { spike: false, ratio: 1, proxy: true };
+    const ranges  = candles.map(c => c.high - c.low);
+    const recent  = ranges.slice(-lookback, -1);
+    const avgRange = recent.reduce((a, b) => a + b, 0) / recent.length;
+    const curRange = ranges[ranges.length - 1];
+    const ratio    = avgRange > 0 ? curRange / avgRange : 1;
+    return { spike: ratio > 1.4, ratio: parseFloat(ratio.toFixed(2)), proxy: true };
+  }
+
+  // ── Smart volume: real vol for crypto, proxy for forex ─────
+  static smartVolume(candles, category = 'forex') {
+    const volumes = candles.map(c => c.volume || 0);
+    const hasReal = volumes.some(v => v > 1);
+    if (hasReal && category === 'crypto') return this.volumeAnalysis(volumes);
+    return this.forexVolumeProxy(candles);
+  }
 }
 
+
+// SessionFilter is defined later in Section 5 (full version)
 
 // ============================================================
 // ── MTF CONTEXT ANALYZER ────────────────────────────────────
@@ -1584,7 +1624,7 @@ class StrategyDetectors {
   // When present, MTF-aware strategies use real H1/H4 data.
   // MTF bias also gates which direction signals are allowed.
   // ────────────────────────────────────────────────────────────
-  static runAll(candles, h1Candles = null, h4Candles = null) {
+  static runAll(candles, h1Candles = null, h4Candles = null, category = 'forex') {
     // Build MTF context if HTF data available
     const mtfCtx = MTFContext.analyze(candles, h1Candles, h4Candles);
 
@@ -1637,12 +1677,15 @@ class StrategyDetectors {
         const result = fn();
         if (!result) continue;
 
-        // MTF GATE: if strong bias exists, filter out counter-trend signals
-        // Only block if we have REAL HTF data (not proxy) and alignment is full
+        // MTF GATE: block counter-trend signals when real HTF data confirms direction
         if (mtfCtx.isRealMTF) {
           if (mtfCtx.alignment === 'FULL_BULL' && result.direction === 'SELL') continue;
           if (mtfCtx.alignment === 'FULL_BEAR' && result.direction === 'BUY')  continue;
         }
+
+        // #5 SESSION GATE: block strategies outside their valid session
+        const sf = SessionFilter.check(result.id, category);
+        if (!sf.allowed) continue;
 
         fired.push(result);
       } catch (e) { /* skip failed detector */ }
@@ -1651,6 +1694,9 @@ class StrategyDetectors {
   }
 }
 
+
+
+
 // ============================================================
 // ── SECTION 3: SIGNAL BUILDER ────────────────────────────────
 // Takes fired strategies, picks the highest-scoring one that
@@ -1658,23 +1704,216 @@ class StrategyDetectors {
 // ============================================================
 class SignalBuilder {
 
-  static calculateLevels(direction, price, atr) {
-    const risk = atr || price * 0.01;
-    return direction === 'BUY' ? {
-      entry: parseFloat(price.toFixed(6)),
-      sl:    parseFloat((price - risk * 1.5).toFixed(6)),
-      tp1:   parseFloat((price + risk).toFixed(6)),
-      tp2:   parseFloat((price + risk * 2).toFixed(6)),
-      tp3:   parseFloat((price + risk * 3).toFixed(6)),
-      riskReward: '1:2',
-    } : {
-      entry: parseFloat(price.toFixed(6)),
-      sl:    parseFloat((price + risk * 1.5).toFixed(6)),
-      tp1:   parseFloat((price - risk).toFixed(6)),
-      tp2:   parseFloat((price - risk * 2).toFixed(6)),
-      tp3:   parseFloat((price - risk * 3).toFixed(6)),
-      riskReward: '1:2',
+  // ── #1 STRUCTURE-BASED LEVELS ───────────────────────────────
+  // Every strategy returns its own structural entry, SL, TP.
+  // Entry  = precise zone based on pattern geometry
+  // SL     = structural invalidation point (not ATR multiple)
+  // TP1    = nearest opposing swing
+  // TP2    = H1 swing / next major zone
+  // TP3    = 3× risk extension (institutional target)
+  static calculateLevels(direction, price, atr, conditions = {}, candles = [], h1 = [], h4 = []) {
+    // Smart decimal formatter: matches instrument type
+    // Crypto/Gold: 2dp, Forex: 5dp, fallback: 4dp
+    const f = (v) => {
+      if (v == null || !isFinite(v) || isNaN(v)) return parseFloat(price.toFixed(5));
+      if (price >= 10000) return parseFloat(v.toFixed(2));   // BTC, ETH, Gold, NIFTY
+      if (price >= 100)   return parseFloat(v.toFixed(3));   // XAU, some crypto
+      if (price >= 1)     return parseFloat(v.toFixed(5));   // Forex: EURUSD, GBPUSD
+      return parseFloat(v.toFixed(6));                        // sub-1 pairs: XRPUSDT etc
     };
+    const buf = atr * 0.15; // small buffer to avoid exact level rejection
+
+    // ── Gather structural data ───────────────────────────────
+    const highs   = candles.length ? candles.map(c => c.high)  : [];
+    const lows    = candles.length ? candles.map(c => c.low)   : [];
+    const closes  = candles.length ? candles.map(c => c.close) : [];
+
+    const swH5 = highs.length  ? Indicators.swingHighs(highs, 3, 5) : [];
+    const swL5 = lows.length   ? Indicators.swingLows(lows, 3, 5)   : [];
+
+    // Safe helpers — never return Infinity/-Infinity
+    const safeNearHigh = (swings, above, fallback) => {
+      const vals = swings.map(s => s.value).filter(v => v > above && isFinite(v));
+      return vals.length ? Math.min(...vals) : fallback;
+    };
+    const safeNearLow = (swings, below, fallback) => {
+      const vals = swings.map(s => s.value).filter(v => v < below && isFinite(v));
+      return vals.length ? Math.max(...vals) : fallback;
+    };
+
+    // Nearest opposing swing for TP1
+    const nearestSwHigh = safeNearHigh(swH5, price, price + atr * 2);
+    const nearestSwLow  = safeNearLow(swL5,  price, price - atr * 2);
+
+    // H1 swing targets for TP2
+    const h1H = h1.length ? Indicators.swingHighs(h1.map(c => c.high), 2, 3) : [];
+    const h1L = h1.length ? Indicators.swingLows(h1.map(c => c.low),  2, 3)  : [];
+    const h1SwHigh = safeNearHigh(h1H, price, price + atr * 4);
+    const h1SwLow  = safeNearLow(h1L,  price, price - atr * 4);
+
+    // ── Per-strategy structural entry & SL ───────────────────
+    let entry = price;
+    let sl, tp1, tp2, tp3;
+
+    const id = conditions._strategyId || '';
+
+    if (direction === 'BUY') {
+      // Strategy-specific entry and SL
+      if (id === 'FVG' && conditions.gapBottom != null) {
+        // Enter at bottom of FVG (gap support), SL just below gap
+        entry = f(conditions.gapBottom + buf);
+        sl    = f(conditions.gapBottom - atr * 0.5 - buf);
+      } else if (id === 'OB' && conditions.obBot != null) {
+        // Enter at top of OB zone, SL below OB low
+        entry = f(conditions.obBot + (conditions.obTop - conditions.obBot) * 0.3 + buf);
+        sl    = f(conditions.obBot - atr * 0.3 - buf);
+      } else if ((id === 'CHOCH' || id === 'BOS') && conditions.brokenLevel != null) {
+        // Enter on retest of broken level
+        entry = f(conditions.brokenLevel + buf);
+        sl    = f(conditions.brokenLevel - atr * 0.8);
+      } else if (id === 'LIQ_SWEEP' && conditions.sweptLevel != null) {
+        // Enter at the swept low level (liquidity already cleared)
+        entry = f(conditions.sweptLevel + buf);
+        sl    = f(conditions.sweepLow - atr * 0.3);
+      } else if (id === 'SR' && conditions.level != null) {
+        // Enter just above support zone
+        entry = f(conditions.level + buf);
+        sl    = f(conditions.level - atr * 0.6);
+      } else if (id === 'INSIDE_BAR' && conditions.motherLow != null) {
+        // Enter at mother candle high break
+        entry = f(conditions.motherHigh + buf);
+        sl    = f(conditions.motherLow - buf);
+      } else if (id === 'BB' && (conditions.lower != null || conditions.upper != null)) {
+        // BB squeeze breakout — enter on breakout side
+        if (conditions.lower != null) {
+          entry = f(conditions.lower - buf);
+          sl    = f(conditions.lower - atr * 0.8);
+        } else {
+          entry = f(conditions.upper + buf);
+          sl    = f(conditions.upper + atr * 0.8);
+        }
+      } else if (id === 'MA_STACK' && conditions.ema26 != null) {
+        entry = f(conditions.ema26 + buf);
+        sl    = f(conditions.ema26 - atr * 0.8);
+      } else if (id === 'PULLBACK' && conditions.ema50 != null) {
+        entry = f(conditions.ema50 + buf);
+        sl    = f(conditions.ema50 - atr);
+      } else if (id === 'MR' && conditions.sma50 != null) {
+        entry = f(price + buf);
+        sl    = f(price - atr * 1.2);
+      } else if (id === 'FIB' && conditions.fibLevel != null) {
+        entry = f(conditions.fibLevel + buf);
+        sl    = f(conditions.fibLevel - atr * 0.6);
+      } else if (id === 'BB_BOUNCE' && (conditions.lower != null || conditions.lowerBand != null)) {
+        const lBand = conditions.lower ?? conditions.lowerBand;
+        entry = f(lBand + buf);
+        sl    = f(lBand - atr * 0.5);
+      } else if (id === 'ORB' && conditions.orbHigh != null) {
+        entry = f(conditions.orbHigh + buf);
+        sl    = f(conditions.orbLow - buf);
+      } else if (id === 'CONS_BREAK' && conditions.consHigh != null) {
+        entry = f(conditions.consHigh + buf);
+        sl    = f(conditions.consLow - buf);
+      } else if (id === 'TL_BREAK' && conditions.trendlineValue != null) {
+        entry = f(conditions.trendlineValue + buf);
+        sl    = f(conditions.trendlineValue - atr);
+      } else {
+        // Generic fallback: current price, ATR-based SL
+        entry = f(price);
+        sl    = f(price - atr * 1.5);
+      }
+
+      // Structure-based TPs: nearest M5 swing → H1 swing → 3R extension
+      const risk = Math.max(entry - sl, atr * 0.5); // min risk = 0.5 ATR
+      tp1 = f(nearestSwHigh > entry + atr * 0.3 ? Math.min(nearestSwHigh - buf, entry + risk * 2) : entry + risk * 1.5);
+      tp2 = f(h1SwHigh      > tp1 + atr * 0.5   ? Math.min(h1SwHigh - buf,     entry + risk * 3) : entry + risk * 2.5);
+      tp3 = f(entry + risk * 4);
+      // Enforce ascending order
+      if (tp2 <= tp1) tp2 = f(tp1 + risk * 0.8);
+      if (tp3 <= tp2) tp3 = f(tp2 + risk * 1.2);
+
+    } else { // SELL
+
+      if (id === 'FVG' && conditions.gapTop != null) {
+        entry = f(conditions.gapTop - buf);
+        sl    = f(conditions.gapTop + atr * 0.5 + buf);
+      } else if (id === 'OB' && conditions.obTop != null) {
+        entry = f(conditions.obTop - (conditions.obTop - conditions.obBot) * 0.3 - buf);
+        sl    = f(conditions.obTop + atr * 0.3 + buf);
+      } else if ((id === 'CHOCH' || id === 'BOS') && conditions.brokenLevel != null) {
+        entry = f(conditions.brokenLevel - buf);
+        sl    = f(conditions.brokenLevel + atr * 0.8);
+      } else if (id === 'LIQ_SWEEP' && conditions.sweptLevel != null) {
+        entry = f(conditions.sweptLevel - buf);
+        sl    = f(conditions.sweepHigh + atr * 0.3);
+      } else if (id === 'SR' && conditions.level != null) {
+        entry = f(conditions.level - buf);
+        sl    = f(conditions.level + atr * 0.6);
+      } else if (id === 'INSIDE_BAR' && conditions.motherHigh != null) {
+        entry = f(conditions.motherLow - buf);
+        sl    = f(conditions.motherHigh + buf);
+      } else if (id === 'BB' && (conditions.lower != null || conditions.upper != null)) {
+        // BB squeeze breakout — enter on breakout side
+        if (conditions.lower != null) {
+          entry = f(conditions.lower - buf);
+          sl    = f(conditions.lower - atr * 0.8);
+        } else {
+          entry = f(conditions.upper + buf);
+          sl    = f(conditions.upper + atr * 0.8);
+        }
+      } else if (id === 'BB' && (conditions.upper != null || conditions.lower != null)) {
+        if (conditions.upper != null) {
+          entry = f(conditions.upper + buf);
+          sl    = f(conditions.upper + atr * 0.8);
+        } else {
+          entry = f(conditions.lower - buf);
+          sl    = f(conditions.lower - atr * 0.8);
+        }
+      } else if (id === 'MA_STACK' && conditions.ema26 != null) {
+        entry = f(conditions.ema26 - buf);
+        sl    = f(conditions.ema26 + atr * 0.8);
+      } else if (id === 'PULLBACK' && conditions.ema50 != null) {
+        entry = f(conditions.ema50 - buf);
+        sl    = f(conditions.ema50 + atr);
+      } else if (id === 'MR' && conditions.sma50 != null) {
+        entry = f(price - buf);
+        sl    = f(price + atr * 1.2);
+      } else if (id === 'FIB' && conditions.fibLevel != null) {
+        entry = f(conditions.fibLevel - buf);
+        sl    = f(conditions.fibLevel + atr * 0.6);
+      } else if (id === 'BB_BOUNCE' && (conditions.upper != null || conditions.upperBand != null)) {
+        const uBand = conditions.upper ?? conditions.upperBand;
+        entry = f(uBand - buf);
+        sl    = f(uBand + atr * 0.5);
+      } else if (id === 'ORB' && conditions.orbLow != null) {
+        entry = f(conditions.orbLow - buf);
+        sl    = f(conditions.orbHigh + buf);
+      } else if (id === 'CONS_BREAK' && conditions.consLow != null) {
+        entry = f(conditions.consLow - buf);
+        sl    = f(conditions.consHigh + buf);
+      } else if (id === 'TL_BREAK' && conditions.trendlineValue != null) {
+        entry = f(conditions.trendlineValue - buf);
+        sl    = f(conditions.trendlineValue + atr);
+      } else {
+        entry = f(price);
+        sl    = f(price + atr * 1.5);
+      }
+
+      const risk = Math.max(sl - entry, atr * 0.5);
+      tp1 = f(nearestSwLow < entry - atr * 0.3 ? Math.max(nearestSwLow + buf, entry - risk * 2) : entry - risk * 1.5);
+      tp2 = f(h1SwLow      < tp1 - atr * 0.5   ? Math.max(h1SwLow + buf,     entry - risk * 3) : entry - risk * 2.5);
+      tp3 = f(entry - risk * 4);
+      // Enforce descending order
+      if (tp2 >= tp1) tp2 = f(tp1 - risk * 0.8);
+      if (tp3 >= tp2) tp3 = f(tp2 - risk * 1.2);
+    }
+
+    // Compute actual R:R from calculated levels
+    const actualRisk   = Math.abs(entry - sl);
+    const actualReward = Math.abs(tp2 - entry);
+    const rr = actualRisk > 0 ? (actualReward / actualRisk).toFixed(1) : '2.0';
+
+    return { entry, sl, tp1, tp2, tp3, riskReward: `1:${rr}` };
   }
 
   // Boost score when multiple fired strategies agree on same direction
@@ -1687,9 +1926,14 @@ class SignalBuilder {
   static build(symbol, candles, source, mtfData = null) {
     const h1 = mtfData?.h1 || null;
     const h4 = mtfData?.h4 || null;
+    const category = SYMBOLS[symbol]?.category || 'forex';
+
+    // #2 — Only analyse on CLOSED candles. Drop the last candle if still open.
+    const confirmedM5 = Indicators.confirmedCandles(candles);
+    if (confirmedM5.length < 10) return null;
 
     // Run all 38 detectors with real MTF data when available
-    const { fired, mtfCtx } = StrategyDetectors.runAll(candles, h1, h4);
+    const { fired, mtfCtx } = StrategyDetectors.runAll(confirmedM5, h1, h4, category);
     if (!fired.length) return null;
 
     // Sort by score descending — pick best
@@ -1705,11 +1949,10 @@ class SignalBuilder {
     const finalScore = Math.min(best.score + confluenceBoost + mtfBoost, 100);
     if (finalScore < CONFIG.SIGNAL_QUALITY_MIN) return null;
 
-    // Indicators on M5 (entry TF)
-    const closes  = candles.map(c => c.close);
-    const highs   = candles.map(c => c.high);
-    const lows    = candles.map(c => c.low);
-    const volumes = candles.map(c => c.volume || 0);
+    // Indicators on M5 (entry TF) — using confirmed closed candles
+    const closes  = confirmedM5.map(c => c.close);
+    const highs   = confirmedM5.map(c => c.high);
+    const lows    = confirmedM5.map(c => c.low);
     const price   = closes[closes.length - 1];
     const atr     = Indicators.atr(highs, lows, closes);
     const rsi     = Indicators.rsi(closes);
@@ -1717,7 +1960,8 @@ class SignalBuilder {
     const ema12   = Indicators.ema(closes, 12);
     const ema26   = Indicators.ema(closes, 26);
     const ema50   = Indicators.ema(closes, Math.min(50, closes.length - 1));
-    const vol     = Indicators.volumeAnalysis(volumes);
+    // #3 — Smart volume: real for crypto, range-proxy for forex
+    const vol     = Indicators.smartVolume(confirmedM5, category);
     const m5Trend = Indicators.trendStrength(closes);
 
     // H1 indicators (zone TF)
@@ -1753,7 +1997,9 @@ class SignalBuilder {
       },
       confirmedBy:  confirmingStrategies,
       totalFired:   fired.length,
-      levels:       this.calculateLevels(best.direction, price, atr),
+      levels:       this.calculateLevels(best.direction, price, atr,
+                      { ...best.conditions, _strategyId: best.id },
+                      candles, h1 || [], h4 || []),
 
       // M5 indicators (entry)
       indicators: {
@@ -1782,8 +2028,13 @@ class SignalBuilder {
 
       strategyConditions: best.conditions,
       dataSource:   source,
-      candleCount:  candles.length,
+      candleCount:  confirmedM5.length,
       timestamp:    new Date().toISOString(),
+      session:      SessionFilter.currentSession(),
+      // #4 Signal expiry — signal valid for 3 candles (15 min)
+      expiresAt:    new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+      expired:      false,
+      invalidated:  false,
     };
   }
 }
@@ -1943,6 +2194,16 @@ class CoinGeckoFetcher {
   }
 }
 
+// ── #7 DHAN LIVE TOKEN MANAGER ──────────────────────────────
+// Dhan access tokens expire daily. Instead of redeploying each time,
+// POST to /api/dhan/token with your new token to update it live.
+// The bot will immediately start using it for NIFTY/BANKNIFTY/FINNIFTY.
+const dhanLiveToken = {
+  clientId:    process.env.DHAN_CLIENT_ID    || 'placeholder',
+  accessToken: process.env.DHAN_ACCESS_TOKEN || 'placeholder',
+  updatedAt:   null,
+};
+
 class DhanFetcher {
   constructor() {
     this.clientId    = CONFIG.DHAN_CLIENT_ID;
@@ -1977,7 +2238,7 @@ class DhanFetcher {
         fromDate: this.formatDate(fromDate), toDate: this.formatDate(toDate),
         interval: 'FIVE_MINUTE',
       }, {
-        headers: { 'access-token': this.accessToken, 'client-id': this.clientId, 'Content-Type': 'application/json' },
+        headers: { 'access-token': dhanLiveToken.accessToken !== 'placeholder' ? dhanLiveToken.accessToken : this.accessToken, 'client-id': dhanLiveToken.clientId !== 'placeholder' ? dhanLiveToken.clientId : this.clientId, 'Content-Type': 'application/json' },
         timeout: 15000,
       });
 
@@ -2194,8 +2455,9 @@ async function sendTelegramAlert(signal) {
   const confirms = signal.confirmedBy.slice(0, 3).map(s => `  • ${s.name}`).join('\n');
 
   const mtfLine = signal.mtf?.enabled
-    ? `🕐 *MTF Bias:* H4:${signal.mtf.h4Trend} | H1:${signal.mtf.h1Trend} | M5:${signal.mtf.m5Trend} [${signal.mtf.alignment}]`
-    : `🕐 *MTF:* M5 only`;
+    ? `📡 *MTF Bias:* H4:${signal.mtf?.h4Trend} | H1:${signal.mtf?.h1Trend} | M5:${signal.mtf?.m5Trend} [${signal.mtf?.alignment}]`
+    : `📡 *MTF:* M5 only`;
+  const sessionLine = `🌍 *Session:* ${(signal.session || 'UNKNOWN').replace(/_/g,' ')} | Expires: ${signal.expiresAt ? new Date(signal.expiresAt).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'}) : 'N/A'} IST`;
 
   const msg = `${emoji} *${signal.direction} SIGNAL — ${signal.symbol}*
 ━━━━━━━━━━━━━━━━━━━━
@@ -2205,12 +2467,13 @@ async function sendTelegramAlert(signal) {
 📐 Strength: ${signal.strategy.strength.replace(/_/g, ' ').toUpperCase()}
 
 ${mtfLine}
+${sessionLine}
 
-💰 Entry:  \`${signal.levels.entry}\`
-🛑 SL:     \`${signal.levels.sl}\`
-🎯 TP1:    \`${signal.levels.tp1}\`
-🎯 TP2:    \`${signal.levels.tp2}\`
-🎯 TP3:    \`${signal.levels.tp3}\`
+💰 Entry:  \`${signal.levels?.entry ?? 'N/A'}\`
+🛑 SL:     \`${signal.levels?.sl ?? 'N/A'}\`
+🎯 TP1:    \`${signal.levels?.tp1 ?? 'N/A'}\`
+🎯 TP2:    \`${signal.levels?.tp2 ?? 'N/A'}\`
+🎯 TP3:    \`${signal.levels?.tp3 ?? 'N/A'}\`
 📐 R:R     ${signal.levels.riskReward}
 
 📈 *Indicators (M5):*
@@ -2328,6 +2591,333 @@ const botState = {
 };
 const dataFetcher = new HybridDataFetcher();
 
+// ── #4 Signal Expiry Checker ────────────────────────────────
+// Runs every cycle. Marks signals as expired if:
+//   a) 15 minutes have passed since signal (time expiry), OR
+//   b) price has moved more than 2×ATR away from entry zone (price invalidation)
+// Sends a Telegram "INVALIDATED" alert for each expired active signal.
+async function checkSignalExpiry(currentPrices) {
+  const now = Date.now();
+  for (const signal of botState.signals) {
+    if (signal.expired || signal.invalidated) continue;
+    const expiryTime = new Date(signal.expiresAt).getTime();
+
+    // Time expiry
+    if (now > expiryTime) {
+      signal.expired = true;
+      console.log(`[Expiry] ⏰ Expired: ${signal.direction} ${signal.symbol} (15min passed)`);
+      await sendExpiryAlert(signal, 'TIME_EXPIRED');
+      continue;
+    }
+
+    // Price invalidation: if current price crossed SL
+    const currentPrice = currentPrices[signal.symbol];
+    if (currentPrice != null) {
+      const slHit = signal.direction === 'BUY'
+        ? currentPrice < signal.levels.sl
+        : currentPrice > signal.levels.sl;
+      if (slHit) {
+        signal.invalidated = true;
+        console.log(`[Expiry] ❌ SL hit: ${signal.direction} ${signal.symbol} at ${currentPrice}`);
+        await sendExpiryAlert(signal, 'SL_INVALIDATED');
+      }
+    }
+  }
+}
+
+async function sendExpiryAlert(signal, reason) {
+  if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) return;
+  const emoji = reason === 'SL_INVALIDATED' ? '❌' : '⏰';
+  const label = reason === 'SL_INVALIDATED' ? 'SIGNAL INVALIDATED — SL Hit' : 'SIGNAL EXPIRED';
+  const msg = `${emoji} *${label}*
+━━━━━━━━━━━━━━━━━━━━
+📊 ${signal.symbolName} | ${signal.direction}
+⚡ ${signal.strategy.name}
+Entry was: \`${signal.levels.entry}\` | SL: \`${signal.levels?.sl ?? 'N/A'}\`
+🕑 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
+_No action needed — setup no longer valid_`;
+  try {
+    await axios.post(`https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
+      { chat_id: CONFIG.TELEGRAM_CHAT_ID, text: msg, parse_mode: 'Markdown' },
+      { timeout: 10000 }
+    );
+  } catch (e) { /* silent fail */ }
+}
+
+
+
+// ============================================================
+// ── BACKTESTING ENGINE (#6) ──────────────────────────────────
+// Runs all 38 strategies on historical candle data and
+// tracks how many signals hit TP1/TP2/TP3 vs SL.
+//
+// How it works:
+//   1. Fetch 500 historical candles (5-day history on 5m)
+//   2. Slide a 100-candle window across them
+//   3. Run all detectors on each window
+//   4. For each signal, look forward 20 candles to see outcome:
+//      → TP1 hit first = WIN (partial)
+//      → TP2 hit first = WIN (full)
+//      → SL  hit first = LOSS
+//      → Neither hit   = OPEN (excluded from stats)
+//   5. Store winRate, avgRR, total trades per strategy
+//
+// Results exposed at GET /api/backtest
+// ============================================================
+class BacktestEngine {
+  constructor() {
+    this.results    = {};  // { strategyId: { wins, losses, open, winRate, avgRR } }
+    this.lastRun    = null;
+    this.isRunning  = false;
+  }
+
+  async run(dataFetcher) {
+    if (this.isRunning) return { error: 'Already running' };
+    this.isRunning = true;
+    console.log('[Backtest] ⚙️  Starting backtest on 500 candles per symbol...');
+    const startTime  = Date.now();
+    const results    = {};
+    const symbolKeys = Object.keys(SYMBOLS).filter(s => SYMBOLS[s].source !== 'dhan'); // skip Dhan (no token)
+
+    for (const symbol of symbolKeys) {
+      try {
+        const config = SYMBOLS[symbol];
+        let candles  = null;
+
+        // Fetch 500 candles (extended history)
+        if (config.source === 'twelvedata') {
+          candles = await dataFetcher.twelvedata.fetchCandles(config.tdSymbol, '5min', 500);
+        } else if (config.source === 'yahoo') {
+          candles = await dataFetcher.yahoo.fetchCandles(config.yahooSymbol, '5m');
+        } else if (config.source === 'coingecko') {
+          candles = dataFetcher.coingecko.getCandles(config.cgId);
+        }
+
+        if (!candles || candles.length < 120) {
+          console.log(`[Backtest] ⚠️  Insufficient candles for ${symbol}: ${candles?.length || 0}`);
+          continue;
+        }
+
+        console.log(`[Backtest] 📊 ${symbol}: ${candles.length} candles`);
+
+        // Slide 100-candle window across all candles
+        const windowSize  = 100;
+        const forwardLook = 20; // candles to check after signal
+
+        for (let i = windowSize; i < candles.length - forwardLook; i++) {
+          const window    = candles.slice(i - windowSize, i);
+          const confirmed = Indicators.confirmedCandles(window);
+          if (confirmed.length < 50) continue;
+
+          const { fired } = StrategyDetectors.runAll(confirmed, null, null, config.category || 'forex');
+          if (!fired.length) continue;
+
+          fired.sort((a, b) => b.score - a.score);
+          const best = fired[0];
+
+          // Quick calculate levels for this signal
+          const closes = confirmed.map(c => c.close);
+          const highs  = confirmed.map(c => c.high);
+          const lows   = confirmed.map(c => c.low);
+          const price  = closes[closes.length - 1];
+          const atr    = Indicators.atr(highs, lows, closes);
+
+          const levels = SignalBuilder.calculateLevels(
+            best.direction, price, atr,
+            { ...best.conditions, _strategyId: best.id },
+            confirmed, [], []
+          );
+          if (!levels.entry || !levels.sl || !levels.tp1) continue;
+
+          // Look forward to determine outcome
+          const future  = candles.slice(i, i + forwardLook);
+          let outcome   = 'open';
+          for (const fc of future) {
+            if (best.direction === 'BUY') {
+              if (fc.low  <= levels.sl)  { outcome = 'loss'; break; }
+              if (fc.high >= levels.tp2 || fc.high >= levels.tp1) { outcome = 'win'; break; }
+            } else {
+              if (fc.high >= levels.sl)  { outcome = 'loss'; break; }
+              if (fc.low  <= levels.tp2 || fc.low  <= levels.tp1) { outcome = 'win'; break; }
+            }
+          }
+
+          if (outcome === 'open') continue; // don't count unresolved
+
+          const id  = best.id;
+          if (!results[id]) results[id] = { wins: 0, losses: 0, open: 0, totalRR: 0, trades: 0 };
+          results[id].trades++;
+          if (outcome === 'win') {
+            results[id].wins++;
+            // Approximate R:R as TP2 distance / SL distance
+            const reward = Math.abs(levels.tp2 - levels.entry);
+            const risk   = Math.abs(levels.sl   - levels.entry);
+            results[id].totalRR += risk > 0 ? reward / risk : 2;
+          } else {
+            results[id].losses++;
+          }
+        }
+
+        await new Promise(r => setTimeout(r, 500)); // rate limit respect
+      } catch (err) {
+        console.error(`[Backtest] Error ${symbol}:`, err.message);
+      }
+    }
+
+    // Compute final stats
+    const summary = {};
+    for (const [id, r] of Object.entries(results)) {
+      if (r.trades < 3) continue; // not enough data
+      summary[id] = {
+        strategy:  id,
+        trades:    r.trades,
+        wins:      r.wins,
+        losses:    r.losses,
+        winRate:   Math.round((r.wins / r.trades) * 100),
+        avgRR:     r.wins > 0 ? parseFloat((r.totalRR / r.wins).toFixed(2)) : 0,
+        verdict:   r.wins / r.trades >= 0.55 ? '✅ KEEP' : r.wins / r.trades >= 0.45 ? '⚠️ WATCH' : '❌ REVIEW',
+      };
+    }
+
+    this.results  = summary;
+    this.lastRun  = new Date().toISOString();
+    this.isRunning = false;
+
+    const totalTrades = Object.values(summary).reduce((s, r) => s + r.trades, 0);
+    const avgWin      = Object.values(summary).length
+      ? Math.round(Object.values(summary).reduce((s, r) => s + r.winRate, 0) / Object.values(summary).length)
+      : 0;
+
+    console.log(`[Backtest] ✅ Done — ${totalTrades} trades analysed across ${Object.keys(summary).length} strategies | avg win rate: ${avgWin}% | ${Date.now() - startTime}ms`);
+    return { summary, totalTrades, avgWinRate: avgWin, ranAt: this.lastRun };
+  }
+}
+
+const backtestEngine = new BacktestEngine();
+
+// ============================================================
+// ── SESSION FILTER (#5) ─────────────────────────────────────
+// Different strategies have optimal trading sessions.
+// Signals outside optimal session get suppressed or penalized.
+//
+// Sessions (UTC):
+//   Asian    00:00–08:00  low volatility, mean reversion
+//   London   08:00–13:00  breakouts, OB, FVG
+//   NY Open  13:00–17:00  overlap, momentum, trend
+//   NY Late  17:00–22:00  trend continuation
+//   Dead     22:00–00:00  avoid most signals
+//
+// India NSE: 03:45–10:00 UTC (09:15–15:30 IST)
+// ============================================================
+class SessionFilter {
+
+  static currentSession() {
+    const h = new Date().getUTCHours();
+    const m = new Date().getUTCMinutes();
+    const t = h + m / 60;
+    if (t >= 22 || t < 0.5)  return 'DEAD';    // 22:00–00:30 UTC — very low liquidity
+    if (t >= 0.5 && t < 8)   return 'ASIAN';   // 00:30–08:00 UTC
+    if (t >= 8  && t < 13)   return 'LONDON';  // 08:00–13:00 UTC
+    if (t >= 13 && t < 17)   return 'NY_OPEN'; // 13:00–17:00 UTC (overlap)
+    if (t >= 17 && t < 22)   return 'NY_LATE'; // 17:00–22:00 UTC
+    return 'UNKNOWN';
+  }
+
+  static isIndiaMarketHours() {
+    // NSE: 09:15–15:30 IST = 03:45–10:00 UTC
+    const h = new Date().getUTCHours();
+    const m = new Date().getUTCMinutes();
+    const t = h * 60 + m;
+    return t >= 225 && t <= 600; // 3h45m to 10h00m UTC in minutes
+  }
+
+  // Returns { allowed: bool, reason: string, sessionPenalty: number }
+  // sessionPenalty: score reduction for signals in non-ideal sessions
+  static check(strategyId, category) {
+    const session = this.currentSession();
+
+    // India symbols: only during NSE hours
+    if (category === 'india') {
+      if (!this.isIndiaMarketHours()) {
+        return { allowed: false, reason: `India NSE closed (UTC ${new Date().getUTCHours()}:${String(new Date().getUTCMinutes()).padStart(2,'0')})` };
+      }
+      return { allowed: true, reason: 'NSE market hours', sessionPenalty: 0 };
+    }
+
+    // Dead session: block almost everything
+    if (session === 'DEAD') {
+      // Only allow mean reversion setups (price usually returns to range after NY close)
+      const mrStrategies = ['MR', 'MR_FIB', 'FVG_MR', 'FIB', 'BB_BOUNCE'];
+      if (mrStrategies.includes(strategyId)) {
+        return { allowed: true, reason: 'MR allowed in dead session', sessionPenalty: 8 };
+      }
+      return { allowed: false, reason: `Dead session (UTC ${new Date().getUTCHours()}:00) — ${strategyId} blocked` };
+    }
+
+    // Strategy-session optimal mapping
+    const optimalSessions = {
+      // Breakout strategies → best in London/NY
+      'ORB':        ['LONDON', 'NY_OPEN'],
+      'ORB_MA':     ['LONDON', 'NY_OPEN'],
+      'OVERLAP':    ['NY_OPEN'],
+      'OVERLAP_OB': ['NY_OPEN'],
+      'CONS_BREAK': ['LONDON', 'NY_OPEN'],
+      'TL_BREAK':   ['LONDON', 'NY_OPEN'],
+      // Institutional / smart money → London + NY
+      'FVG':        ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'FVG_BOS':    ['LONDON', 'NY_OPEN'],
+      'FVG_BOS_HTF':['LONDON', 'NY_OPEN'],
+      'FVG_MR':     ['LONDON', 'NY_OPEN', 'ASIAN'],
+      'OB':         ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'OB_FVG':     ['LONDON', 'NY_OPEN'],
+      'OB_HTF':     ['LONDON', 'NY_OPEN'],
+      'CHOCH':      ['LONDON', 'NY_OPEN'],
+      'CHOCH_LIQ':  ['LONDON', 'NY_OPEN'],
+      'CHOCH_VOL':  ['LONDON', 'NY_OPEN'],
+      'BOS':        ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'LIQ_SWEEP':  ['LONDON', 'NY_OPEN'],
+      // Trend strategies → any active session
+      'EMA_CROSS':  ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'MA_STACK':   ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'PULLBACK':   ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'PB_VOL':     ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'TREND_CONF': ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'HTF_CONF':   ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'OB_CONS':    ['LONDON', 'NY_OPEN'],
+      // Mean reversion → best in Asian / quiet
+      'MR':         ['ASIAN', 'NY_LATE', 'LONDON'],
+      'MR_FIB':     ['ASIAN', 'NY_LATE'],
+      'FIB':        ['ASIAN', 'LONDON', 'NY_LATE'],
+      'BB':         ['LONDON', 'NY_OPEN'],
+      'BB_BOUNCE':  ['ASIAN', 'NY_LATE'],
+      // Volume/Momentum → need active sessions
+      'VOL_CONF':   ['LONDON', 'NY_OPEN'],
+      'RSI_DIV':    ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'MACD_DIV':   ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'RSI_EXT':    ['ASIAN', 'LONDON', 'NY_LATE'],
+      'CONF_ZONE':  ['LONDON', 'NY_OPEN', 'NY_LATE'],
+      'GAP_FILL':   ['LONDON', 'NY_OPEN'],
+      // SR works any active session
+      'SR':         ['LONDON', 'NY_OPEN', 'NY_LATE', 'ASIAN'],
+      'INSIDE_BAR': ['LONDON', 'NY_OPEN', 'NY_LATE'],
+    };
+
+    const optimal = optimalSessions[strategyId];
+    if (!optimal) {
+      // Unknown strategy — allow with small penalty
+      return { allowed: true, reason: 'Unknown strategy — default allow', sessionPenalty: 3 };
+    }
+
+    if (optimal.includes(session)) {
+      return { allowed: true, reason: `${strategyId} optimal in ${session}`, sessionPenalty: 0 };
+    }
+
+    // Non-optimal but not dead session — allow with score penalty
+    const penalty = session === 'ASIAN' && !['MR','MR_FIB','FIB','BB_BOUNCE','SR'].includes(strategyId) ? 12 : 6;
+    return { allowed: true, reason: `${strategyId} non-optimal in ${session}`, sessionPenalty: penalty };
+  }
+}
+
 async function runAnalysisCycle() {
   if (botState.isRunning) return;
   botState.isRunning = true;
@@ -2355,6 +2945,26 @@ async function runAnalysisCycle() {
         continue;
       }
 
+      // #5 Session filter — check if strategy is valid in current session
+      const sessionCheck = SessionFilter.check(signal.strategy.id, SYMBOLS[symbol].category);
+      if (!sessionCheck.allowed) {
+        cycleBlocked++;
+        botState.stats.blockedByGate++;
+        console.log(`[Bot] 🕐 SESSION BLOCK ${symbol}: ${sessionCheck.reason}`);
+        continue;
+      }
+      // Apply session penalty to quality score if non-optimal
+      if (sessionCheck.sessionPenalty > 0) {
+        signal.quality = Math.max(0, signal.quality - sessionCheck.sessionPenalty);
+        signal.sessionNote = sessionCheck.reason;
+        if (signal.quality < 75) {
+          cycleBlocked++;
+          botState.stats.blockedByGate++;
+          console.log(`[Bot] 🕐 SESSION PENALTY ${symbol}: Q dropped to ${signal.quality} — blocked`);
+          continue;
+        }
+      }
+
       // Run all gate checks
       const gate = signalGate.check(signal, currentPrice);
       if (!gate.allowed) {
@@ -2380,11 +2990,22 @@ async function runAnalysisCycle() {
     } catch (err) { console.error(`[Bot] Error ${symbol}:`, err.message); }
   }
 
+  // #4 — Check all active signals for expiry / price invalidation
+  const currentPrices = {};
+  for (const s of botState.signals.filter(x => !x.expired && !x.invalidated)) {
+    const mtf = dataFetcher.mtfCache[s.symbol + '_mtf'];
+    if (mtf?.data?.m5?.length) {
+      const m5 = mtf.data.m5;
+      currentPrices[s.symbol] = m5[m5.length - 1].close;
+    }
+  }
+  await checkSignalExpiry(currentPrices);
+
   botState.lastCycle = {
     signals: cycleSignals, blocked: cycleBlocked,
     durationMs: Date.now() - cycleStart, timestamp: new Date().toISOString(),
   };
-  console.log(`[Bot] ✅ Cycle done — ${cycleSignals} signals sent | ${cycleBlocked} blocked by gate | ${Date.now() - cycleStart}ms\n`);
+  console.log(`[Bot] ✅ Cycle done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - cycleStart}ms\n`);
   botState.isRunning = false;
 }
 
@@ -2393,7 +3014,7 @@ async function runAnalysisCycle() {
 // ============================================================
 app.get('/', (req, res) => res.json({
   bot: 'HYBRID TRADING BOT v6.0 — REAL SIGNAL ENGINE',
-  status: 'OPERATIONAL ✅', version: '6.0.0',
+  status: 'OPERATIONAL ✅', version: '8.0.0',
   description: 'All 38 strategies have genuine condition detection on live candle data. Signals only fire when ALL conditions are truly met.',
   dataSources: { crypto: 'CoinGecko', forex: 'Twelve Data', silver: 'Yahoo Finance', india: 'Dhan (add token when ready)' },
   symbols: 14, strategies: 38,
@@ -2402,7 +3023,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const uptime = Math.floor((Date.now() - botState.stats.startTime) / 1000);
   res.json({
-    status: 'OPERATIONAL ✅', version: '6.0.0',
+    status: 'OPERATIONAL ✅', version: '8.0.0',
     uptime: `${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m ${uptime%60}s`,
     totalSignals: botState.stats.totalSignals,
     blockedByGate: botState.stats.blockedByGate,
@@ -2507,11 +3128,115 @@ app.get('/api/stats', (req, res) => {
   });
 });
 
+// #7 — Live Dhan token update (no redeploy needed)
+app.post('/api/dhan/token', (req, res) => {
+  const { clientId, accessToken } = req.body;
+  if (!clientId || !accessToken) {
+    return res.status(400).json({ error: 'Provide clientId and accessToken in body' });
+  }
+  dhanLiveToken.clientId    = clientId;
+  dhanLiveToken.accessToken = accessToken;
+  dhanLiveToken.updatedAt   = new Date().toISOString();
+  console.log(`[Dhan] ✅ Token updated at ${dhanLiveToken.updatedAt}`);
+  res.json({
+    success: true,
+    message: 'Dhan token updated. NIFTY/BANKNIFTY/FINNIFTY will use it next cycle.',
+    updatedAt: dhanLiveToken.updatedAt,
+  });
+});
+
 app.post('/api/metatrader/receive', (req, res) => {
   const { symbol, candles } = req.body;
   if (!symbol || !Array.isArray(candles)) return res.status(400).json({ error: 'Invalid data' });
   dataFetcher.metatrader.receiveData(symbol.toUpperCase(), candles);
   res.json({ success: true, symbol: symbol.toUpperCase(), candlesReceived: candles.length });
+});
+
+// ── #6 BACKTEST ENGINE ──────────────────────────────────────
+// Runs all 38 strategies on historical candle windows.
+// For each signal fired in history, checks if TP1/TP2/SL was hit.
+// Returns win rates per strategy.
+function runBacktest(candles) {
+  const results = {};
+  if (!candles || candles.length < 50) return results;
+
+  // Slide a window of 100 candles across history, fire detectors on each
+  const windowSize = 100;
+  for (let i = windowSize; i < candles.length - 20; i++) {
+    const window = candles.slice(i - windowSize, i);
+    let runResult;
+    try { runResult = StrategyDetectors.runAll(window, null, null, 'forex'); }
+    catch { continue; }
+    if (!runResult?.fired?.length) continue;
+
+    for (const fired of runResult.fired) {
+      const id  = fired.id;
+      if (!results[id]) results[id] = { fires: 0, tp1: 0, tp2: 0, sl: 0 };
+      results[id].fires++;
+
+      // Simulate forward — look at next 20 candles to see what got hit first
+      const closes  = window.map(c => c.close);
+      const highs   = candles.slice(i, i + 20).map(c => c.high);
+      const lows    = candles.slice(i, i + 20).map(c => c.low);
+      const atr     = Indicators.atr(window.map(c => c.high), window.map(c => c.low), closes);
+      const price   = closes[closes.length - 1];
+      const dir     = fired.direction;
+
+      // Use simple ATR-based levels for backtest (same as v1 for consistency)
+      const risk  = atr * 1.5;
+      const tp1   = dir === 'BUY' ? price + atr       : price - atr;
+      const tp2   = dir === 'BUY' ? price + atr * 2   : price - atr * 2;
+      const sl    = dir === 'BUY' ? price - risk       : price + risk;
+
+      let tp1Hit = false, tp2Hit = false, slHit = false;
+      for (let j = 0; j < highs.length; j++) {
+        if (dir === 'BUY') {
+          if (!tp1Hit && highs[j] >= tp1) tp1Hit = true;
+          if (!tp2Hit && highs[j] >= tp2) tp2Hit = true;
+          if (!slHit  && lows[j]  <= sl)  slHit  = true;
+        } else {
+          if (!tp1Hit && lows[j]  <= tp1) tp1Hit = true;
+          if (!tp2Hit && lows[j]  <= tp2) tp2Hit = true;
+          if (!slHit  && highs[j] >= sl)  slHit  = true;
+        }
+        // Stop at first exit
+        if (slHit || tp2Hit) break;
+      }
+
+      if (tp2Hit && !slHit) results[id].tp2++;
+      else if (tp1Hit && !slHit) results[id].tp1++;
+      else if (slHit) results[id].sl++;
+    }
+  }
+
+  // Compute win rates
+  for (const id of Object.keys(results)) {
+    const r = results[id];
+    const total = r.tp1 + r.tp2 + r.sl;
+    r.winRate  = total > 0 ? Math.round(((r.tp1 + r.tp2) / total) * 100) : 0;
+    r.tp1Rate  = total > 0 ? Math.round((r.tp1 / total) * 100) : 0;
+    r.tp2Rate  = total > 0 ? Math.round((r.tp2 / total) * 100) : 0;
+    r.slRate   = total > 0 ? Math.round((r.sl  / total) * 100) : 0;
+  }
+
+  return results;
+}
+
+app.get('/api/backtest/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  const cached = dataFetcher.cache[symbol];
+  if (!cached || cached.length < 50) {
+    return res.json({ error: 'Not enough candle data cached for this symbol. Wait for at least 1 cycle.' });
+  }
+  try {
+    const results = runBacktest(cached);
+    const sorted  = Object.entries(results)
+      .sort((a, b) => b[1].winRate - a[1].winRate)
+      .map(([id, r]) => ({ id, ...r }));
+    res.json({ symbol, candlesUsed: cached.length, strategies: sorted });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
@@ -2521,7 +3246,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 // ============================================================
 async function startBot() {
   console.log('\n╔══════════════════════════════════════════════════╗');
-  console.log('║   HYBRID TRADING BOT v6.0 — REAL SIGNAL ENGINE  ║');
+  console.log('║   HYBRID TRADING BOT v8.2 — PRECISION ENGINE    ║');
   console.log('║  All 38 strategies: genuine condition detection  ║');
   console.log('║  Signals ONLY fire when ALL conditions are met   ║');
   console.log('║  Live candle analysis every 5 minutes 24/7      ║');
