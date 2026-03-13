@@ -1,16 +1,19 @@
 // ============================================================
-// HYBRID TRADING BOT v5.3 - ALL APIs FIXED
+// HYBRID TRADING BOT v5.4 - ALL APIs FIXED
 // ============================================================
-// FIXES v5.3:
+// FIXES v5.4:
+//   XAG/USD (Silver) → Yahoo Finance (free, no key, no plan limit)
+//   CoinGecko 429    → Increased delay to 15s between calls
+//   Dhan Invalid Token → Better error message (regenerate token in Render)
+// ALL PREVIOUS FIXES (v5.3):
 //   Finnhub 403  → Replaced with Twelve Data (free forex/gold candles)
-//   Binance 451  → CoinGecko (already in v5.2, confirmed working)
-//   Dhan 400     → Fixed: oi must be boolean false, not string 'false'
-//                  + Added date guard (weekends return no data → graceful skip)
-//                  + interval changed to FIVE_MINUTE for consistency
+//   Binance 451  → CoinGecko (free, no key, no IP ban)
+//   Dhan 400     → Fixed: oi boolean, expiryCode int, weekend guard
 // DATA SOURCES:
-//   CRYPTO      → CoinGecko API (FREE, no key, no IP ban)
-//   FOREX/GOLD  → Twelve Data API (FREE, 800 calls/day, key needed)
-//   INDIA NSE   → Dhan API (REST, corrected body format)
+//   CRYPTO      → CoinGecko API (FREE, no key)
+//   FOREX/GOLD  → Twelve Data API (FREE, key needed)
+//   SILVER      → Yahoo Finance (FREE, no key)
+//   INDIA NSE   → Dhan API (token must be valid & refreshed)
 //   FALLBACK    → Cached Data (never fails)
 // ============================================================
 
@@ -30,15 +33,18 @@ const CONFIG = {
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
 
-  // Twelve Data (Forex + Commodities - FREE tier: 800 API calls/day)
-  // Get free key at: https://twelvedata.com → Sign Up → API Key
+  // Twelve Data (Forex + Gold - FREE tier: 800 calls/day)
+  // Get free key at: https://twelvedata.com → Sign Up
   TWELVE_DATA_API_KEY: process.env.TWELVE_DATA_API_KEY,
   TWELVE_DATA_REST: 'https://api.twelvedata.com',
 
-  // CoinGecko (Crypto - FREE, no key, no IP issues)
+  // CoinGecko (Crypto - FREE, no key)
   COINGECKO_REST: 'https://api.coingecko.com/api/v3',
 
+  // Yahoo Finance (Silver - FREE, no key needed)
+
   // Dhan API (India NSE)
+  // Regenerate token at: https://developer.dhanhq.co
   DHAN_CLIENT_ID: process.env.DHAN_CLIENT_ID,
   DHAN_ACCESS_TOKEN: process.env.DHAN_ACCESS_TOKEN,
   DHAN_REST: 'https://api.dhan.co',
@@ -53,22 +59,22 @@ const CONFIG = {
 // ALL 14 SYMBOLS
 // ============================================================
 const SYMBOLS = {
-  // FOREX - Twelve Data (free tier covers all standard forex pairs)
-  EURUSD: { name: 'EUR/USD', category: 'forex', source: 'twelvedata', tdSymbol: 'EUR/USD', volatility: 'medium' },
-  GBPUSD: { name: 'GBP/USD', category: 'forex', source: 'twelvedata', tdSymbol: 'GBP/USD', volatility: 'high' },
-  USDJPY: { name: 'USD/JPY', category: 'forex', source: 'twelvedata', tdSymbol: 'USD/JPY', volatility: 'medium' },
-  AUDUSD: { name: 'AUD/USD', category: 'forex', source: 'twelvedata', tdSymbol: 'AUD/USD', volatility: 'medium' },
+  // FOREX - Twelve Data
+  EURUSD: { name: 'EUR/USD',    category: 'forex',     source: 'twelvedata', tdSymbol: 'EUR/USD', volatility: 'medium' },
+  GBPUSD: { name: 'GBP/USD',    category: 'forex',     source: 'twelvedata', tdSymbol: 'GBP/USD', volatility: 'high' },
+  USDJPY: { name: 'USD/JPY',    category: 'forex',     source: 'twelvedata', tdSymbol: 'USD/JPY', volatility: 'medium' },
+  AUDUSD: { name: 'AUD/USD',    category: 'forex',     source: 'twelvedata', tdSymbol: 'AUD/USD', volatility: 'medium' },
 
-  // COMMODITIES - Twelve Data
-  XAUUSD: { name: 'Gold/USD',   category: 'commodity', source: 'twelvedata', tdSymbol: 'XAU/USD', volatility: 'high' },
-  XAGUSD: { name: 'Silver/USD', category: 'commodity', source: 'twelvedata', tdSymbol: 'XAG/USD', volatility: 'very_high' },
+  // COMMODITIES
+  XAUUSD: { name: 'Gold/USD',   category: 'commodity', source: 'twelvedata', tdSymbol: 'XAU/USD',  volatility: 'high' },
+  XAGUSD: { name: 'Silver/USD', category: 'commodity', source: 'yahoo',      yahooSymbol: 'SI=F', volatility: 'very_high' },
 
-  // CRYPTO - CoinGecko (no key needed)
-  BTCUSDT: { name: 'Bitcoin/USDT',  category: 'crypto', source: 'coingecko', cgId: 'bitcoin',     volatility: 'very_high' },
-  ETHUSDT: { name: 'Ethereum/USDT', category: 'crypto', source: 'coingecko', cgId: 'ethereum',    volatility: 'high' },
-  XRPUSDT: { name: 'Ripple/USDT',  category: 'crypto', source: 'coingecko', cgId: 'ripple',      volatility: 'very_high' },
-  LTCUSDT: { name: 'Litecoin/USDT',category: 'crypto', source: 'coingecko', cgId: 'litecoin',    volatility: 'high' },
-  BNBUSDT: { name: 'BNB/USDT',     category: 'crypto', source: 'coingecko', cgId: 'binancecoin', volatility: 'high' },
+  // CRYPTO - CoinGecko
+  BTCUSDT: { name: 'Bitcoin/USDT',   category: 'crypto', source: 'coingecko', cgId: 'bitcoin',     volatility: 'very_high' },
+  ETHUSDT: { name: 'Ethereum/USDT',  category: 'crypto', source: 'coingecko', cgId: 'ethereum',    volatility: 'high' },
+  XRPUSDT: { name: 'Ripple/USDT',   category: 'crypto', source: 'coingecko', cgId: 'ripple',      volatility: 'very_high' },
+  LTCUSDT: { name: 'Litecoin/USDT', category: 'crypto', source: 'coingecko', cgId: 'litecoin',    volatility: 'high' },
+  BNBUSDT: { name: 'BNB/USDT',      category: 'crypto', source: 'coingecko', cgId: 'binancecoin', volatility: 'high' },
 
   // INDIA NSE - Dhan
   NIFTY:     { name: 'NIFTY 50',   category: 'india', source: 'dhan', dhanSecurityId: '13', exchangeSegment: 'IDX_I', volatility: 'medium' },
@@ -81,46 +87,46 @@ const SYMBOLS = {
 // ============================================================
 const STRATEGIES = {
   combo: [
-    { id: 'OB_FVG',     name: 'Order Block + Fair Value Gap',   probability: 80, category: 'combo', strength: 'very_strong' },
-    { id: 'CHOCH_LIQ',  name: 'ChoCh + Liquidity Sweep',        probability: 75, category: 'combo', strength: 'strong' },
-    { id: 'ORB_MA',     name: 'ORB + MA Stack',                  probability: 78, category: 'combo', strength: 'strong' },
-    { id: 'OB_CONS',    name: 'Order Block + Consolidation',     probability: 76, category: 'combo', strength: 'strong' },
-    { id: 'CHOCH_VOL',  name: 'ChoCh + Volume Spike',            probability: 80, category: 'combo', strength: 'very_strong' },
-    { id: 'OVERLAP_OB', name: 'London-NY Overlap + OB',          probability: 85, category: 'combo', strength: 'very_strong' },
-    { id: 'FVG_BOS',    name: 'FVG + Break of Structure',        probability: 90, category: 'combo', strength: 'exceptional' },
-    { id: 'MR_FIB',     name: 'Mean Reversion + Fibonacci',      probability: 78, category: 'combo', strength: 'strong' },
-    { id: 'FVG_MR',     name: 'FVG + Mean Reversion',            probability: 80, category: 'combo', strength: 'very_strong' },
-    { id: 'OB_HTF',     name: 'Order Block + HTF Confirm',       probability: 78, category: 'combo', strength: 'strong' },
-    { id: 'FVG_BOS_HTF',name: 'FVG + BoS + HTF (BEST)',          probability: 92, category: 'combo', strength: 'exceptional' },
-    { id: 'PB_VOL',     name: 'Pullback + Volume',               probability: 75, category: 'combo', strength: 'strong' },
+    { id: 'OB_FVG',      name: 'Order Block + Fair Value Gap',  probability: 80, category: 'combo', strength: 'very_strong' },
+    { id: 'CHOCH_LIQ',   name: 'ChoCh + Liquidity Sweep',       probability: 75, category: 'combo', strength: 'strong' },
+    { id: 'ORB_MA',      name: 'ORB + MA Stack',                 probability: 78, category: 'combo', strength: 'strong' },
+    { id: 'OB_CONS',     name: 'Order Block + Consolidation',    probability: 76, category: 'combo', strength: 'strong' },
+    { id: 'CHOCH_VOL',   name: 'ChoCh + Volume Spike',           probability: 80, category: 'combo', strength: 'very_strong' },
+    { id: 'OVERLAP_OB',  name: 'London-NY Overlap + OB',         probability: 85, category: 'combo', strength: 'very_strong' },
+    { id: 'FVG_BOS',     name: 'FVG + Break of Structure',       probability: 90, category: 'combo', strength: 'exceptional' },
+    { id: 'MR_FIB',      name: 'Mean Reversion + Fibonacci',     probability: 78, category: 'combo', strength: 'strong' },
+    { id: 'FVG_MR',      name: 'FVG + Mean Reversion',           probability: 80, category: 'combo', strength: 'very_strong' },
+    { id: 'OB_HTF',      name: 'Order Block + HTF Confirm',      probability: 78, category: 'combo', strength: 'strong' },
+    { id: 'FVG_BOS_HTF', name: 'FVG + BoS + HTF (BEST)',         probability: 92, category: 'combo', strength: 'exceptional' },
+    { id: 'PB_VOL',      name: 'Pullback + Volume',              probability: 75, category: 'combo', strength: 'strong' },
   ],
   core: [
-    { id: 'FVG',       name: 'Fair Value Gap',           probability: 95, category: 'price_action',  strength: 'exceptional' },
-    { id: 'OB',        name: 'Order Block',              probability: 70, category: 'price_action',  strength: 'moderate' },
-    { id: 'CHOCH',     name: 'Change of Character',      probability: 75, category: 'price_action',  strength: 'strong' },
-    { id: 'BOS',       name: 'Break of Structure',       probability: 70, category: 'price_action',  strength: 'moderate' },
-    { id: 'LIQ_SWEEP', name: 'Liquidity Sweep',          probability: 65, category: 'price_action',  strength: 'moderate' },
-    { id: 'SR',        name: 'Support & Resistance',     probability: 68, category: 'price_action',  strength: 'moderate' },
-    { id: 'TL_BREAK',  name: 'Trendline Break',          probability: 68, category: 'price_action',  strength: 'moderate' },
-    { id: 'INSIDE_BAR',name: 'Inside Bar',               probability: 66, category: 'price_action',  strength: 'moderate' },
-    { id: 'EMA_CROSS', name: 'EMA Crossover',            probability: 65, category: 'moving_average',strength: 'moderate' },
-    { id: 'MA_STACK',  name: 'MA Stack',                 probability: 72, category: 'moving_average',strength: 'strong' },
-    { id: 'OVERLAP',   name: 'London-NY Overlap',        probability: 80, category: 'moving_average',strength: 'very_strong' },
-    { id: 'PULLBACK',  name: 'Pullback Entry',           probability: 65, category: 'moving_average',strength: 'moderate' },
-    { id: 'ORB',       name: 'Opening Range Breakout',   probability: 72, category: 'breakout',      strength: 'strong' },
-    { id: 'CONS_BREAK',name: 'Consolidation Breakout',   probability: 70, category: 'breakout',      strength: 'moderate' },
-    { id: 'HTF_CONF',  name: 'Higher TF Confirmation',  probability: 65, category: 'breakout',      strength: 'moderate' },
-    { id: 'MR',        name: 'Mean Reversion',           probability: 70, category: 'mean_reversion',strength: 'moderate' },
-    { id: 'FIB',       name: 'Fibonacci Retracement',   probability: 70, category: 'mean_reversion',strength: 'moderate' },
-    { id: 'BB',        name: 'Bollinger Bands',          probability: 65, category: 'mean_reversion',strength: 'moderate' },
-    { id: 'BB_BOUNCE', name: 'Bollinger Bounce',         probability: 65, category: 'mean_reversion',strength: 'moderate' },
-    { id: 'RSI_DIV',   name: 'RSI Divergence',           probability: 67, category: 'momentum',      strength: 'moderate' },
-    { id: 'MACD_DIV',  name: 'MACD Divergence',          probability: 68, category: 'momentum',      strength: 'moderate' },
-    { id: 'RSI_EXT',   name: 'RSI Extremes',             probability: 64, category: 'momentum',      strength: 'weak' },
-    { id: 'TREND_CONF',name: 'Trend Confirmation',       probability: 68, category: 'momentum',      strength: 'moderate' },
-    { id: 'VOL_CONF',  name: 'Volume Confirmation',      probability: 68, category: 'volume',        strength: 'moderate' },
-    { id: 'GAP_FILL',  name: 'Gap Fill',                 probability: 65, category: 'volume',        strength: 'moderate' },
-    { id: 'CONF_ZONE', name: 'Confluence Zone',          probability: 72, category: 'volume',        strength: 'strong' },
+    { id: 'FVG',        name: 'Fair Value Gap',          probability: 95, category: 'price_action',   strength: 'exceptional' },
+    { id: 'OB',         name: 'Order Block',             probability: 70, category: 'price_action',   strength: 'moderate' },
+    { id: 'CHOCH',      name: 'Change of Character',     probability: 75, category: 'price_action',   strength: 'strong' },
+    { id: 'BOS',        name: 'Break of Structure',      probability: 70, category: 'price_action',   strength: 'moderate' },
+    { id: 'LIQ_SWEEP',  name: 'Liquidity Sweep',         probability: 65, category: 'price_action',   strength: 'moderate' },
+    { id: 'SR',         name: 'Support & Resistance',    probability: 68, category: 'price_action',   strength: 'moderate' },
+    { id: 'TL_BREAK',   name: 'Trendline Break',         probability: 68, category: 'price_action',   strength: 'moderate' },
+    { id: 'INSIDE_BAR', name: 'Inside Bar',              probability: 66, category: 'price_action',   strength: 'moderate' },
+    { id: 'EMA_CROSS',  name: 'EMA Crossover',           probability: 65, category: 'moving_average', strength: 'moderate' },
+    { id: 'MA_STACK',   name: 'MA Stack',                probability: 72, category: 'moving_average', strength: 'strong' },
+    { id: 'OVERLAP',    name: 'London-NY Overlap',       probability: 80, category: 'moving_average', strength: 'very_strong' },
+    { id: 'PULLBACK',   name: 'Pullback Entry',          probability: 65, category: 'moving_average', strength: 'moderate' },
+    { id: 'ORB',        name: 'Opening Range Breakout',  probability: 72, category: 'breakout',       strength: 'strong' },
+    { id: 'CONS_BREAK', name: 'Consolidation Breakout',  probability: 70, category: 'breakout',       strength: 'moderate' },
+    { id: 'HTF_CONF',   name: 'Higher TF Confirmation', probability: 65, category: 'breakout',       strength: 'moderate' },
+    { id: 'MR',         name: 'Mean Reversion',          probability: 70, category: 'mean_reversion', strength: 'moderate' },
+    { id: 'FIB',        name: 'Fibonacci Retracement',  probability: 70, category: 'mean_reversion', strength: 'moderate' },
+    { id: 'BB',         name: 'Bollinger Bands',         probability: 65, category: 'mean_reversion', strength: 'moderate' },
+    { id: 'BB_BOUNCE',  name: 'Bollinger Bounce',        probability: 65, category: 'mean_reversion', strength: 'moderate' },
+    { id: 'RSI_DIV',    name: 'RSI Divergence',          probability: 67, category: 'momentum',       strength: 'moderate' },
+    { id: 'MACD_DIV',   name: 'MACD Divergence',         probability: 68, category: 'momentum',       strength: 'moderate' },
+    { id: 'RSI_EXT',    name: 'RSI Extremes',            probability: 64, category: 'momentum',       strength: 'weak' },
+    { id: 'TREND_CONF', name: 'Trend Confirmation',      probability: 68, category: 'momentum',       strength: 'moderate' },
+    { id: 'VOL_CONF',   name: 'Volume Confirmation',     probability: 68, category: 'volume',         strength: 'moderate' },
+    { id: 'GAP_FILL',   name: 'Gap Fill',                probability: 65, category: 'volume',         strength: 'moderate' },
+    { id: 'CONF_ZONE',  name: 'Confluence Zone',         probability: 72, category: 'volume',         strength: 'strong' },
   ]
 };
 
@@ -169,7 +175,11 @@ class TechnicalIndicators {
     if (closes.length < period + 1) return closes[closes.length - 1] * 0.01;
     const trs = [];
     for (let i = 1; i < closes.length; i++) {
-      trs.push(Math.max(highs[i] - lows[i], Math.abs(highs[i] - closes[i-1]), Math.abs(lows[i] - closes[i-1])));
+      trs.push(Math.max(
+        highs[i] - lows[i],
+        Math.abs(highs[i] - closes[i - 1]),
+        Math.abs(lows[i] - closes[i - 1])
+      ));
     }
     return parseFloat((trs.slice(-period).reduce((a, b) => a + b, 0) / period).toFixed(6));
   }
@@ -195,11 +205,11 @@ class TechnicalIndicators {
     const lows    = candles.map(c => c.low);
     const closes  = candles.map(c => c.close);
     const volumes = candles.map(c => c.volume || 0);
-    const rsi   = this.calculateRSI(closes);
-    const macd  = this.calculateMACD(closes);
-    const ema12 = this.calculateEMA(closes, Math.min(12, closes.length - 1));
-    const ema26 = this.calculateEMA(closes, Math.min(26, closes.length - 1));
-    const ema50 = this.calculateEMA(closes, Math.min(50, closes.length - 1));
+    const rsi    = this.calculateRSI(closes);
+    const macd   = this.calculateMACD(closes);
+    const ema12  = this.calculateEMA(closes, Math.min(12, closes.length - 1));
+    const ema26  = this.calculateEMA(closes, Math.min(26, closes.length - 1));
+    const ema50  = this.calculateEMA(closes, Math.min(50, closes.length - 1));
     const atr    = this.calculateATR(highs, lows, closes);
     const volume = this.analyzeVolume(volumes);
     const fvg    = this.detectFVG(candles);
@@ -212,17 +222,13 @@ class TechnicalIndicators {
 }
 
 // ============================================================
-// TWELVE DATA FETCHER — Forex + Commodities (FREE, 800/day)
-// ============================================================
-// Sign up at https://twelvedata.com to get your free API key.
-// Free plan: 800 API credits/day, 8 requests/minute.
-// Add TWELVE_DATA_API_KEY to your Render environment variables.
+// TWELVE DATA FETCHER — Forex + Gold (FREE, 800 calls/day)
 // ============================================================
 class TwelveDataFetcher {
   constructor() {
-    this.apiKey = CONFIG.TWELVE_DATA_API_KEY;
-    this.baseUrl = CONFIG.TWELVE_DATA_REST;
-    this.lastCall = 0; // rate-limit guard (8 req/min on free plan)
+    this.apiKey   = CONFIG.TWELVE_DATA_API_KEY;
+    this.baseUrl  = CONFIG.TWELVE_DATA_REST;
+    this.lastCall = 0;
   }
 
   async fetchCandles(tdSymbol) {
@@ -232,8 +238,8 @@ class TwelveDataFetcher {
         return null;
       }
 
-      // Respect free tier: 8 requests/minute → wait 8s between calls
-      const now = Date.now();
+      // Free tier: 8 requests/minute → enforce 8s gap
+      const now  = Date.now();
       const wait = 8000 - (now - this.lastCall);
       if (wait > 0) await new Promise(r => setTimeout(r, wait));
       this.lastCall = Date.now();
@@ -249,19 +255,16 @@ class TwelveDataFetcher {
       });
 
       const d = response.data;
-
-      // API-level error (e.g. wrong symbol, quota exceeded)
       if (d.status === 'error' || d.code) {
         console.error(`[TwelveData] API error ${tdSymbol}: ${d.message || d.code}`);
         return null;
       }
-
       if (!d.values || !d.values.length) {
         console.log(`[TwelveData] No data for ${tdSymbol}`);
         return null;
       }
 
-      // Twelve Data returns newest first — reverse so oldest is first
+      // Twelve Data returns newest first — reverse to oldest first
       const candles = d.values.reverse().map(bar => ({
         time:   new Date(bar.datetime).getTime(),
         open:   parseFloat(bar.open),
@@ -283,21 +286,71 @@ class TwelveDataFetcher {
 }
 
 // ============================================================
-// COINGECKO FETCHER — Crypto (FREE, no key, no IP ban)
+// YAHOO FINANCE FETCHER — Silver XAG/USD (FREE, no key)
+// ============================================================
+class YahooFetcher {
+  async fetchCandles(yahooSymbol) {
+    try {
+      const now  = Math.floor(Date.now() / 1000);
+      const from = now - 60 * 60 * 24; // last 24 hours
+      const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}` +
+                   `?interval=5m&period1=${from}&period2=${now}`;
+
+      const response = await axios.get(url, {
+        timeout: 15000,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      });
+
+      const result = response.data?.chart?.result?.[0];
+      if (!result?.timestamp?.length) {
+        console.log(`[Yahoo] No data for ${yahooSymbol}`);
+        return null;
+      }
+
+      const { timestamp, indicators } = result;
+      const q = indicators.quote[0];
+
+      const candles = timestamp
+        .map((t, i) => ({
+          time:   t * 1000,
+          open:   q.open[i],
+          high:   q.high[i],
+          low:    q.low[i],
+          close:  q.close[i],
+          volume: q.volume[i] || 0,
+        }))
+        .filter(c => c.open != null && c.close != null);
+
+      if (candles.length < 10) {
+        console.log(`[Yahoo] Too few candles for ${yahooSymbol}: ${candles.length}`);
+        return null;
+      }
+
+      console.log(`[Yahoo] ✅ ${yahooSymbol}: ${candles.length} candles`);
+      return candles;
+
+    } catch (err) {
+      const status = err.response?.status;
+      console.error(`[Yahoo] Error ${yahooSymbol}: ${status || err.message}`);
+      return null;
+    }
+  }
+}
+
+// ============================================================
+// COINGECKO FETCHER — Crypto (FREE, no key)
 // ============================================================
 class CoinGeckoFetcher {
   constructor() {
     this.baseUrl = CONFIG.COINGECKO_REST;
-    this.lastFetch = {};
   }
 
   async fetchCandles(cgId) {
     try {
-      // OHLC endpoint — 1 day returns ~24 candles (hourly-ish)
       const response = await axios.get(
         `${this.baseUrl}/coins/${cgId}/ohlc`,
         {
-          params: { vs_currency: 'usd', days: '1' },
+          params:  { vs_currency: 'usd', days: '1' },
           timeout: 15000,
           headers: { 'Accept': 'application/json' },
         }
@@ -310,7 +363,7 @@ class CoinGeckoFetcher {
 
       const candles = response.data.map(c => ({
         time: c[0], open: c[1], high: c[2], low: c[3], close: c[4],
-        volume: 1000000, // OHLC endpoint has no volume — placeholder
+        volume: 1000000,
       }));
 
       console.log(`[CoinGecko] ✅ ${cgId}: ${candles.length} candles`);
@@ -319,7 +372,6 @@ class CoinGeckoFetcher {
     } catch (err) {
       const status = err.response?.status;
       console.error(`[CoinGecko] Error ${cgId}: ${status || err.message}`);
-      // Rate limited — try market_chart fallback
       if (status === 429) return await this.fetchMarketChart(cgId);
       return null;
     }
@@ -327,22 +379,23 @@ class CoinGeckoFetcher {
 
   async fetchMarketChart(cgId) {
     try {
+      await new Promise(r => setTimeout(r, 5000));
       const response = await axios.get(
         `${this.baseUrl}/coins/${cgId}/market_chart`,
         {
-          params: { vs_currency: 'usd', days: '1', interval: 'hourly' },
+          params:  { vs_currency: 'usd', days: '1', interval: 'hourly' },
           timeout: 15000,
         }
       );
       if (!response.data?.prices?.length) return null;
-      const prices = response.data.prices;
+      const prices  = response.data.prices;
       const candles = prices.map((p, i) => {
         const prev = prices[i - 1] || p;
         const price = p[1], prevPrice = prev[1];
         return {
           time: p[0], open: prevPrice,
-          high: Math.max(price, prevPrice) * 1.001,
-          low:  Math.min(price, prevPrice) * 0.999,
+          high:  Math.max(price, prevPrice) * 1.001,
+          low:   Math.min(price, prevPrice) * 0.999,
           close: price, volume: 1000000,
         };
       });
@@ -356,14 +409,13 @@ class CoinGeckoFetcher {
 }
 
 // ============================================================
-// DHAN FETCHER — India NSE Indices (FIXED)
+// DHAN FETCHER — India NSE Indices
 // ============================================================
-// FIXES applied:
-//   1. oi must be boolean false, NOT the string 'false'
-//   2. expiryCode must be integer 0
-//   3. Weekend guard — Dhan returns 400 on Sat/Sun (market closed)
-//   4. interval changed to FIVE_MINUTE (matches bot's 5-min cycle)
-//   5. Better error logging (prints full Dhan error message)
+// If you see "Invalid Token":
+//   1. Go to https://developer.dhanhq.co
+//   2. Generate a new Access Token
+//   3. Update DHAN_ACCESS_TOKEN in Render → Environment Variables
+//   4. Trigger a manual redeploy on Render
 // ============================================================
 class DhanFetcher {
   constructor() {
@@ -380,19 +432,18 @@ class DhanFetcher {
   }
 
   isMarketWeekday() {
-    // Dhan rejects requests on weekends (Indian market is Mon-Fri)
     const istNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-    const day = istNow.getDay(); // 0 = Sun, 6 = Sat
+    const day = istNow.getDay();
     return day >= 1 && day <= 5;
   }
 
   async fetchCandles(symbol) {
     try {
       if (!this.clientId || !this.accessToken) {
-        throw new Error('Dhan credentials not configured');
+        console.warn(`[Dhan] Credentials missing — skipping ${symbol}`);
+        return null;
       }
 
-      // Skip weekends — Dhan 400s when market is closed
       if (!this.isMarketWeekday()) {
         console.log(`[Dhan] Weekend/holiday — skipping ${symbol}`);
         return null;
@@ -406,14 +457,14 @@ class DhanFetcher {
       fromDate.setDate(fromDate.getDate() - 5);
 
       const requestBody = {
-        securityId:      config.dhanSecurityId,  // string, e.g. '13'
+        securityId:      config.dhanSecurityId,
         exchangeSegment: 'IDX_I',
         instrument:      'INDEX',
-        expiryCode:      0,          // ✅ integer (was missing/wrong type)
-        oi:              false,      // ✅ boolean (was string 'false' — caused 400)
+        expiryCode:      0,      // integer
+        oi:              false,  // boolean (NOT string 'false')
         fromDate:        this.formatDate(fromDate),
         toDate:          this.formatDate(toDate),
-        interval:        'FIVE_MINUTE', // changed from ONE_MINUTE for cleaner data
+        interval:        'FIVE_MINUTE',
       };
 
       const response = await axios.post(
@@ -455,6 +506,9 @@ class DhanFetcher {
                   || err.response?.data?.message
                   || err.message;
       console.error(`[Dhan] Error ${symbol}: ${status} — ${msg}`);
+      if (msg && msg.toLowerCase().includes('token')) {
+        console.error('[Dhan] ⚠️  Token expired! Go to https://developer.dhanhq.co → regenerate token → update DHAN_ACCESS_TOKEN in Render env vars.');
+      }
       return null;
     }
   }
@@ -465,7 +519,10 @@ class DhanFetcher {
 // ============================================================
 class MetaTraderReceiver {
   constructor() { this.data = {}; this.lastUpdate = {}; }
-  receiveData(symbol, candles) { this.data[symbol] = candles; this.lastUpdate[symbol] = Date.now(); }
+  receiveData(symbol, candles) {
+    this.data[symbol] = candles;
+    this.lastUpdate[symbol] = Date.now();
+  }
   getCandles(symbol) {
     if (!this.lastUpdate[symbol] || Date.now() - this.lastUpdate[symbol] > 15 * 60 * 1000) return null;
     return this.data[symbol] || null;
@@ -477,21 +534,24 @@ class MetaTraderReceiver {
 // ============================================================
 class HybridDataFetcher {
   constructor() {
-    this.twelvedata = new TwelveDataFetcher();
-    this.coingecko  = new CoinGeckoFetcher();
-    this.dhan       = new DhanFetcher();
-    this.metatrader = new MetaTraderReceiver();
-    this.cache      = {};
+    this.twelvedata  = new TwelveDataFetcher();
+    this.yahoo       = new YahooFetcher();
+    this.coingecko   = new CoinGeckoFetcher();
+    this.dhan        = new DhanFetcher();
+    this.metatrader  = new MetaTraderReceiver();
+    this.cache       = {};
     this.cgLastFetch = {};
   }
 
   async initialize() {
     console.log('[Bot] ✅ Data sources:');
     console.log('[Bot]    Crypto  → CoinGecko    (free, no key)');
-    console.log('[Bot]    Forex   → Twelve Data  (free, key needed)');
+    console.log('[Bot]    Forex   → Twelve Data  (free key needed)');
+    console.log('[Bot]    Gold    → Twelve Data  (free key needed)');
+    console.log('[Bot]    Silver  → Yahoo Finance (free, no key)');
     console.log('[Bot]    India   → Dhan REST API');
     if (!CONFIG.TWELVE_DATA_API_KEY) {
-      console.warn('[Bot] ⚠️  TWELVE_DATA_API_KEY not set — Forex/Gold will use cache/MetaTrader fallback');
+      console.warn('[Bot] ⚠️  TWELVE_DATA_API_KEY not set — Forex/Gold will use cache/fallback');
     }
     if (!CONFIG.DHAN_CLIENT_ID || !CONFIG.DHAN_ACCESS_TOKEN) {
       console.warn('[Bot] ⚠️  Dhan credentials not set — NSE indices will be skipped');
@@ -509,11 +569,15 @@ class HybridDataFetcher {
         candles = await this.twelvedata.fetchCandles(config.tdSymbol);
         source  = 'twelvedata';
 
+      } else if (config.source === 'yahoo') {
+        candles = await this.yahoo.fetchCandles(config.yahooSymbol);
+        source  = 'yahoo';
+
       } else if (config.source === 'coingecko') {
-        // Rate limit: 2s between CoinGecko calls
+        // Rate limit: 15s between CoinGecko calls to avoid 429
         const now  = Date.now();
         const last = this.cgLastFetch[config.cgId] || 0;
-        if (now - last < 2000) await new Promise(r => setTimeout(r, 2000 - (now - last)));
+        if (now - last < 15000) await new Promise(r => setTimeout(r, 15000 - (now - last)));
         candles = await this.coingecko.fetchCandles(config.cgId);
         this.cgLastFetch[config.cgId] = Date.now();
         source  = 'coingecko';
@@ -526,7 +590,7 @@ class HybridDataFetcher {
       console.error(`[Hybrid] Error ${symbol}:`, err.message);
     }
 
-    // Fallback 1: MetaTrader EA data
+    // Fallback 1: MetaTrader EA
     if (!candles || candles.length < 10) {
       const mtCandles = this.metatrader.getCandles(symbol);
       if (mtCandles) { candles = mtCandles; source = 'metatrader'; }
@@ -537,7 +601,6 @@ class HybridDataFetcher {
       if (this.cache[symbol]) { candles = this.cache[symbol]; source = 'cache'; }
     }
 
-    // Update cache on success
     if (candles?.length >= 10) this.cache[symbol] = candles;
 
     return candles?.length >= 10 ? { candles, source } : null;
@@ -601,19 +664,28 @@ class SignalGenerator {
   generateSignal(symbol, candles, source) {
     const indicators = TechnicalIndicators.calculateAll(candles);
     if (!indicators) return null;
-    const strategy = this.allStrategies[Math.floor(Math.random() * this.allStrategies.length)];
-    const quality  = this.scoreSignal(strategy, indicators);
+    const strategy  = this.allStrategies[Math.floor(Math.random() * this.allStrategies.length)];
+    const quality   = this.scoreSignal(strategy, indicators);
     if (quality < CONFIG.SIGNAL_QUALITY_MIN) return null;
     const direction = this.getDirection(indicators);
     const levels    = this.calculateLevels(direction, indicators.currentPrice, indicators.atr);
     return {
       id: `${symbol}_${Date.now()}`, symbol,
-      symbolName: SYMBOLS[symbol].name, category: SYMBOLS[symbol].category,
-      direction, quality,
-      strategy: { id: strategy.id, name: strategy.name, probability: strategy.probability, strength: strategy.strength },
+      symbolName: SYMBOLS[symbol].name,
+      category:   SYMBOLS[symbol].category,
+      direction,  quality,
+      strategy: {
+        id: strategy.id, name: strategy.name,
+        probability: strategy.probability, strength: strategy.strength,
+      },
       levels,
-      indicators: { rsi: indicators.rsi, macd: indicators.macd, trend: indicators.trend, volume: indicators.volume, fvg: indicators.fvg, ema: indicators.ema },
-      dataSource: source, candleCount: candles.length, timestamp: new Date().toISOString(),
+      indicators: {
+        rsi: indicators.rsi, macd: indicators.macd, trend: indicators.trend,
+        volume: indicators.volume, fvg: indicators.fvg, ema: indicators.ema,
+      },
+      dataSource:  source,
+      candleCount: candles.length,
+      timestamp:   new Date().toISOString(),
     };
   }
 }
@@ -662,7 +734,7 @@ const botState = {
   stats: { totalAnalyzed: 0, totalSignals: 0, startTime: Date.now() },
   isRunning: false,
 };
-const dataFetcher    = new HybridDataFetcher();
+const dataFetcher     = new HybridDataFetcher();
 const signalGenerator = new SignalGenerator();
 
 async function runAnalysisCycle() {
@@ -702,12 +774,13 @@ async function runAnalysisCycle() {
 // API ENDPOINTS
 // ============================================================
 app.get('/', (req, res) => res.json({
-  bot: 'HYBRID TRADING BOT v5.3', status: 'OPERATIONAL ✅', version: '5.3.0',
+  bot: 'HYBRID TRADING BOT v5.4', status: 'OPERATIONAL ✅', version: '5.4.0',
   dataSources: {
     crypto:      'CoinGecko (free, no key)',
-    forex:       'Twelve Data API (free, key needed)',
-    commodities: 'Twelve Data API (free, key needed)',
-    india:       'Dhan API',
+    forex:       'Twelve Data API (free key needed)',
+    gold:        'Twelve Data API (free key needed)',
+    silver:      'Yahoo Finance (free, no key)',
+    india:       'Dhan API (token must be valid)',
   },
   symbols:    { forex: 4, crypto: 5, commodity: 2, india: 3, total: 14 },
   strategies: { total: 38 },
@@ -725,12 +798,13 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const uptime = Math.floor((Date.now() - botState.stats.startTime) / 1000);
   res.json({
-    status: 'OPERATIONAL ✅', version: '5.3.0',
-    uptime: `${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m ${uptime%60}s`,
-    totalSignals: botState.stats.totalSignals,
+    status: 'OPERATIONAL ✅', version: '5.4.0',
+    uptime: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`,
+    totalSignals:  botState.stats.totalSignals,
     totalAnalyzed: botState.stats.totalAnalyzed,
     dataSources: {
       twelvedata: CONFIG.TWELVE_DATA_API_KEY ? '✅ Forex+Gold' : '⚠️ Key missing',
+      yahoo:      '✅ Silver (no key needed)',
       coingecko:  '✅ Crypto (no key needed)',
       dhan:       (CONFIG.DHAN_CLIENT_ID && CONFIG.DHAN_ACCESS_TOKEN) ? '✅ India NSE' : '⚠️ Credentials missing',
     },
@@ -740,9 +814,9 @@ app.get('/api/health', (req, res) => {
 });
 
 app.get('/api/signals', (req, res) => {
-  const limit = parseInt(req.query.limit) || 50;
+  const limit    = parseInt(req.query.limit) || 50;
   const category = req.query.category;
-  let signals = botState.signals.slice(0, limit);
+  let signals    = botState.signals.slice(0, limit);
   if (category) signals = signals.filter(s => s.category === category);
   res.json({ count: signals.length, signals });
 });
@@ -752,16 +826,18 @@ app.get('/api/signals/:symbol', (req, res) => {
   res.json({ symbol, signals: botState.signals.filter(s => s.symbol === symbol) });
 });
 
-app.get('/api/strategies', (req, res) => res.json({ total: 38, combo: STRATEGIES.combo, core: STRATEGIES.core }));
+app.get('/api/strategies', (req, res) => res.json({
+  total: 38, combo: STRATEGIES.combo, core: STRATEGIES.core,
+}));
 
 app.get('/api/symbols', (req, res) => res.json({ total: 14, symbols: SYMBOLS }));
 
 app.get('/api/stats', (req, res) => {
-  const uptime = Math.floor((Date.now() - botState.stats.startTime) / 1000);
+  const uptime     = Math.floor((Date.now() - botState.stats.startTime) / 1000);
   const byCategory = {};
   botState.signals.forEach(s => { byCategory[s.category] = (byCategory[s.category] || 0) + 1; });
   res.json({
-    uptime: `${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m`,
+    uptime: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`,
     totalAnalyzed:  botState.stats.totalAnalyzed,
     totalSignals:   botState.stats.totalSignals,
     avgQuality: botState.signals.length
@@ -786,10 +862,12 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 // ============================================================
 async function startBot() {
   console.log('\n╔══════════════════════════════════════════════╗');
-  console.log('║   HYBRID TRADING BOT v5.3 - ALL FIXED! ✅   ║');
+  console.log('║   HYBRID TRADING BOT v5.4 - ALL FIXED! ✅   ║');
   console.log('║  Crypto  → CoinGecko  (no key, no ban)      ║');
   console.log('║  Forex   → Twelve Data (free key)            ║');
-  console.log('║  India   → Dhan REST API (body fixed)        ║');
+  console.log('║  Gold    → Twelve Data (free key)            ║');
+  console.log('║  Silver  → Yahoo Finance (no key needed)     ║');
+  console.log('║  India   → Dhan REST API                     ║');
   console.log('╚══════════════════════════════════════════════╝\n');
 
   app.listen(CONFIG.PORT, () => console.log(`[Server] ✅ Port ${CONFIG.PORT}`));
