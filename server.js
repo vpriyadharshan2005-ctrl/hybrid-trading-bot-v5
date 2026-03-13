@@ -1701,44 +1701,77 @@ class YahooFetcher {
   }
 }
 
+// ============================================================
+// COINGECKO FETCHER — Smart batched fetcher
+// Strategy:
+//   - All 5 coins are pre-fetched ONCE per cycle with 12s stagger
+//   - Results cached in this.batch{}
+//   - On 429, skip fallback immediately and return cached data
+//   - Batch is refreshed only once every 4.5 minutes (just under 5min cycle)
+// ============================================================
 class CoinGeckoFetcher {
-  constructor() { this.baseUrl = CONFIG.COINGECKO_REST; }
-
-  async fetchCandles(cgId) {
-    try {
-      const res = await axios.get(`${this.baseUrl}/coins/${cgId}/ohlc`,
-        { params: { vs_currency: 'usd', days: '1' }, timeout: 15000, headers: { 'Accept': 'application/json' } }
-      );
-      if (!res.data?.length) return null;
-      const candles = res.data.map(c => ({ time: c[0], open: c[1], high: c[2], low: c[3], close: c[4], volume: 1000000 }));
-      console.log(`[CoinGecko] ✅ ${cgId}: ${candles.length} candles`);
-      return candles;
-    } catch (err) {
-      const status = err.response?.status;
-      console.error(`[CoinGecko] Error ${cgId}: ${status || err.message}`);
-      if (status === 429) return await this.fetchMarketChart(cgId);
-      return null;
-    }
+  constructor() {
+    this.baseUrl    = CONFIG.COINGECKO_REST;
+    this.batch      = {};        // { cgId: candles[] }
+    this.batchTime  = 0;         // when last batch was fetched
+    this.batchTTL   = 4.5 * 60 * 1000; // 4.5 minutes
+    this.rateLimited = false;    // global 429 flag
+    this.rateLimitUntil = 0;     // backoff until timestamp
   }
 
-  async fetchMarketChart(cgId) {
-    try {
-      await new Promise(r => setTimeout(r, 5000));
-      const res = await axios.get(`${this.baseUrl}/coins/${cgId}/market_chart`,
-        { params: { vs_currency: 'usd', days: '1', interval: 'hourly' }, timeout: 15000 }
-      );
-      if (!res.data?.prices?.length) return null;
-      const prices = res.data.prices;
-      const candles = prices.map((p, i) => {
-        const prev = prices[i - 1] || p;
-        return { time: p[0], open: prev[1], high: Math.max(p[1], prev[1]) * 1.001, low: Math.min(p[1], prev[1]) * 0.999, close: p[1], volume: 1000000 };
-      });
-      console.log(`[CoinGecko] ✅ ${cgId} (market_chart): ${candles.length} candles`);
-      return candles;
-    } catch (err) {
-      console.error(`[CoinGecko] market_chart error ${cgId}: ${err.message}`);
-      return null;
+  // Called once per cycle to pre-fetch all coins with stagger
+  async prefetchAll(cgIds) {
+    // Skip if batch is still fresh
+    if (Date.now() - this.batchTime < this.batchTTL && Object.keys(this.batch).length > 0) {
+      console.log('[CoinGecko] Using cached batch');
+      return;
     }
+
+    // Skip if globally rate limited and backoff not expired
+    if (this.rateLimited && Date.now() < this.rateLimitUntil) {
+      console.log(`[CoinGecko] Rate limited — skipping prefetch, using cache`);
+      return;
+    }
+    this.rateLimited = false;
+
+    console.log('[CoinGecko] Prefetching all crypto...');
+    for (let i = 0; i < cgIds.length; i++) {
+      const cgId = cgIds[i];
+      // Stagger: 12s between each coin to stay under 5 req/min free limit
+      if (i > 0) await new Promise(r => setTimeout(r, 12000));
+
+      try {
+        const res = await axios.get(`${this.baseUrl}/coins/${cgId}/ohlc`, {
+          params: { vs_currency: 'usd', days: '1' },
+          timeout: 15000,
+          headers: { 'Accept': 'application/json' },
+        });
+
+        if (res.data?.length) {
+          this.batch[cgId] = res.data.map(c => ({
+            time: c[0], open: c[1], high: c[2], low: c[3], close: c[4], volume: 1000000,
+          }));
+          console.log(`[CoinGecko] ✅ ${cgId}: ${this.batch[cgId].length} candles`);
+        }
+
+      } catch (err) {
+        const status = err.response?.status;
+        if (status === 429) {
+          console.warn(`[CoinGecko] 429 on ${cgId} — backing off 60s, using cache for all remaining`);
+          this.rateLimited    = true;
+          this.rateLimitUntil = Date.now() + 60000; // wait 60s before trying again
+          break; // stop fetching remaining coins, use cache
+        } else {
+          console.error(`[CoinGecko] Error ${cgId}: ${status || err.message}`);
+        }
+      }
+    }
+    this.batchTime = Date.now();
+  }
+
+  // Returns candles from batch (already fetched by prefetchAll)
+  getCandles(cgId) {
+    return this.batch[cgId] || null;
   }
 }
 
@@ -1810,17 +1843,28 @@ class MetaTraderReceiver {
 
 class HybridDataFetcher {
   constructor() {
-    this.twelvedata  = new TwelveDataFetcher();
-    this.yahoo       = new YahooFetcher();
-    this.coingecko   = new CoinGeckoFetcher();
-    this.dhan        = new DhanFetcher();
-    this.metatrader  = new MetaTraderReceiver();
-    this.cache       = {};
-    this.cgLastFetch = {};
+    this.twelvedata = new TwelveDataFetcher();
+    this.yahoo      = new YahooFetcher();
+    this.coingecko  = new CoinGeckoFetcher();
+    this.dhan       = new DhanFetcher();
+    this.metatrader = new MetaTraderReceiver();
+    this.cache      = {};
+
+    // All CoinGecko coin IDs in order
+    this.cgIds = Object.values(SYMBOLS)
+      .filter(s => s.source === 'coingecko')
+      .map(s => s.cgId);
   }
 
   async initialize() {
-    console.log('[Bot] Data sources: CoinGecko | Twelve Data | Yahoo Finance | Dhan (placeholder until token added)');
+    console.log('[Bot] Data sources: CoinGecko (batch) | Twelve Data | Yahoo Finance | Dhan');
+    // Pre-warm crypto cache on startup
+    await this.coingecko.prefetchAll(this.cgIds);
+  }
+
+  // Called at the START of each analysis cycle before symbol loop
+  async prefetchCrypto() {
+    await this.coingecko.prefetchAll(this.cgIds);
   }
 
   async fetchCandles(symbol) {
@@ -1830,27 +1874,35 @@ class HybridDataFetcher {
 
     try {
       if (config.source === 'twelvedata') {
-        candles = await this.twelvedata.fetchCandles(config.tdSymbol); source = 'twelvedata';
+        candles = await this.twelvedata.fetchCandles(config.tdSymbol);
+        source  = 'twelvedata';
+
       } else if (config.source === 'yahoo') {
-        candles = await this.yahoo.fetchCandles(config.yahooSymbol); source = 'yahoo';
+        candles = await this.yahoo.fetchCandles(config.yahooSymbol);
+        source  = 'yahoo';
+
       } else if (config.source === 'coingecko') {
-        const now = Date.now(), last = this.cgLastFetch[config.cgId] || 0;
-        if (now - last < 15000) await new Promise(r => setTimeout(r, 15000 - (now - last)));
-        candles = await this.coingecko.fetchCandles(config.cgId);
-        this.cgLastFetch[config.cgId] = Date.now();
-        source = 'coingecko';
+        // Batch was already fetched at cycle start — just read from batch
+        candles = this.coingecko.getCandles(config.cgId);
+        source  = candles ? 'coingecko' : 'unknown';
+
       } else if (config.source === 'dhan') {
-        candles = await this.dhan.fetchCandles(symbol); source = 'dhan';
+        candles = await this.dhan.fetchCandles(symbol);
+        source  = 'dhan';
       }
     } catch (err) { console.error(`[Hybrid] ${symbol}:`, err.message); }
 
+    // Fallback 1: MetaTrader
     if (!candles || candles.length < 10) {
       const mt = this.metatrader.getCandles(symbol);
       if (mt) { candles = mt; source = 'metatrader'; }
     }
+
+    // Fallback 2: Cache
     if (!candles || candles.length < 10) {
       if (this.cache[symbol]) { candles = this.cache[symbol]; source = 'cache'; }
     }
+
     if (candles?.length >= 10) this.cache[symbol] = candles;
     return candles?.length >= 10 ? { candles, source } : null;
   }
@@ -1918,6 +1970,12 @@ async function runAnalysisCycle() {
   botState.isRunning = true;
   const cycleStart = Date.now();
   console.log(`\n[Bot] ⚡ Cycle — ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`);
+
+  // Pre-fetch all 5 crypto coins in one staggered batch BEFORE the symbol loop.
+  // Prevents 429s from 5 rapid sequential requests mid-cycle.
+  console.log('[Bot] Prefetching crypto batch...');
+  await dataFetcher.prefetchCrypto();
+
   let cycleSignals = 0;
 
   for (const symbol of Object.keys(SYMBOLS)) {
