@@ -247,6 +247,77 @@ class Indicators {
   }
 }
 
+
+// ============================================================
+// ── MTF CONTEXT ANALYZER ────────────────────────────────────
+// Derives the top-down bias from H4 → H1 → M5 candle data.
+// Used by HTF_CONF, OB_HTF, FVG_BOS_HTF, OVERLAP_OB, ORB_MA.
+// ============================================================
+class MTFContext {
+
+  // Build full top-down context from 3 TF candle arrays
+  static analyze(m5, h1, h4) {
+    const h4Trend  = h4 && h4.length >= 10  ? Indicators.trendStrength(h4.map(c => c.close)) : { trend: 'NEUTRAL', strength: 0 };
+    const h1Trend  = h1 && h1.length >= 20  ? Indicators.trendStrength(h1.map(c => c.close)) : { trend: 'NEUTRAL', strength: 0 };
+    const m5Trend  = m5 && m5.length >= 20  ? Indicators.trendStrength(m5.map(c => c.close)) : { trend: 'NEUTRAL', strength: 0 };
+
+    const h4Rsi    = h4 && h4.length >= 15  ? Indicators.rsi(h4.map(c => c.close)) : 50;
+    const h1Rsi    = h1 && h1.length >= 15  ? Indicators.rsi(h1.map(c => c.close)) : 50;
+
+    // Key H1 levels (OB / FVG zones on 1H)
+    const h1SwH    = h1 ? Indicators.swingHighs(h1.map(c => c.high), 3, 3) : [];
+    const h1SwL    = h1 ? Indicators.swingLows(h1.map(c => c.low), 3, 3)   : [];
+    const h4SwH    = h4 ? Indicators.swingHighs(h4.map(c => c.high), 2, 3) : [];
+    const h4SwL    = h4 ? Indicators.swingLows(h4.map(c => c.low), 2, 3)   : [];
+
+    // Overall bias: H4 is the master
+    let bias = h4Trend.trend;
+    if (bias === 'NEUTRAL') bias = h1Trend.trend; // fall back to H1
+
+    // Count how many TFs agree
+    const trends = [h4Trend.trend, h1Trend.trend, m5Trend.trend].filter(t => t !== 'NEUTRAL');
+    const bullCount = trends.filter(t => t === 'BULLISH').length;
+    const bearCount = trends.filter(t => t === 'BEARISH').length;
+    const alignment = bullCount === 3 ? 'FULL_BULL'
+                    : bearCount === 3 ? 'FULL_BEAR'
+                    : bullCount === 2 ? 'PARTIAL_BULL'
+                    : bearCount === 2 ? 'PARTIAL_BEAR'
+                    : 'MIXED';
+
+    return {
+      bias,           // H4-driven master direction
+      alignment,      // how many TFs agree
+      h4Trend: h4Trend.trend,
+      h1Trend: h1Trend.trend,
+      m5Trend: m5Trend.trend,
+      h4Rsi, h1Rsi,
+      h1SwH, h1SwL,   // 1H swing levels (key zones)
+      h4SwH, h4SwL,   // 4H swing levels (major zones)
+      isRealMTF: !!(h1 && h4),
+    };
+  }
+
+  // Returns true if context supports a BUY signal
+  static supportsBuy(ctx) {
+    if (!ctx) return false;
+    return ctx.alignment === 'FULL_BULL' || ctx.alignment === 'PARTIAL_BULL';
+  }
+
+  // Returns true if context supports a SELL signal
+  static supportsSell(ctx) {
+    if (!ctx) return false;
+    return ctx.alignment === 'FULL_BEAR' || ctx.alignment === 'PARTIAL_BEAR';
+  }
+
+  // Score boost based on MTF alignment quality
+  static scoreBoost(ctx) {
+    if (!ctx) return 0;
+    if (ctx.alignment === 'FULL_BULL' || ctx.alignment === 'FULL_BEAR') return 15;
+    if (ctx.alignment === 'PARTIAL_BULL' || ctx.alignment === 'PARTIAL_BEAR') return 8;
+    return 0;
+  }
+}
+
 // ============================================================
 // ── SECTION 2: STRATEGY DETECTORS ───────────────────────────
 // Each function returns null (no signal) or a result object
@@ -850,26 +921,54 @@ class StrategyDetectors {
   }
 
   // 15. Higher Timeframe (HTF) Confirmation
-  // Condition: Use every 4th candle as "HTF" proxy. HTF trend aligns
-  // with current price action direction. Trend must be clear.
-  static detectHTFConfirmation(candles) {
-    if (candles.length < 40) return null;
-    const closes = candles.map(c => c.close);
+  // Real MTF: uses actual 1H and 4H candle arrays when available.
+  // Falls back to every-4th-candle proxy only if HTF data missing.
+  static detectHTFConfirmation(candles, h1Candles = null, h4Candles = null) {
+    if (candles.length < 20) return null;
+    const m5Closes = candles.map(c => c.close);
+    const m5Trend  = Indicators.trendStrength(m5Closes.slice(-20));
 
-    // Build pseudo-HTF candles by taking every 4th close
-    const htfCloses = closes.filter((_, i) => i % 4 === 0);
-    const htfTrend  = Indicators.trendStrength(htfCloses);
-    const ltfTrend  = Indicators.trendStrength(closes.slice(-20));
+    let h1Trend = null, h4Trend = null;
 
-    // Both timeframes must agree
-    if (htfTrend.trend === 'NEUTRAL' || ltfTrend.trend === 'NEUTRAL') return null;
-    if (htfTrend.trend !== ltfTrend.trend) return null;
+    // Real 1H trend
+    if (h1Candles && h1Candles.length >= 20) {
+      h1Trend = Indicators.trendStrength(h1Candles.map(c => c.close));
+    }
+    // Real 4H trend
+    if (h4Candles && h4Candles.length >= 10) {
+      h4Trend = Indicators.trendStrength(h4Candles.map(c => c.close));
+    }
+    // Fallback proxy if no real HTF data
+    if (!h1Trend) {
+      const proxy = m5Closes.filter((_, i) => i % 4 === 0);
+      h1Trend = Indicators.trendStrength(proxy);
+    }
+    if (!h4Trend) {
+      const proxy = m5Closes.filter((_, i) => i % 12 === 0);
+      h4Trend = Indicators.trendStrength(proxy);
+    }
+
+    if (m5Trend.trend === 'NEUTRAL') return null;
+    if (h1Trend.trend === 'NEUTRAL' && h4Trend.trend === 'NEUTRAL') return null;
+
+    // Strong: all 3 align
+    const allAlign = m5Trend.trend === h1Trend.trend && h1Trend.trend === h4Trend.trend;
+    // Partial: at least 2 align
+    const twoAlign = (m5Trend.trend === h1Trend.trend) || (m5Trend.trend === h4Trend.trend);
+    if (!twoAlign) return null;
+
+    const score = allAlign ? 78 : 67;
+    const isReal = !!(h1Candles && h4Candles);
 
     return {
-      direction: htfTrend.trend === 'BULLISH' ? 'BUY' : 'SELL',
+      direction: m5Trend.trend === 'BULLISH' ? 'BUY' : 'SELL',
       id: 'HTF_CONF', name: 'Higher TF Confirmation',
-      strength: 'moderate', probability: 65, score: 67,
-      conditions: { htfTrend: htfTrend.trend, ltfTrend: ltfTrend.trend, aligned: true },
+      strength: allAlign ? 'strong' : 'moderate',
+      probability: allAlign ? 75 : 65, score,
+      conditions: {
+        m5Trend: m5Trend.trend, h1Trend: h1Trend.trend, h4Trend: h4Trend.trend,
+        allAligned: allAlign, realMTF: isReal,
+      },
     };
   }
 
@@ -1433,30 +1532,36 @@ class StrategyDetectors {
     };
   }
 
-  // C10. Order Block + HTF Confirmation
-  static detectOB_HTF(candles) {
+  // C10. Order Block + HTF Confirmation (real MTF)
+  static detectOB_HTF(candles, h1Candles = null, h4Candles = null) {
     const ob  = this.detectOrderBlock(candles);
-    const htf = this.detectHTFConfirmation(candles);
+    const htf = this.detectHTFConfirmation(candles, h1Candles, h4Candles);
     if (!ob || !htf) return null;
     if (ob.direction !== htf.direction) return null;
+    const isReal = !!(h1Candles && h4Candles);
     return {
       direction: ob.direction, id: 'OB_HTF', name: 'Order Block + HTF Confirm',
-      strength: 'strong', probability: 78, score: 83,
-      conditions: { ob: ob.conditions, htf: htf.conditions },
+      strength: isReal ? 'very_strong' : 'strong',
+      probability: isReal ? 82 : 78,
+      score: isReal ? 87 : 83,
+      conditions: { ob: ob.conditions, htf: htf.conditions, realMTF: isReal },
     };
   }
 
-  // C11. FVG + BoS + HTF — THE BEST SETUP ⭐
-  static detectFVG_BoS_HTF(candles) {
+  // C11. FVG + BoS + HTF — THE BEST SETUP ⭐ (real MTF)
+  static detectFVG_BoS_HTF(candles, h1Candles = null, h4Candles = null) {
     const fvg = this.detectFVG(candles);
     const bos = this.detectBoS(candles);
-    const htf = this.detectHTFConfirmation(candles);
+    const htf = this.detectHTFConfirmation(candles, h1Candles, h4Candles);
     if (!fvg || !bos || !htf) return null;
     if (fvg.direction !== bos.direction || bos.direction !== htf.direction) return null;
+    const isReal = !!(h1Candles && h4Candles);
     return {
       direction: fvg.direction, id: 'FVG_BOS_HTF', name: 'FVG + BoS + HTF (BEST ⭐)',
-      strength: 'exceptional', probability: 92, score: 95,
-      conditions: { fvg: fvg.conditions, bos: bos.conditions, htf: htf.conditions },
+      strength: 'exceptional',
+      probability: isReal ? 95 : 92,
+      score: isReal ? 98 : 95,
+      conditions: { fvg: fvg.conditions, bos: bos.conditions, htf: htf.conditions, realMTF: isReal },
     };
   }
 
@@ -1474,11 +1579,17 @@ class StrategyDetectors {
   }
 
   // ────────────────────────────────────────────────────────────
-  // RUN ALL DETECTORS — returns array of all fired signals
+  // RUN ALL DETECTORS
+  // mtfCtx is optional MTFContext.analyze() result.
+  // When present, MTF-aware strategies use real H1/H4 data.
+  // MTF bias also gates which direction signals are allowed.
   // ────────────────────────────────────────────────────────────
-  static runAll(candles) {
+  static runAll(candles, h1Candles = null, h4Candles = null) {
+    // Build MTF context if HTF data available
+    const mtfCtx = MTFContext.analyze(candles, h1Candles, h4Candles);
+
     const detectors = [
-      // Core strategies
+      // Core strategies (all pass candles + optional HTF arrays)
       () => this.detectFVG(candles),
       () => this.detectOrderBlock(candles),
       () => this.detectChoCh(candles),
@@ -1493,7 +1604,7 @@ class StrategyDetectors {
       () => this.detectPullback(candles),
       () => this.detectORB(candles),
       () => this.detectConsolidationBreakout(candles),
-      () => this.detectHTFConfirmation(candles),
+      () => this.detectHTFConfirmation(candles, h1Candles, h4Candles), // real MTF
       () => this.detectMeanReversion(candles),
       () => this.detectFibonacci(candles),
       () => this.detectBollingerBands(candles),
@@ -1505,7 +1616,7 @@ class StrategyDetectors {
       () => this.detectVolumeConfirmation(candles),
       () => this.detectGapFill(candles),
       () => this.detectConfluenceZone(candles),
-      // Combo strategies (all sub-conditions must pass)
+      // Combo strategies — pass HTF arrays to combos that need them
       () => this.detectOB_FVG(candles),
       () => this.detectChoCh_Liq(candles),
       () => this.detectORB_MA(candles),
@@ -1515,8 +1626,8 @@ class StrategyDetectors {
       () => this.detectFVG_BoS(candles),
       () => this.detectMR_Fib(candles),
       () => this.detectFVG_MR(candles),
-      () => this.detectOB_HTF(candles),
-      () => this.detectFVG_BoS_HTF(candles),
+      () => this.detectOB_HTF(candles, h1Candles, h4Candles),       // real MTF
+      () => this.detectFVG_BoS_HTF(candles, h1Candles, h4Candles), // real MTF
       () => this.detectPullback_Vol(candles),
     ];
 
@@ -1524,10 +1635,19 @@ class StrategyDetectors {
     for (const fn of detectors) {
       try {
         const result = fn();
-        if (result) fired.push(result);
+        if (!result) continue;
+
+        // MTF GATE: if strong bias exists, filter out counter-trend signals
+        // Only block if we have REAL HTF data (not proxy) and alignment is full
+        if (mtfCtx.isRealMTF) {
+          if (mtfCtx.alignment === 'FULL_BULL' && result.direction === 'SELL') continue;
+          if (mtfCtx.alignment === 'FULL_BEAR' && result.direction === 'BUY')  continue;
+        }
+
+        fired.push(result);
       } catch (e) { /* skip failed detector */ }
     }
-    return fired;
+    return { fired, mtfCtx };
   }
 }
 
@@ -1563,21 +1683,29 @@ class SignalBuilder {
     return Math.min(agreeing * 3, 15); // up to +15 points for confluence
   }
 
-  static build(symbol, candles, source) {
-    const fired = StrategyDetectors.runAll(candles);
+  // mtfData = { m5, h1, h4 } from HybridDataFetcher.fetchMTF()
+  static build(symbol, candles, source, mtfData = null) {
+    const h1 = mtfData?.h1 || null;
+    const h4 = mtfData?.h4 || null;
+
+    // Run all 38 detectors with real MTF data when available
+    const { fired, mtfCtx } = StrategyDetectors.runAll(candles, h1, h4);
     if (!fired.length) return null;
 
     // Sort by score descending — pick best
     fired.sort((a, b) => b.score - a.score);
     const best = fired[0];
 
-    // Apply confluence boost
-    const boost = this.confluenceBoost(fired, best.direction);
-    const finalScore = Math.min(best.score + boost, 100);
+    // Confluence boost from multiple strategies agreeing
+    const confluenceBoost = this.confluenceBoost(fired, best.direction);
 
+    // MTF alignment boost — real multi-TF confirmation adds score
+    const mtfBoost = MTFContext.scoreBoost(mtfCtx);
+
+    const finalScore = Math.min(best.score + confluenceBoost + mtfBoost, 100);
     if (finalScore < CONFIG.SIGNAL_QUALITY_MIN) return null;
 
-    // Calculate indicators for display
+    // Indicators on M5 (entry TF)
     const closes  = candles.map(c => c.close);
     const highs   = candles.map(c => c.high);
     const lows    = candles.map(c => c.low);
@@ -1590,9 +1718,22 @@ class SignalBuilder {
     const ema26   = Indicators.ema(closes, 26);
     const ema50   = Indicators.ema(closes, Math.min(50, closes.length - 1));
     const vol     = Indicators.volumeAnalysis(volumes);
-    const trend   = Indicators.trendStrength(closes);
+    const m5Trend = Indicators.trendStrength(closes);
 
-    // All strategies that fired and agree with signal direction
+    // H1 indicators (zone TF)
+    let h1Rsi = null, h1Trend = null;
+    if (h1 && h1.length >= 15) {
+      h1Rsi   = parseFloat(Indicators.rsi(h1.map(c => c.close)).toFixed(2));
+      h1Trend = Indicators.trendStrength(h1.map(c => c.close)).trend;
+    }
+
+    // H4 indicators (bias TF)
+    let h4Rsi = null, h4Trend = null;
+    if (h4 && h4.length >= 10) {
+      h4Rsi   = parseFloat(Indicators.rsi(h4.map(c => c.close)).toFixed(2));
+      h4Trend = Indicators.trendStrength(h4.map(c => c.close)).trend;
+    }
+
     const confirmingStrategies = fired
       .filter(s => s.direction === best.direction)
       .map(s => ({ id: s.id, name: s.name, score: s.score }));
@@ -1604,27 +1745,42 @@ class SignalBuilder {
       category:    SYMBOLS[symbol].category,
       direction:   best.direction,
       quality:     finalScore,
-      strategy:    {
+      strategy: {
         id:          best.id,
         name:        best.name,
         probability: best.probability,
         strength:    best.strength,
       },
-      confirmedBy:  confirmingStrategies,  // all strategies that agree
+      confirmedBy:  confirmingStrategies,
       totalFired:   fired.length,
       levels:       this.calculateLevels(best.direction, price, atr),
+
+      // M5 indicators (entry)
       indicators: {
-        rsi:    parseFloat(rsi.toFixed(2)),
-        macd:   parseFloat(macd.macdLine.toFixed(6)),
+        rsi:       parseFloat(rsi.toFixed(2)),
+        macd:      parseFloat(macd.macdLine.toFixed(6)),
         histogram: parseFloat(macd.histogram.toFixed(6)),
-        trend:  trend.trend,
-        ema12:  parseFloat(ema12.toFixed(6)),
-        ema26:  parseFloat(ema26.toFixed(6)),
-        ema50:  parseFloat(ema50.toFixed(6)),
-        volume: vol,
-        atr:    parseFloat(atr.toFixed(6)),
+        trend:     m5Trend.trend,
+        ema12:     parseFloat(ema12.toFixed(6)),
+        ema26:     parseFloat(ema26.toFixed(6)),
+        ema50:     parseFloat(ema50.toFixed(6)),
+        volume:    vol,
+        atr:       parseFloat(atr.toFixed(6)),
       },
-      strategyConditions: best.conditions, // the actual conditions that were met
+
+      // MTF analysis summary
+      mtf: {
+        enabled:    !!(h1 && h4),
+        bias:       mtfCtx.bias,
+        alignment:  mtfCtx.alignment,
+        h4Trend:    mtfCtx.h4Trend,
+        h1Trend:    mtfCtx.h1Trend,
+        m5Trend:    mtfCtx.m5Trend,
+        h4Rsi, h1Rsi,
+        mtfBoost,
+      },
+
+      strategyConditions: best.conditions,
       dataSource:   source,
       candleCount:  candles.length,
       timestamp:    new Date().toISOString(),
@@ -1643,21 +1799,23 @@ class TwelveDataFetcher {
     this.lastCall = 0;
   }
 
-  async fetchCandles(tdSymbol) {
+  // interval: '5min' | '1h' | '4h'
+  async fetchCandles(tdSymbol, interval = '5min', outputsize = 100) {
     try {
       if (!this.apiKey) { console.warn(`[TwelveData] No key — skipping ${tdSymbol}`); return null; }
+      // Rate limit: 8s between calls on free tier (max 8/min)
       const now  = Date.now();
       const wait = 8000 - (now - this.lastCall);
       if (wait > 0) await new Promise(r => setTimeout(r, wait));
       this.lastCall = Date.now();
 
       const res = await axios.get(`${this.baseUrl}/time_series`, {
-        params: { symbol: tdSymbol, interval: '5min', outputsize: 100, apikey: this.apiKey },
+        params: { symbol: tdSymbol, interval, outputsize, apikey: this.apiKey },
         timeout: 15000,
       });
 
       const d = res.data;
-      if (d.status === 'error' || d.code) { console.error(`[TwelveData] ${tdSymbol}: ${d.message}`); return null; }
+      if (d.status === 'error' || d.code) { console.error(`[TwelveData] ${tdSymbol}/${interval}: ${d.message}`); return null; }
       if (!d.values?.length) return null;
 
       const candles = d.values.reverse().map(b => ({
@@ -1666,22 +1824,25 @@ class TwelveDataFetcher {
         low:  parseFloat(b.low),  close: parseFloat(b.close),
         volume: parseFloat(b.volume || 0) || 1,
       }));
-      console.log(`[TwelveData] ✅ ${tdSymbol}: ${candles.length} candles`);
+      console.log(`[TwelveData] ✅ ${tdSymbol} [${interval}]: ${candles.length} candles`);
       return candles;
     } catch (err) {
-      console.error(`[TwelveData] Error ${tdSymbol}: ${err.response?.status || err.message}`);
+      console.error(`[TwelveData] Error ${tdSymbol}/${interval}: ${err.response?.status || err.message}`);
       return null;
     }
   }
 }
 
 class YahooFetcher {
-  async fetchCandles(yahooSymbol) {
+  // interval: '5m' | '1h' | '1d'
+  async fetchCandles(yahooSymbol, interval = '5m') {
     try {
-      const now  = Math.floor(Date.now() / 1000);
-      const from = now - 86400;
-      const res  = await axios.get(
-        `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=5m&period1=${from}&period2=${now}`,
+      const now    = Math.floor(Date.now() / 1000);
+      // Lookback window based on interval
+      const window = interval === '1h' ? 60 * 86400 : interval === '1d' ? 365 * 86400 : 86400;
+      const from   = now - window;
+      const res    = await axios.get(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?interval=${interval}&period1=${from}&period2=${now}`,
         { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0' } }
       );
       const result = res.data?.chart?.result?.[0];
@@ -1692,10 +1853,10 @@ class YahooFetcher {
         .map((t, i) => ({ time: t * 1000, open: q.open[i], high: q.high[i], low: q.low[i], close: q.close[i], volume: q.volume[i] || 0 }))
         .filter(c => c.open != null && c.close != null);
       if (candles.length < 10) return null;
-      console.log(`[Yahoo] ✅ ${yahooSymbol}: ${candles.length} candles`);
+      console.log(`[Yahoo] ✅ ${yahooSymbol} [${interval}]: ${candles.length} candles`);
       return candles;
     } catch (err) {
-      console.error(`[Yahoo] Error ${yahooSymbol}: ${err.response?.status || err.message}`);
+      console.error(`[Yahoo] Error ${yahooSymbol}/${interval}: ${err.response?.status || err.message}`);
       return null;
     }
   }
@@ -1856,6 +2017,7 @@ class HybridDataFetcher {
     this.dhan       = new DhanFetcher();
     this.metatrader = new MetaTraderReceiver();
     this.cache      = {};
+    this.mtfCache   = {}; // MTF candle cache: { symbol_mtf: { data, time } }
 
     // All CoinGecko coin IDs in order
     this.cgIds = Object.values(SYMBOLS)
@@ -1865,15 +2027,14 @@ class HybridDataFetcher {
 
   async initialize() {
     console.log('[Bot] Data sources: CoinGecko (batch) | Twelve Data | Yahoo Finance | Dhan');
-    // Pre-warm crypto cache on startup
     await this.coingecko.prefetchAll(this.cgIds);
   }
 
-  // Called at the START of each analysis cycle before symbol loop
   async prefetchCrypto() {
     await this.coingecko.prefetchAll(this.cgIds);
   }
 
+  // ── Fetch single TF (5m) candles ───────────────────────────
   async fetchCandles(symbol) {
     const config = SYMBOLS[symbol];
     if (!config) return null;
@@ -1881,37 +2042,143 @@ class HybridDataFetcher {
 
     try {
       if (config.source === 'twelvedata') {
-        candles = await this.twelvedata.fetchCandles(config.tdSymbol);
+        candles = await this.twelvedata.fetchCandles(config.tdSymbol, '5min', 100);
         source  = 'twelvedata';
-
       } else if (config.source === 'yahoo') {
-        candles = await this.yahoo.fetchCandles(config.yahooSymbol);
+        candles = await this.yahoo.fetchCandles(config.yahooSymbol, '5m');
         source  = 'yahoo';
-
       } else if (config.source === 'coingecko') {
-        // Batch was already fetched at cycle start — just read from batch
         candles = this.coingecko.getCandles(config.cgId);
         source  = candles ? 'coingecko' : 'unknown';
-
       } else if (config.source === 'dhan') {
         candles = await this.dhan.fetchCandles(symbol);
         source  = 'dhan';
       }
     } catch (err) { console.error(`[Hybrid] ${symbol}:`, err.message); }
 
-    // Fallback 1: MetaTrader
     if (!candles || candles.length < 10) {
       const mt = this.metatrader.getCandles(symbol);
       if (mt) { candles = mt; source = 'metatrader'; }
     }
-
-    // Fallback 2: Cache
     if (!candles || candles.length < 10) {
       if (this.cache[symbol]) { candles = this.cache[symbol]; source = 'cache'; }
     }
-
     if (candles?.length >= 10) this.cache[symbol] = candles;
     return candles?.length >= 10 ? { candles, source } : null;
+  }
+
+  // ── Fetch ALL THREE timeframes for a symbol ─────────────────
+  // Returns { m5, h1, h4, source } or null
+  // m5  = 5-minute  (100 candles) → entry timeframe
+  // h1  = 1-hour    (100 candles) → zone timeframe
+  // h4  = 4-hour    (100 candles) → bias timeframe
+  async fetchMTF(symbol) {
+    const config = SYMBOLS[symbol];
+    if (!config) return null;
+
+    const cacheKey = `${symbol}_mtf`;
+    const mtfTTL   = 4 * 60 * 1000; // 4 min cache — h1/h4 don't change fast
+
+    // Return cached MTF if still fresh
+    if (this.mtfCache[cacheKey] && Date.now() - this.mtfCache[cacheKey].time < mtfTTL) {
+      return this.mtfCache[cacheKey].data;
+    }
+
+    let m5 = null, h1 = null, h4 = null, source = 'unknown';
+
+    try {
+      if (config.source === 'twelvedata') {
+        // Fetch all 3 TFs — each call has 8s rate limit built in
+        m5 = await this.twelvedata.fetchCandles(config.tdSymbol, '5min',  100);
+        h1 = await this.twelvedata.fetchCandles(config.tdSymbol, '1h',    100);
+        h4 = await this.twelvedata.fetchCandles(config.tdSymbol, '4h',    100);
+        source = 'twelvedata';
+
+      } else if (config.source === 'yahoo') {
+        m5 = await this.yahoo.fetchCandles(config.yahooSymbol, '5m');
+        h1 = await this.yahoo.fetchCandles(config.yahooSymbol, '1h');
+        // Yahoo 4h not available — build from 1h candles
+        h4 = h1 ? this._resample(h1, 4) : null;
+        source = 'yahoo';
+
+      } else if (config.source === 'coingecko') {
+        // CoinGecko OHLC: days=1 gives ~30min candles, days=7 gives 4h candles
+        m5 = this.coingecko.getCandles(config.cgId);  // from batch
+        const h1Raw = await this._cgFetchH1(config.cgId);
+        h1 = h1Raw;
+        h4 = h1 ? this._resample(h1, 4) : null;
+        source = 'coingecko';
+
+      } else if (config.source === 'dhan') {
+        // Dhan only provides 5min — use resample for higher TFs
+        m5 = await this.dhan.fetchCandles(symbol);
+        if (m5 && m5.length >= 20) {
+          h1 = this._resample(m5, 12); // 12 × 5min = 1h
+          h4 = this._resample(m5, 48); // 48 × 5min = 4h
+        }
+        source = 'dhan';
+      }
+    } catch (err) { console.error(`[MTF] ${symbol}:`, err.message); }
+
+    // Fallbacks from cache
+    if (!m5 || m5.length < 10) {
+      const cached = this.cache[symbol];
+      if (cached) { m5 = cached; }
+    }
+    if (m5?.length >= 10) this.cache[symbol] = m5;
+
+    // Need at least m5 to proceed
+    if (!m5 || m5.length < 10) return null;
+
+    // If HTF missing, resample from m5
+    if (!h1 || h1.length < 10) h1 = this._resample(m5, 12);
+    if (!h4 || h4.length < 5)  h4 = this._resample(m5, 48);
+
+    const result = { m5, h1, h4, source };
+    this.mtfCache[cacheKey] = { data: result, time: Date.now() };
+    return result;
+  }
+
+  // ── Resample candles: combine N consecutive candles into one ─
+  _resample(candles, n) {
+    if (!candles || candles.length < n) return candles;
+    const result = [];
+    for (let i = 0; i + n <= candles.length; i += n) {
+      const slice = candles.slice(i, i + n);
+      result.push({
+        time:   slice[0].time,
+        open:   slice[0].open,
+        high:   Math.max(...slice.map(c => c.high)),
+        low:    Math.min(...slice.map(c => c.low)),
+        close:  slice[slice.length - 1].close,
+        volume: slice.reduce((s, c) => s + (c.volume || 0), 0),
+      });
+    }
+    return result;
+  }
+
+  // ── CoinGecko hourly candles (days=7 gives 4h OHLC) ─────────
+  async _cgFetchH1(cgId) {
+    try {
+      // CoinGecko market_chart with days=7 gives hourly data points
+      const res = await axios.get(`${CONFIG.COINGECKO_REST}/coins/${cgId}/market_chart`, {
+        params: { vs_currency: 'usd', days: '7', interval: 'hourly' },
+        timeout: 15000,
+      });
+      if (!res.data?.prices?.length) return null;
+      const prices = res.data.prices;
+      return prices.map((p, i) => {
+        const prev = prices[i - 1] || p;
+        return {
+          time:   p[0],
+          open:   prev[1],
+          high:   Math.max(p[1], prev[1]),
+          low:    Math.min(p[1], prev[1]),
+          close:  p[1],
+          volume: 1000000,
+        };
+      });
+    } catch { return null; }
   }
 }
 
@@ -1926,12 +2193,18 @@ async function sendTelegramAlert(signal) {
   // List confirming strategies (up to 3)
   const confirms = signal.confirmedBy.slice(0, 3).map(s => `  • ${s.name}`).join('\n');
 
+  const mtfLine = signal.mtf?.enabled
+    ? `🕐 *MTF Bias:* H4:${signal.mtf.h4Trend} | H1:${signal.mtf.h1Trend} | M5:${signal.mtf.m5Trend} [${signal.mtf.alignment}]`
+    : `🕐 *MTF:* M5 only`;
+
   const msg = `${emoji} *${signal.direction} SIGNAL — ${signal.symbol}*
 ━━━━━━━━━━━━━━━━━━━━
 📊 ${signal.symbolName} | ${signal.category.toUpperCase()}
 ⚡ *${signal.strategy.name}*
 💯 Quality: ${signal.quality}/100 [${bar}]
-📐 Strength: ${signal.strategy.strength.replace('_', ' ').toUpperCase()}
+📐 Strength: ${signal.strategy.strength.replace(/_/g, ' ').toUpperCase()}
+
+${mtfLine}
 
 💰 Entry:  \`${signal.levels.entry}\`
 🛑 SL:     \`${signal.levels.sl}\`
@@ -1940,17 +2213,17 @@ async function sendTelegramAlert(signal) {
 🎯 TP3:    \`${signal.levels.tp3}\`
 📐 R:R     ${signal.levels.riskReward}
 
-📈 *Indicators (live):*
+📈 *Indicators (M5):*
   RSI: ${signal.indicators.rsi} | Trend: ${signal.indicators.trend}
   MACD: ${signal.indicators.macd > 0 ? '▲' : '▼'} ${signal.indicators.macd}
-  Vol spike: ${signal.indicators.volume.spike ? '✅' : '❌'} (${signal.indicators.volume.ratio}x avg)
+  Vol: ${signal.indicators.volume.spike ? '✅ spike' : '❌ normal'} (${signal.indicators.volume.ratio}x avg)
   ATR: ${signal.indicators.atr}
 
 ✅ *Confirmed by ${signal.confirmedBy.length} strategies:*
 ${confirms}
 
 🔌 Source: ${signal.dataSource.toUpperCase()} | ${signal.candleCount} candles
-🕐 ${new Date(signal.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
+🕑 ${new Date(signal.timestamp).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST
 ⚠️ _For educational purposes only_`;
 
   try {
@@ -1987,11 +2260,15 @@ async function runAnalysisCycle() {
 
   for (const symbol of Object.keys(SYMBOLS)) {
     try {
-      const result = await dataFetcher.fetchCandles(symbol);
+      // Fetch all 3 timeframes: M5 (entry) + H1 (zone) + H4 (bias)
+      const mtfData = await dataFetcher.fetchMTF(symbol);
       botState.stats.totalAnalyzed++;
-      if (!result) { console.log(`[Bot] ⚠️ No data: ${symbol}`); continue; }
 
-      const signal = SignalBuilder.build(symbol, result.candles, result.source);
+      if (!mtfData || !mtfData.m5) { console.log(`[Bot] ⚠️ No data: ${symbol}`); continue; }
+
+      const mtfLabel = mtfData.h1 && mtfData.h4 ? '[M5+H1+H4]' : '[M5 only]';
+      const signal   = SignalBuilder.build(symbol, mtfData.m5, mtfData.source, mtfData);
+
       if (signal) {
         botState.signals.unshift(signal);
         if (botState.signals.length > CONFIG.MAX_SIGNALS_STORED)
@@ -1999,11 +2276,11 @@ async function runAnalysisCycle() {
         botState.stats.totalSignals++;
         botState.stats.totalStrategiesFired += signal.totalFired;
         cycleSignals++;
-        console.log(`[Bot] ✅ ${signal.direction} ${symbol} | Q:${signal.quality} | Strategy:${signal.strategy.id} | ConfirmedBy:${signal.confirmedBy.length} | src:${result.source}`);
+        console.log(`[Bot] ✅ ${signal.direction} ${symbol} | Q:${signal.quality} | ${signal.strategy.id} | Align:${signal.mtf.alignment} | MTF:${mtfLabel} | src:${mtfData.source}`);
         await sendTelegramAlert(signal);
         await new Promise(r => setTimeout(r, 500));
       } else {
-        console.log(`[Bot] ℹ️ No signal: ${symbol} (src:${result.source})`);
+        console.log(`[Bot] ℹ️ No signal: ${symbol} ${mtfLabel} (src:${mtfData.source})`);
       }
     } catch (err) { console.error(`[Bot] Error ${symbol}:`, err.message); }
   }
