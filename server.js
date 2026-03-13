@@ -2238,9 +2238,92 @@ ${confirms}
 // ============================================================
 // ── SECTION 6: BOT ENGINE ────────────────────────────────────
 // ============================================================
+
+// ── Signal Gate: prevents false, repeated, conflicting signals ──
+// Rules:
+//  1. Quality >= 75 (raised from 65)
+//  2. At least 2 strategies must confirm
+//  3. Entry price within 0.3% of live candle close (no stale price)
+//  4. 30-min cooldown per symbol (no spam every 5 min)
+//  5. No direction flip within 60 min (no BUY then SELL same symbol)
+//  6. No duplicate: same strategy + direction within 2 hours
+class SignalGate {
+  constructor() {
+    this.lastSignal = {}; // { symbol: { direction, time, price, strategy } }
+  }
+
+  check(signal, currentPrice) {
+    const symbol = signal.symbol;
+    const now    = Date.now();
+    const last   = this.lastSignal[symbol];
+
+    // Rule 1: Quality gate
+    if (signal.quality < 75) {
+      return { allowed: false, reason: `Quality ${signal.quality} < 75` };
+    }
+
+    // Rule 2: Need at least 2 strategies confirming
+    if (signal.confirmedBy.length < 2) {
+      return { allowed: false, reason: `Only ${signal.confirmedBy.length} confirmation — need 2+` };
+    }
+
+    // Rule 3: Price validity — entry must be within 0.3% of live price
+    if (currentPrice > 0) {
+      const drift = Math.abs(signal.levels.entry - currentPrice) / currentPrice;
+      if (drift > 0.003) {
+        return { allowed: false, reason: `Price drift ${(drift*100).toFixed(2)}% > 0.3%` };
+      }
+    }
+
+    if (last) {
+      const mins = (now - last.time) / 60000;
+
+      // Rule 4: 30-min cooldown per symbol
+      if (mins < 30) {
+        return { allowed: false, reason: `Cooldown: ${mins.toFixed(1)}min < 30min` };
+      }
+
+      // Rule 5: No direction flip within 60 min
+      if (mins < 60 && last.direction !== signal.direction) {
+        return { allowed: false, reason: `Direction flip blocked: was ${last.direction} ${mins.toFixed(1)}min ago` };
+      }
+
+      // Rule 6: No duplicate strategy+direction within 2h
+      if (mins < 120 && last.direction === signal.direction && last.strategy === signal.strategy.id) {
+        return { allowed: false, reason: `Duplicate ${signal.strategy.id} ${signal.direction} within 2h` };
+      }
+    }
+
+    return { allowed: true, reason: 'passed' };
+  }
+
+  record(signal) {
+    this.lastSignal[signal.symbol] = {
+      direction: signal.direction,
+      time:      Date.now(),
+      price:     signal.levels.entry,
+      strategy:  signal.strategy.id,
+    };
+  }
+
+  cooldowns() {
+    const now = Date.now();
+    return Object.entries(this.lastSignal).map(([sym, s]) => ({
+      symbol: sym, direction: s.direction, strategy: s.strategy,
+      minsAgo: Math.round((now - s.time) / 60000),
+      cooldownLeft: Math.max(0, Math.round(30 - (now - s.time) / 60000)),
+    }));
+  }
+}
+
+const signalGate = new SignalGate();
 const botState = {
   signals: [], lastCycle: null,
-  stats: { totalAnalyzed: 0, totalSignals: 0, totalStrategiesFired: 0, startTime: Date.now() },
+  stats: {
+    totalAnalyzed: 0, totalSignals: 0,
+    totalStrategiesFired: 0, blockedByGate: 0,
+    startTime: Date.now(),
+  },
   isRunning: false,
 };
 const dataFetcher = new HybridDataFetcher();
@@ -2251,42 +2334,57 @@ async function runAnalysisCycle() {
   const cycleStart = Date.now();
   console.log(`\n[Bot] ⚡ Cycle — ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`);
 
-  // Pre-fetch all 5 crypto coins in one staggered batch BEFORE the symbol loop.
-  // Prevents 429s from 5 rapid sequential requests mid-cycle.
   console.log('[Bot] Prefetching crypto batch...');
   await dataFetcher.prefetchCrypto();
 
-  let cycleSignals = 0;
+  let cycleSignals = 0, cycleBlocked = 0;
 
   for (const symbol of Object.keys(SYMBOLS)) {
     try {
-      // Fetch all 3 timeframes: M5 (entry) + H1 (zone) + H4 (bias)
       const mtfData = await dataFetcher.fetchMTF(symbol);
       botState.stats.totalAnalyzed++;
 
       if (!mtfData || !mtfData.m5) { console.log(`[Bot] ⚠️ No data: ${symbol}`); continue; }
 
-      const mtfLabel = mtfData.h1 && mtfData.h4 ? '[M5+H1+H4]' : '[M5 only]';
-      const signal   = SignalBuilder.build(symbol, mtfData.m5, mtfData.source, mtfData);
+      const mtfLabel     = mtfData.h1 && mtfData.h4 ? '[M5+H1+H4]' : '[M5 only]';
+      const signal       = SignalBuilder.build(symbol, mtfData.m5, mtfData.source, mtfData);
+      const currentPrice = mtfData.m5[mtfData.m5.length - 1].close;
 
-      if (signal) {
-        botState.signals.unshift(signal);
-        if (botState.signals.length > CONFIG.MAX_SIGNALS_STORED)
-          botState.signals = botState.signals.slice(0, CONFIG.MAX_SIGNALS_STORED);
-        botState.stats.totalSignals++;
-        botState.stats.totalStrategiesFired += signal.totalFired;
-        cycleSignals++;
-        console.log(`[Bot] ✅ ${signal.direction} ${symbol} | Q:${signal.quality} | ${signal.strategy.id} | Align:${signal.mtf.alignment} | MTF:${mtfLabel} | src:${mtfData.source}`);
-        await sendTelegramAlert(signal);
-        await new Promise(r => setTimeout(r, 500));
-      } else {
-        console.log(`[Bot] ℹ️ No signal: ${symbol} ${mtfLabel} (src:${mtfData.source})`);
+      if (!signal) {
+        console.log(`[Bot] ℹ️  No signal: ${symbol} ${mtfLabel}`);
+        continue;
       }
+
+      // Run all gate checks
+      const gate = signalGate.check(signal, currentPrice);
+      if (!gate.allowed) {
+        cycleBlocked++;
+        botState.stats.blockedByGate++;
+        console.log(`[Bot] 🚫 ${symbol}: ${gate.reason}`);
+        continue;
+      }
+
+      // ✅ Signal passed — record, store, alert
+      signalGate.record(signal);
+      botState.signals.unshift(signal);
+      if (botState.signals.length > CONFIG.MAX_SIGNALS_STORED)
+        botState.signals = botState.signals.slice(0, CONFIG.MAX_SIGNALS_STORED);
+      botState.stats.totalSignals++;
+      botState.stats.totalStrategiesFired += signal.totalFired;
+      cycleSignals++;
+
+      console.log(`[Bot] ✅ ${signal.direction} ${symbol} | Q:${signal.quality} | ${signal.strategy.id} | Align:${signal.mtf.alignment} | Confirmed:${signal.confirmedBy.length} | ${mtfLabel}`);
+      await sendTelegramAlert(signal);
+      await new Promise(r => setTimeout(r, 500));
+
     } catch (err) { console.error(`[Bot] Error ${symbol}:`, err.message); }
   }
 
-  botState.lastCycle = { signals: cycleSignals, durationMs: Date.now() - cycleStart, timestamp: new Date().toISOString() };
-  console.log(`[Bot] ✅ Cycle done — ${cycleSignals} real signals | ${Date.now() - cycleStart}ms\n`);
+  botState.lastCycle = {
+    signals: cycleSignals, blocked: cycleBlocked,
+    durationMs: Date.now() - cycleStart, timestamp: new Date().toISOString(),
+  };
+  console.log(`[Bot] ✅ Cycle done — ${cycleSignals} signals sent | ${cycleBlocked} blocked by gate | ${Date.now() - cycleStart}ms\n`);
   botState.isRunning = false;
 }
 
@@ -2307,6 +2405,8 @@ app.get('/api/health', (req, res) => {
     status: 'OPERATIONAL ✅', version: '6.0.0',
     uptime: `${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m ${uptime%60}s`,
     totalSignals: botState.stats.totalSignals,
+    blockedByGate: botState.stats.blockedByGate,
+    activeCooldowns: signalGate.cooldowns().filter(c => c.cooldownLeft > 0).length,
     totalAnalyzed: botState.stats.totalAnalyzed,
     totalStrategiesFired: botState.stats.totalStrategiesFired,
     lastCycle: botState.lastCycle,
@@ -2394,6 +2494,8 @@ app.get('/api/stats', (req, res) => {
   res.json({
     uptime: `${Math.floor(uptime/3600)}h ${Math.floor((uptime%3600)/60)}m`,
     totalAnalyzed:        botState.stats.totalAnalyzed,
+    blockedByGate:        botState.stats.blockedByGate,
+    cooldowns:            signalGate.cooldowns(),
     totalSignals:         botState.stats.totalSignals,
     totalStrategiesFired: botState.stats.totalStrategiesFired,
     avgQuality: botState.signals.length
