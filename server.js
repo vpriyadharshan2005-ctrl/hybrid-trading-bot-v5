@@ -1704,7 +1704,7 @@ class YahooFetcher {
 // ============================================================
 // COINGECKO FETCHER — Smart batched fetcher
 // Strategy:
-//   - All 5 coins are pre-fetched ONCE per cycle with 12s stagger
+//   - All 5 coins are pre-fetched ONCE per cycle with 20s stagger
 //   - Results cached in this.batch{}
 //   - On 429, skip fallback immediately and return cached data
 //   - Batch is refreshed only once every 4.5 minutes (just under 5min cycle)
@@ -1714,31 +1714,34 @@ class CoinGeckoFetcher {
     this.baseUrl    = CONFIG.COINGECKO_REST;
     this.batch      = {};        // { cgId: candles[] }
     this.batchTime  = 0;         // when last batch was fetched
-    this.batchTTL   = 4.5 * 60 * 1000; // 4.5 minutes
+    this.batchTTL   = 8 * 60 * 1000;   // 8 minutes — well above 5min cycle
     this.rateLimited = false;    // global 429 flag
     this.rateLimitUntil = 0;     // backoff until timestamp
   }
 
   // Called once per cycle to pre-fetch all coins with stagger
   async prefetchAll(cgIds) {
-    // Skip if batch is still fresh
+    // Skip if batch is still fresh (TTL 6min > 5min cycle = never double-fetches)
     if (Date.now() - this.batchTime < this.batchTTL && Object.keys(this.batch).length > 0) {
-      console.log('[CoinGecko] Using cached batch');
+      console.log(`[CoinGecko] Using cached batch (${Object.keys(this.batch).length}/5 coins)`);
       return;
     }
 
     // Skip if globally rate limited and backoff not expired
     if (this.rateLimited && Date.now() < this.rateLimitUntil) {
-      console.log(`[CoinGecko] Rate limited — skipping prefetch, using cache`);
+      const secsLeft = Math.ceil((this.rateLimitUntil - Date.now()) / 1000);
+      console.log(`[CoinGecko] Rate limited — ${secsLeft}s backoff remaining, using cache`);
       return;
     }
     this.rateLimited = false;
 
-    console.log('[CoinGecko] Prefetching all crypto...');
+    console.log('[CoinGecko] Prefetching all 5 crypto coins (20s stagger)...');
+    let fetched = 0;
+
     for (let i = 0; i < cgIds.length; i++) {
       const cgId = cgIds[i];
-      // Stagger: 12s between each coin to stay under 5 req/min free limit
-      if (i > 0) await new Promise(r => setTimeout(r, 12000));
+      // 20s between each coin = 3 req/min, well under CoinGecko free limit
+      if (i > 0) await new Promise(r => setTimeout(r, 20000));
 
       try {
         const res = await axios.get(`${this.baseUrl}/coins/${cgId}/ohlc`, {
@@ -1751,22 +1754,26 @@ class CoinGeckoFetcher {
           this.batch[cgId] = res.data.map(c => ({
             time: c[0], open: c[1], high: c[2], low: c[3], close: c[4], volume: 1000000,
           }));
-          console.log(`[CoinGecko] ✅ ${cgId}: ${this.batch[cgId].length} candles`);
+          fetched++;
+          console.log(`[CoinGecko] SUCCESS ${cgId}: ${this.batch[cgId].length} candles (${fetched}/${cgIds.length})`);
         }
 
       } catch (err) {
         const status = err.response?.status;
         if (status === 429) {
-          console.warn(`[CoinGecko] 429 on ${cgId} — backing off 60s, using cache for all remaining`);
+          // Back off 90s to fully clear the rate limit window
           this.rateLimited    = true;
-          this.rateLimitUntil = Date.now() + 60000; // wait 60s before trying again
-          break; // stop fetching remaining coins, use cache
+          this.rateLimitUntil = Date.now() + 120000;
+          console.warn(`[CoinGecko] 429 on ${cgId} — 120s backoff, cache used for remaining ${cgIds.length - i} coins`);
+          break;
         } else {
           console.error(`[CoinGecko] Error ${cgId}: ${status || err.message}`);
         }
       }
     }
-    this.batchTime = Date.now();
+
+    if (fetched > 0) this.batchTime = Date.now();
+    console.log(`[CoinGecko] Prefetch complete — ${fetched}/${cgIds.length} fresh, rest from cache`);
   }
 
   // Returns candles from batch (already fetched by prefetchAll)
