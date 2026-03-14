@@ -72,7 +72,7 @@ const Market = {
     const now = new Date();
     const day = now.getUTCDay(), h = now.getUTCHours();
     if (day === 6) return false;                    // Saturday always closed
-    if (day === 0 && h < 22) return false;           // Sunday before 22:00 UTC
+    if (day === 0 && h < 22) return false;           // Sunday: market opens 22:00 UTC (Sydney)
     if (day === 5 && h >= 22) return false;          // Friday after 22:00 UTC
     return true;
   },
@@ -1259,25 +1259,23 @@ class CGFetcher {
   }
 
   async prefetchAll(ids) {
-    if (this.backoff > Date.now()) return;
-    try {
-      // CoinGecko OHLC days=1 returns ~48 candles (30min each) — good M15 proxy
-      const res = await axios.get(`${CONFIG.COINGECKO_URL}/coins/markets`, {
-        params: { vs_currency: 'usd', ids: ids.join(','), order: 'market_cap_desc', per_page: 20 },
-        timeout: 15000,
-      });
-      // Use price data to build synthetic M15-equivalent candles from market data
-      // For proper OHLC we use individual coin endpoint
-    } catch (e) {
-      if (e.response?.status === 429) { this.backoff = Date.now() + 120000; console.warn('[CG] Rate limited — 2 min backoff'); }
+    if (this.backoff > Date.now()) {
+      console.log('[CG] Backoff active — skipping prefetch');
+      return;
     }
+    // Stagger fetch OHLC for each coin: 2.5s between calls to avoid 429
+    for (const id of ids) {
+      await this.fetchOHLC(id);
+      await new Promise(r => setTimeout(r, 2500));
+    }
+    console.log('[CG] Prefetch done');
   }
 
   async fetchOHLC(cgId) {
     if (this.backoff > Date.now()) return this.cache[cgId]?.candles || null;
     const cached = this.cache[cgId];
     if (cached && Date.now() - cached.time < this.ttl) return cached.candles;
-    await new Promise(r => setTimeout(r, 800)); // CG rate limit spacing
+    await new Promise(r => setTimeout(r, 1500)); // CG rate limit spacing
     try {
       const res = await axios.get(`${CONFIG.COINGECKO_URL}/coins/${cgId}/ohlc`, {
         params: { vs_currency: 'usd', days: 1 },
@@ -1785,10 +1783,12 @@ app.listen(CONFIG.PORT, async () => {
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
 Port: ${CONFIG.PORT} | Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN} | Cooldown: ${CONFIG.COOLDOWN_MIN}min
-Symbols: ${Object.keys(SYMBOLS).length} | Markets close automatically outside trading hours
+Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:4) | Auto market hours
   `);
 
-  // First run immediately
+  // Give CoinGecko a moment before first cycle (avoid cold-start 429)
+  console.log('[v9.1] Waiting 5s before first cycle (CG rate limit buffer)...');
+  await new Promise(r => setTimeout(r, 5000));
   await runCycle();
 
   // Schedule every 15 min aligned to clock (09:15, 09:30, 09:45...)
