@@ -55,6 +55,7 @@ const dhanToken = {
   clientId:    process.env.DHAN_CLIENT_ID    || 'placeholder',
   accessToken: process.env.DHAN_ACCESS_TOKEN || 'placeholder',
   updatedAt:   null,
+  updatedMs:   process.env.DHAN_ACCESS_TOKEN ? Date.now() : null, // assume fresh if set via env
 };
 
 // ── Market hours helpers ─────────────────────────────────────
@@ -1666,6 +1667,7 @@ async function runCycle() {
 
   await checkExpiry();
 
+  await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
   console.log(`[v9.1] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
   state.running = false;
@@ -1702,7 +1704,9 @@ app.get('/api/health', (req, res) => {
     dataSources: {
       twelvedata: CONFIG.TWELVE_DATA_KEY  ? '✅' : '⚠️  key missing',
       coingecko:  '✅',
-      dhan:       dhanToken.accessToken !== 'placeholder' ? '✅' : '⏳ add token',
+      dhan: dhanToken.accessToken === 'placeholder' ? '⏳ no token — POST /api/dhan/token' :
+               dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 86400000 ? '❌ token expired — refresh now' :
+               dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 72000000 ? '⚠️  token expiring soon' : '✅ active',
     },
   });
 });
@@ -1766,9 +1770,30 @@ app.post('/api/dhan/token', (req, res) => {
   dhanToken.clientId    = clientId;
   dhanToken.accessToken = accessToken;
   dhanToken.updatedAt   = new Date().toISOString();
-  console.log(`[Dhan] Token updated at ${dhanToken.updatedAt}`);
-  res.json({ ok: true, updatedAt: dhanToken.updatedAt, message: 'NIFTY/BANKNIFTY/FINNIFTY/SENSEX will use new token next cycle' });
+  dhanToken.updatedMs   = Date.now();
+  console.log(`[Dhan] ✅ Token updated at ${dhanToken.updatedAt}`);
+  tgSend(`✅ *Dhan Token Updated*\nNIFTY/BANKNIFTY/FINNIFTY/SENSEX are now active.\nToken valid until approximately ${new Date(Date.now() + 23*3600000).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' })} IST tomorrow.`);
+  res.json({ ok: true, updatedAt: dhanToken.updatedAt, message: 'India symbols active next cycle' });
 });
+
+// Token age check — called in runCycle to warn if expiring soon
+async function checkDhanTokenAge() {
+  if (dhanToken.accessToken === 'placeholder') return;
+  if (!dhanToken.updatedMs) return;
+  const ageHours = (Date.now() - dhanToken.updatedMs) / 3600000;
+  // Warn at 20 hours (token expires at 24h)
+  if (ageHours >= 20 && ageHours < 21) {
+    const msg = `⚠️ *Dhan Token Expiring Soon*\nYour token was set ${Math.floor(ageHours)}h ago and expires in ~${Math.ceil(24 - ageHours)}h.\n\nRefresh now:\n1. Go to developer.dhan.co\n2. Generate new token\n3. POST to /api/dhan/token`;
+    await tgSend(msg);
+    console.log('[Dhan] ⚠️  Token expiring in ~4h — Telegram warning sent');
+  }
+  // Hard expired (>24h) — warn every cycle
+  if (ageHours >= 24) {
+    const msg = `❌ *Dhan Token Expired*\nIndia symbols (NIFTY/BANKNIFTY/FINNIFTY/SENSEX) are now offline.\n\nRefresh immediately:\n1. Go to developer.dhan.co\n2. Generate new token\n3. POST to /api/dhan/token`;
+    await tgSend(msg);
+    console.log('[Dhan] ❌ Token expired — India symbols offline');
+  }
+}
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
@@ -1789,6 +1814,13 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   // Give CoinGecko a moment before first cycle (avoid cold-start 429)
   console.log('[v9.1] Waiting 5s before first cycle (CG rate limit buffer)...');
   await new Promise(r => setTimeout(r, 5000));
+  // Startup Telegram notification
+  const indiaReady = dhanToken.accessToken !== 'placeholder';
+  await tgSend(`🚀 *Hybrid Trading Bot v9.1 Online*
+Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ | Crypto ✅
+Strategies: 10 ICT/SMC | Entry: M15 | SL: H1 structure
+Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
+${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activate NIFTY/BANKNIFTY/FINNIFTY/SENSEX' : ''}`);
   await runCycle();
 
   // Schedule every 15 min aligned to clock (09:15, 09:30, 09:45...)
