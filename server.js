@@ -34,23 +34,39 @@ const CONFIG = {
 
 // ── Symbols ───────────────────────────────────────────────────
 const SYMBOLS = {
-  // India NSE (Dhan)
-  NIFTY:     { name:'NIFTY 50',    cat:'india',     src:'dhan', dhanId:'13', seg:'IDX_I' },
-  BANKNIFTY: { name:'Bank NIFTY',  cat:'india',     src:'dhan', dhanId:'25', seg:'IDX_I' },
-  FINNIFTY:  { name:'Fin NIFTY',   cat:'india',     src:'dhan', dhanId:'27', seg:'IDX_I' },
-  SENSEX:    { name:'BSE SENSEX',  cat:'india',     src:'dhan', dhanId:'51', seg:'IDX_I' },
-  // Forex — Finnhub primary (60 req/min) | TwelveData fallback (8 req/min)
-  EURUSD:    { name:'EUR/USD',     cat:'forex',     src:'td',   td:'EUR/USD',  fh:'OANDA:EUR_USD'  },
-  GBPUSD:    { name:'GBP/USD',     cat:'forex',     src:'td',   td:'GBP/USD',  fh:'OANDA:GBP_USD'  },
-  USDJPY:    { name:'USD/JPY',     cat:'forex',     src:'td',   td:'USD/JPY',  fh:'OANDA:USD_JPY'  },
-  AUDUSD:    { name:'AUD/USD',     cat:'forex',     src:'td',   td:'AUD/USD',  fh:'OANDA:AUD_USD'  },
-  // Commodity — Finnhub primary | TwelveData fallback
-  XAUUSD:    { name:'Gold/USD',    cat:'commodity', src:'td',   td:'XAU/USD',  fh:'OANDA:XAU_USD'  },
-  // Crypto — Delta Exchange primary (real M15) | CoinGecko fallback (30-min proxy)
-  BTCUSDT:   { name:'BTC/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'BTCUSD',  cgId:'bitcoin'     },
-  ETHUSDT:   { name:'ETH/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'ETHUSD',  cgId:'ethereum'    },
-  XRPUSDT:   { name:'XRP/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'XRPUSD',  cgId:'ripple'      },
-  BNBUSDT:   { name:'BNB/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'BNBUSD',  cgId:'binancecoin' },
+  // ── India NSE/BSE (Dhan) ────────────────────────────────────────────────
+  NIFTY:      { name:'NIFTY 50',      cat:'india',     src:'dhan', dhanId:'13',  seg:'IDX_I' },
+  BANKNIFTY:  { name:'Bank NIFTY',    cat:'india',     src:'dhan', dhanId:'25',  seg:'IDX_I' },
+  FINNIFTY:   { name:'Fin NIFTY',     cat:'india',     src:'dhan', dhanId:'27',  seg:'IDX_I' },
+  SENSEX:     { name:'BSE SENSEX',    cat:'india',     src:'dhan', dhanId:'51',  seg:'IDX_I' },
+  MIDCPNIFTY: { name:'Midcap NIFTY',  cat:'india',     src:'dhan', dhanId:'11915', seg:'IDX_I' },
+
+  // ── Forex — Finnhub primary | TwelveData fallback ──────────────────────
+  // Majors (highest volume globally)
+  EURUSD:    { name:'EUR/USD',     cat:'forex',     src:'td', td:'EUR/USD',  fh:'OANDA:EUR_USD'  }, // #1 ~$1.5T/day
+  USDJPY:    { name:'USD/JPY',     cat:'forex',     src:'td', td:'USD/JPY',  fh:'OANDA:USD_JPY'  }, // #2 ~$950B/day
+  GBPUSD:    { name:'GBP/USD',     cat:'forex',     src:'td', td:'GBP/USD',  fh:'OANDA:GBP_USD'  }, // #3 ~$630B/day
+  AUDUSD:    { name:'AUD/USD',     cat:'forex',     src:'td', td:'AUD/USD',  fh:'OANDA:AUD_USD'  }, // #5 ~$350B/day
+  USDCAD:    { name:'USD/CAD',     cat:'forex',     src:'td', td:'USD/CAD',  fh:'OANDA:USD_CAD'  }, // #6 ~$250B/day oil pair
+  USDCHF:    { name:'USD/CHF',     cat:'forex',     src:'td', td:'USD/CHF',  fh:'OANDA:USD_CHF'  }, // #7 safe haven
+  NZDUSD:    { name:'NZD/USD',     cat:'forex',     src:'td', td:'NZD/USD',  fh:'OANDA:NZD_USD'  }, // #8 commodity
+  // High-volatility crosses (best for ICT/SMC — large intraday ranges)
+  GBPJPY:    { name:'GBP/JPY',     cat:'forex',     src:'td', td:'GBP/JPY',  fh:'OANDA:GBP_JPY'  }, // 100+ pips/day "The Dragon"
+  EURJPY:    { name:'EUR/JPY',     cat:'forex',     src:'td', td:'EUR/JPY',  fh:'OANDA:EUR_JPY'  }, // 3rd most traded cross
+
+  // ── Commodity — Finnhub primary | TwelveData fallback ──────────────────
+  XAUUSD:    { name:'Gold/USD',    cat:'commodity', src:'td', td:'XAU/USD',  fh:'OANDA:XAU_USD'  }, // #1 commodity
+  XAGUSD:    { name:'Silver/USD',  cat:'commodity', src:'td', td:'XAG/USD',  fh:'OANDA:XAG_USD'  }, // #2 commodity high vol
+
+  // ── Crypto — Delta Exchange India primary | Binance fallback | CoinGecko last ──
+  BTCUSDT:   { name:'BTC/USDT',   cat:'crypto', src:'delta', deltaSymbol:'BTCUSD',  cgId:'bitcoin'       }, // #1
+  ETHUSDT:   { name:'ETH/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ETHUSD',  cgId:'ethereum'      }, // #2
+  SOLUSDT:   { name:'SOL/USDT',   cat:'crypto', src:'delta', deltaSymbol:'SOLUSDT', cgId:'solana'        }, // #3 high vol
+  XRPUSDT:   { name:'XRP/USDT',   cat:'crypto', src:'delta', deltaSymbol:'XRPUSD',  cgId:'ripple'        }, // #4
+  DOGEUSDT:  { name:'DOGE/USDT',  cat:'crypto', src:'delta', deltaSymbol:'DOGEUSDT',cgId:'dogecoin'      }, // #5 extreme vol
+  ADAUSDT:   { name:'ADA/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ADAUSDT', cgId:'cardano'       }, // #6
+  BNBUSDT:   { name:'BNB/USDT',   cat:'crypto', src:'delta', deltaSymbol:'BNBUSD',  cgId:'binancecoin'   }, // #7
+  LTCUSDT:   { name:'LTC/USDT',   cat:'crypto', src:'delta', deltaSymbol:'LTCUSD',  cgId:'litecoin'      }, // #8
 };
 
 // ── Live Dhan token (updated at runtime, no redeploy) ─────────
@@ -2030,8 +2046,10 @@ class BinanceFallback {
     this.lastCall = 0;
     // Map deltaSymbol → Binance symbol
     this.symMap   = {
-      'BTCUSD': 'BTCUSDT', 'ETHUSD': 'ETHUSDT',
-      'XRPUSD': 'XRPUSDT', 'BNBUSD':  'BNBUSDT',
+      'BTCUSD':  'BTCUSDT', 'ETHUSD':   'ETHUSDT',
+      'XRPUSD':  'XRPUSDT', 'BNBUSD':   'BNBUSDT',
+      'SOLUSDT': 'SOLUSDT', 'DOGEUSDT': 'DOGEUSDT',
+      'ADAUSDT': 'ADAUSDT', 'LTCUSD':   'LTCUSDT',
     };
   }
 
@@ -2552,7 +2570,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '9.8.0',
+  version: '9.9.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -2563,7 +2581,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '9.8.0',
+    status: 'OK', version: '9.9.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -2682,7 +2700,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v9.8 — ICT/SMC ENGINE      ║
+║   HYBRID TRADING BOT v9.9 — ICT/SMC ENGINE      ║
 ║   14 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -2695,7 +2713,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v9.8 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v9.9 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 14 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
