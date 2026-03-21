@@ -1286,6 +1286,7 @@ class Builder {
     const cfg  = SYMBOLS[symbol];
     if (!cfg)  return null;
     const cat  = cfg.cat;
+    const m5    = mtfData?.m5    || null;
     const h1    = mtfData?.h1    || null;
     const h4    = mtfData?.h4    || null;
     const daily = mtfData?.daily || null;
@@ -1308,7 +1309,7 @@ class Builder {
     if (quality < CONFIG.SIGNAL_QUALITY_MIN) return null;
 
     // Build levels from live candle data
-    const lvls = this.levels(best, m15, h1, h4, cat);
+    const lvls = this.levels(best, m5, m15, h1, h4, cat);
     if (!lvls.entry || !lvls.sl || !lvls.tp1) return null;
 
     // MTF context
@@ -1348,7 +1349,11 @@ class Builder {
       session:   Market.session(),
       source,
       candles:   m15.length,
-      timeframe: 'M15',
+      m5candles: m5?.length || 0,
+      timeframe:  'M15',
+      entryTF:    lvls.m5Confirmation ? 'M5' : 'M15',
+      m5Confirmed: lvls.m5Confirmation || false,
+      m5EntryNote: lvls.m5EntryNote || null,
       ts:        new Date().toISOString(),
       expiresAt: new Date(Date.now() + CONFIG.EXPIRY_MIN * 60000).toISOString(),
       expired:   false,
@@ -1357,7 +1362,7 @@ class Builder {
   }
 
   // ── SL / TP from live candle data per strategy ────────────
-  static levels(sig, m15, h1, h4, cat) {
+  static levels(sig, m5, m15, h1, h4, cat) {
     const c   = Ind.confirmed(m15);
     const cls = c.map(x => x.close);
     const atr = Ind.atr(c);
@@ -1751,19 +1756,61 @@ class Builder {
       if (tp3 && tp2   && tp3 >= tp2)   tp3 = f(tp2   - atr * 2.5);
     }
 
+    // ── M5 ENTRY REFINEMENT for precision strategies ────────────────────────
+    // For FPB, OTE, SILVER_BULLET, GAP_GO: refine entry using last M5 candles
+    // M5 confirmation = last M5 candle closes in entry direction with body
+    // This gives a tighter entry price than just using M15 close
+    const M5_STRATEGIES = ['FPB', 'OTE', 'SILVER_BULLET', 'GAP_GO'];
+    let m5Entry = null;
+    let m5Confirmation = false;
+    let m5EntryNote = null;
+
+    if (M5_STRATEGIES.includes(sig.id) && m5 && m5.length >= 5) {
+      const m5conf = Ind.confirmed(m5);
+      const m5last = m5conf[m5conf.length - 1];
+      const m5prev = m5conf[m5conf.length - 2];
+      const m5atr  = Ind.atr(m5conf);
+      const m5body = Math.abs(m5last.close - m5last.open);
+      const m5minBody = m5atr * 0.25; // M5 body must be meaningful
+
+      if (isBuy) {
+        // M5 bullish confirmation: last M5 candle bullish body above M5 prev close
+        if (m5last.close > m5last.open && m5body >= m5minBody && m5last.close > m5prev.close) {
+          // Refined entry: M5 candle close (tighter than M15 close)
+          m5Entry = f(m5last.close);
+          m5Confirmation = true;
+          m5EntryNote = `M5 bullish body confirmed at ${m5Entry}`;
+          // Tighten entry if M5 close is INSIDE the M15 zone (closer to zone edge)
+          if (entry && m5Entry < entry) entry = m5Entry;
+        } else {
+          // M5 not confirmed yet — signal fires but note to wait for M5 confirmation
+          m5EntryNote = `Wait for M5 bull body close above ${f(m5last.close)} before entering`;
+        }
+      } else {
+        // M5 bearish confirmation
+        if (m5last.close < m5last.open && m5body >= m5minBody && m5last.close < m5prev.close) {
+          m5Entry = f(m5last.close);
+          m5Confirmation = true;
+          m5EntryNote = `M5 bearish body confirmed at ${m5Entry}`;
+          if (entry && m5Entry > entry) entry = m5Entry;
+        } else {
+          m5EntryNote = `Wait for M5 bear body close below ${f(m5last.close)} before entering`;
+        }
+      }
+    }
+
     // ── Minimum RR check: reject if RR < 1:1.5 ───────────────────────────────
     if (sl && tp1 && entry) {
       const risk   = Math.abs(entry - sl);
       const reward = Math.abs(tp1   - entry);
       if (risk > 0 && reward / risk < 1.5) {
-        // Extend TP1 to enforce minimum 1:1.5 RR
         tp1 = isBuy
           ? f((entry || price) + risk * 1.5)
           : f((entry || price) - risk * 1.5);
       }
     }
 
-    return { entry, sl, tp1, tp2, tp3 };
+    return { entry, sl, tp1, tp2, tp3, m5Entry, m5Confirmation, m5EntryNote };
   }
 }
 
@@ -1851,13 +1898,15 @@ class FinnhubFetcher {
     }
   }
 
-  // Fetch M15 + H1 + H4 + Daily for a symbol, with cache
+  // Fetch M5 + M15 + H1 + H4 + Daily for a symbol, with cache
   async fetchMTF(fhSymbol) {
     const cached = this.cache[fhSymbol];
     if (cached && Date.now() - cached.time < this.ttlM15) return cached;
 
     const m15 = await this.fetchCandles(fhSymbol, '15', 3);
     if (!m15 || m15.length < 10) return cached || null;
+    // M5 — 1 day = 288 candles. Cached separately at ttlM15.
+    const m5 = await this.fetchCandles(fhSymbol, '5', 1);
 
     let h1 = cached?.h1 || null;
     if (!h1 || Date.now() - (cached?.h1Time || 0) > this.ttlH1) {
@@ -1870,7 +1919,7 @@ class FinnhubFetcher {
       daily = await this.fetchCandles(fhSymbol, 'D', 60);
     }
     const result = {
-      m15, h1: h1 || [], h4: h4 || [], daily: daily || [],
+      m5: m5 || [], m15, h1: h1 || [], h4: h4 || [], daily: daily || [],
       time: Date.now(), h1Time: Date.now(), dailyTime: Date.now(),
     };
     this.cache[fhSymbol] = result;
@@ -1938,6 +1987,8 @@ class DeltaFetcher {
     if (cached && Date.now() - cached.time < this.ttlM15) {
       return cached;
     }
+    // Fetch M5 (1 day = ~288 candles) — for precision entry strategies
+    const m5 = await this.fetchCandles(symbol, '5m', 1);
     // Fetch M15 (2 days = ~192 candles)
     const m15 = await this.fetchCandles(symbol, '15m', 2);
     if (!m15 || m15.length < 10) return cached || null; // fallback to stale
@@ -1951,7 +2002,7 @@ class DeltaFetcher {
     // H4 — fetch directly (Delta supports it)
     let h4 = await this.fetchCandles(symbol, '4h', 30);
 
-    const result = { m15, h1: h1 || [], h4: h4 || [], time: Date.now(), h1Time: Date.now() };
+    const result = { m5: m5 || [], m15, h1: h1 || [], h4: h4 || [], time: Date.now(), h1Time: Date.now() };
     this.cache[symbol] = result;
     return result;
   }
@@ -2149,7 +2200,7 @@ class DataFetcher {
     if (this.mtfCache[key] && Date.now() - this.mtfCache[key].time < this.mtfTTL)
       return this.mtfCache[key].data;
 
-    let m15 = null, h1 = null, h4 = null, daily = null, source = 'unknown';
+    let m5 = null, m15 = null, h1 = null, h4 = null, daily = null, source = 'unknown';
 
     try {
       if (cfg.src === 'td') {
@@ -2158,16 +2209,18 @@ class DataFetcher {
           const fhData = await this.fh.fetchMTF(cfg.fh);
           if (fhData?.m15?.length >= 10) {
             m15 = fhData.m15;
-            h1  = fhData.h1?.length ? fhData.h1 : null;
-            h4  = fhData.h4?.length ? fhData.h4 : null;
+            m5  = fhData.m5?.length  ? fhData.m5  : null;
+            h1  = fhData.h1?.length  ? fhData.h1  : null;
+            h4  = fhData.h4?.length  ? fhData.h4  : null;
             source = 'finnhub';
-            console.log(`[FH] ✅ ${symbol}: M15(${m15.length}) H1(${h1?.length||0}) H4(${h4?.length||0})`);
+            console.log(`[FH] ✅ ${symbol}: M5(${m5?.length||0}) M15(${m15.length}) H1(${h1?.length||0}) H4(${h4?.length||0})`);
           }
         }
         // ── Fallback: TwelveData (8 req/min) ────────────────────────
         if (!m15 || m15.length < 10) {
           console.log(`[TD] ${source === 'finnhub' ? '' : 'Finnhub unavailable — '}using TwelveData for ${symbol}`);
           m15 = await this.td.fetch(cfg.td, '15min', 130);
+          m5  = m15 ? await this.td.fetch(cfg.td, '5min', 288) : null;
           h1  = m15 ? await this.td.fetch(cfg.td, '1h', 100) : null;
           h4  = m15 ? await this.td.fetch(cfg.td, '4h', 60)  : null;
           source = m15 ? 'twelvedata' : 'failed';
@@ -2187,8 +2240,9 @@ class DataFetcher {
         const dtf = await this.delta.fetchMTF(cfg.deltaSymbol);
         if (dtf?.m15?.length >= 10) {
           m15 = dtf.m15;
-          h1  = dtf.h1?.length ? dtf.h1 : null;
-          h4  = dtf.h4?.length ? dtf.h4 : null;
+          m5  = dtf.m5?.length  ? dtf.m5  : null;
+          h1  = dtf.h1?.length  ? dtf.h1  : null;
+          h4  = dtf.h4?.length  ? dtf.h4  : null;
           source = 'delta';
         // Daily from H4 (6 × 4h = 1 day)
         if (m15 && h4?.length >= 6) daily = this.resample(h4, 6);
@@ -2200,6 +2254,8 @@ class DataFetcher {
           if (binM15?.length >= 10) {
             const binH1 = await this.binFb.fetch(cfg.deltaSymbol, '1h', 100);
             const binH4 = await this.binFb.fetch(cfg.deltaSymbol, '4h', 60);
+            const binM5 = await this.binFb.fetch(cfg.deltaSymbol, '5m', 288);
+            m5     = binM5 || null;
             m15    = binM15;
             h1     = binH1 || this.resample(binM15, 4);
             h4     = binH4 || this.resample(binM15, 16);
@@ -2223,6 +2279,7 @@ class DataFetcher {
       } else if (cfg.src === 'dhan') {
         // Dhan: fetch M15 directly, resample for H1 and H4
         m15 = await this.dhan.fetch(symbol, 'FIFTEEN_MINUTE');
+        m5  = await this.dhan.fetch(symbol, 'FIVE_MINUTE');
         if (m15 && m15.length >= 20) {
           h1 = this.resample(m15, 4);   // 4 × 15min = 1h
           h4 = this.resample(m15, 16);  // 16 × 15min = 4h
@@ -2246,7 +2303,7 @@ class DataFetcher {
     if (!h1 || h1.length < 8)  h1 = this.resample(m15, 4);
     if (!h4 || h4.length < 4)  h4 = this.resample(m15, 16);
 
-    const result = { m15, h1, h4, daily: daily || [], source };
+    const result = { m5: m5 || [], m15, h1, h4, daily: daily || [], source };
     this.mtfCache[key] = { data: result, time: Date.now() };
     return result;
   }
@@ -2286,17 +2343,16 @@ async function tgSignal(sig) {
 🌍 *Session:* ${sig.session} | KZ: ${sig.mtf.kz ? '✅' : '❌'}
 📍 *Zone:* ${pd} | H1 POI: ${sig.mtf.h1POI || 'none'}
 
-💰 *Entry:*  \`${sig.levels.entry}\`
-🛑 *SL:*     \`${sig.levels.sl}\`
+💰 *Entry:*  \`${sig.levels.entry}\` (${sig.entryTF})${sig.levels.sl}\`
 🎯 *TP1:*   \`${sig.levels.tp1}\`
 🎯 *TP2:*   \`${sig.levels.tp2}\`
 🎯 *TP3:*   \`${sig.levels.tp3}\`
 📐 *R:R:*   ${sig.levels.rr}
-⏱ *Expires:* ${exp} IST | M15 entry | H1 SL
+⏱ *Expires:* ${exp} IST | Setup: M15 | Entry: ${sig.entryTF} | SL: H1 struct
 
 📈 RSI: ${sig.indicators.rsi} | Vol: ${sig.indicators.vol.ratio}x | ATR: ${sig.indicators.atr}
 
-✅ *Confirmed by:*
+${sig.m5EntryNote ? `⚡ *M5 Entry:* ${sig.m5EntryNote}\n\n` : ''}✅ *Confirmed by:*
 ${confirms}
 
 🔌 ${sig.source.toUpperCase()} | ${sig.candles} M15 candles
@@ -2496,7 +2552,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '9.7.0',
+  version: '9.8.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -2507,7 +2563,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '9.7.0',
+    status: 'OK', version: '9.8.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -2626,7 +2682,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v9.7 — ICT/SMC ENGINE      ║
+║   HYBRID TRADING BOT v9.8 — ICT/SMC ENGINE      ║
 ║   10 strategies · M15 entry · H1/H4 SL-TP       ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -2639,7 +2695,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v9.7 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v9.8 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 10 ICT/SMC | Entry: M15 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
