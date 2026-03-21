@@ -2476,7 +2476,7 @@ async function runCycle() {
   state.running = true;
   const t0 = Date.now();
   const ist = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  console.log(`\n[v9.1] ⚡ M15 Cycle — ${ist}`);
+  console.log(`\n[v9.8] ⚡ M15 Cycle — ${ist}`);
 
   // Prefetch all Delta crypto symbols
   const deltaSyms = Object.values(SYMBOLS).filter(s => s.src === 'delta').map(s => s.deltaSymbol);
@@ -2503,25 +2503,25 @@ async function runCycle() {
             await tgSend(`🔴 *${catLabel[cfg.cat] || cfg.cat.charAt(0).toUpperCase()+cfg.cat.slice(1)} Market Closed*\n${Market.closedMessage(cfg.cat, symbol)}`);
           }
         }
-        console.log(`[v9.1] 🔴 ${symbol}: ${cfg.cat} market closed`);
+        console.log(`[v9.8] 🔴 ${symbol}: ${cfg.cat} market closed`);
         continue;
       }
 
       // ── Fetch candles ──────────────────────────────────────
       const mtf = await dataFetcher.fetchMTF(symbol);
-      if (!mtf?.m15?.length) { console.log(`[v9.1] ⚠️  No data: ${symbol}`); continue; }
+      if (!mtf?.m15?.length) { console.log(`[v9.8] ⚠️  No data: ${symbol}`); continue; }
 
       // ── Build signal ───────────────────────────────────────
       const sig      = Builder.build(symbol, mtf.m15, mtf.source, mtf);
       const curPrice = mtf.m15[mtf.m15.length - 1].close;
 
-      if (!sig) { console.log(`[v9.1] ℹ️  No signal: ${symbol}`); continue; }
+      if (!sig) { console.log(`[v9.8] ℹ️  No signal: ${symbol}`); continue; }
 
       // ── Gate check ─────────────────────────────────────────
       const g = gate.check(sig, curPrice);
       if (!g.ok) {
         cycleBlocked++; state.stats.blocked++;
-        console.log(`[v9.1] 🚫 ${symbol}: ${g.why}`);
+        console.log(`[v9.8] 🚫 ${symbol}: ${g.why}`);
         continue;
       }
 
@@ -2532,18 +2532,18 @@ async function runCycle() {
       state.stats.total++;
       cycleSignals++;
 
-      console.log(`[v9.1] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
+      console.log(`[v9.8] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
       await tgSignal(sig);
       await new Promise(r => setTimeout(r, 500));
 
-    } catch (e) { console.error(`[v9.1] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
+    } catch (e) { console.error(`[v9.8] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
   }
 
   await checkExpiry();
 
   await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
-  console.log(`[v9.1] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
+  console.log(`[v9.8] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
   state.running = false;
 }
 
@@ -2683,7 +2683,7 @@ app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
 ║   HYBRID TRADING BOT v9.8 — ICT/SMC ENGINE      ║
-║   10 strategies · M15 entry · H1/H4 SL-TP       ║
+║   14 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
 Port: ${CONFIG.PORT} | Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN} | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -2691,13 +2691,13 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   `);
 
   // Give CoinGecko a moment before first cycle (avoid cold-start 429)
-  console.log('[v9.1] Waiting 5s before first cycle (CG rate limit buffer)...');
+  console.log('[v9.8] Waiting 5s before first cycle (CG rate limit buffer)...');
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
   await tgSend(`🚀 *Hybrid Trading Bot v9.8 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
-Strategies: 10 ICT/SMC | Entry: M15 | SL: H1 structure
+Strategies: 14 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
 ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activate NIFTY/BANKNIFTY/FINNIFTY/SENSEX' : ''}`);
   await runCycle();
@@ -2705,5 +2705,5 @@ ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activat
   // Schedule every 15 min aligned to clock (09:15, 09:30, 09:45...)
   // */15 fires at :00, :15, :30, :45 of every hour — perfect M15 alignment
   cron.schedule('*/15 * * * *', runCycle);
-  console.log('[v9.1] Cron scheduled: every 15 min. Bot running.\n');
+  console.log('[v9.8] Cron scheduled: every 15 min. Bot running.\n');
 });
