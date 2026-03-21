@@ -22,6 +22,7 @@ const CONFIG = {
   TWELVE_DATA_KEY:    process.env.TWELVE_DATA_API_KEY,
   TWELVE_DATA_URL:    'https://api.twelvedata.com',
   DELTA_URL:          'https://api.india.delta.exchange', // No API key needed
+  CG_URL:             'https://api.coingecko.com/api/v3',  // Fallback for crypto
   DHAN_URL:           'https://api.dhan.co',
   SIGNAL_QUALITY_MIN: 80,
   CANDLE_LIMIT:       130,   // M15 candles to fetch
@@ -45,11 +46,11 @@ const SYMBOLS = {
   AUDUSD:    { name:'AUD/USD',     cat:'forex',     src:'td',   td:'AUD/USD',  fh:'OANDA:AUD_USD'  },
   // Commodity — Finnhub primary | TwelveData fallback
   XAUUSD:    { name:'Gold/USD',    cat:'commodity', src:'td',   td:'XAU/USD',  fh:'OANDA:XAU_USD'  },
-  // Crypto (Delta Exchange India — real M15 OHLC, no API key needed)
-  BTCUSDT:   { name:'BTC/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'BTCUSD'  },
-  ETHUSDT:   { name:'ETH/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'ETHUSD'  },
-  XRPUSDT:   { name:'XRP/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'XRPUSD'  },
-  BNBUSDT:   { name:'BNB/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'BNBUSD'  },
+  // Crypto — Delta Exchange primary (real M15) | CoinGecko fallback (30-min proxy)
+  BTCUSDT:   { name:'BTC/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'BTCUSD',  cgId:'bitcoin'     },
+  ETHUSDT:   { name:'ETH/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'ETHUSD',  cgId:'ethereum'    },
+  XRPUSDT:   { name:'XRP/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'XRPUSD',  cgId:'ripple'      },
+  BNBUSDT:   { name:'BNB/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'BNBUSD',  cgId:'binancecoin' },
 };
 
 // ── Live Dhan token (updated at runtime, no redeploy) ─────────
@@ -1426,6 +1427,55 @@ class DeltaFetcher {
 }
 
 
+// ── CoinGecko Fallback — only used when Delta Exchange fails ─────────────────
+// Simpler than the old CGFetcher: no prefetch, just fetch on demand.
+// Returns 30-min candles (best CG free tier offers) as M15 proxy.
+class CGFallback {
+  constructor() {
+    this.cache   = {};          // cgId → { candles, time }
+    this.ttl     = 15 * 60000; // 15 min cache
+    this.backoff = 0;
+    this.lastCall = 0;
+  }
+
+  async fetch(cgId) {
+    // Return cache if fresh
+    if (this.cache[cgId] && Date.now() - this.cache[cgId].time < this.ttl)
+      return this.cache[cgId].candles;
+    // Respect backoff
+    if (this.backoff > Date.now()) {
+      console.log(`[CG-FB] Backoff — returning cache for ${cgId}`);
+      return this.cache[cgId]?.candles || null;
+    }
+    // Rate limit: 2s between calls
+    const gap = 2000 - (Date.now() - this.lastCall);
+    if (gap > 0) await new Promise(r => setTimeout(r, gap));
+    this.lastCall = Date.now();
+    try {
+      const res = await axios.get(`${CONFIG.CG_URL}/coins/${cgId}/ohlc`, {
+        params: { vs_currency: 'usd', days: 1 },
+        headers: { 'Accept': 'application/json', 'User-Agent': 'HybridTradingBot/9.3' },
+        timeout: 15000,
+      });
+      if (!res.data?.length) return this.cache[cgId]?.candles || null;
+      const candles = res.data.map(([t, o, h, l, cv]) => ({
+        time: t, open: o, high: h, low: l, close: cv, volume: 500000,
+      }));
+      this.cache[cgId] = { candles, time: Date.now() };
+      console.log(`[CG-FB] ✅ ${cgId}: ${candles.length} candles (30-min proxy)`);
+      return candles;
+    } catch (e) {
+      if (e.response?.status === 429) {
+        this.backoff = Date.now() + 120000;
+        console.warn('[CG-FB] 429 — 2 min backoff');
+      } else {
+        console.error(`[CG-FB] ${cgId}: ${e.message}`);
+      }
+      return this.cache[cgId]?.candles || null;
+    }
+  }
+}
+
 class DhanFetcher {
   constructor() {}
 
@@ -1478,6 +1528,7 @@ class DataFetcher {
     this.td      = new TDFetcher();
     this.fh      = new FinnhubFetcher();
     this.delta   = new DeltaFetcher();
+    this.cgFb    = new CGFallback();     // CoinGecko fallback for crypto
     this.dhan    = new DhanFetcher();
     this.cache = {};     // symbol → last known M15 candles
     this.mtfCache = {}; // symbol_mtf → { data, time }
@@ -1532,12 +1583,26 @@ class DataFetcher {
         }
 
       } else if (cfg.src === 'delta') {
-        // Delta Exchange India — real M15 OHLC, no rate limit issues
+        // ── Primary: Delta Exchange India (real M15, no API key) ────
         const dtf = await this.delta.fetchMTF(cfg.deltaSymbol);
-        m15 = dtf?.m15 || null;
-        h1  = dtf?.h1  || null;
-        h4  = dtf?.h4  || null;
-        source = 'delta';
+        if (dtf?.m15?.length >= 10) {
+          m15 = dtf.m15;
+          h1  = dtf.h1?.length ? dtf.h1 : null;
+          h4  = dtf.h4?.length ? dtf.h4 : null;
+          source = 'delta';
+        }
+        // ── Fallback: CoinGecko (30-min proxy if Delta fails) ────────
+        if (!m15 || m15.length < 10) {
+          console.log(`[CG-FB] Delta failed for ${symbol} — trying CoinGecko fallback`);
+          const cgCandles = await this.cgFb.fetch(cfg.cgId);
+          if (cgCandles?.length >= 10) {
+            m15    = cgCandles;
+            h1     = this.resample(cgCandles, 2);  // 2 × 30min = 1h proxy
+            h4     = this.resample(cgCandles, 8);  // 8 × 30min = 4h proxy
+            source = 'coingecko_fallback';
+            console.log(`[CG-FB] ✅ ${symbol}: using CoinGecko (${cgCandles.length} candles)`);
+          }
+        }
 
       } else if (cfg.src === 'dhan') {
         // Dhan: fetch M15 directly, resample for H1 and H4
@@ -1813,7 +1878,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '9.3.0',
+  version: '9.4.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -1824,7 +1889,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '9.3.0',
+    status: 'OK', version: '9.4.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -1839,7 +1904,8 @@ app.get('/api/health', (req, res) => {
     dataSources: {
       finnhub:    CONFIG.FINNHUB_KEY      ? '✅ primary forex/gold' : '⚠️  add FINNHUB_API_KEY',
       twelvedata: CONFIG.TWELVE_DATA_KEY  ? '✅ fallback forex/gold' : '⚠️  key missing',
-      delta:     '✅ crypto (real M15)',
+      delta:     '✅ crypto primary (real M15)',
+      coingecko: '✅ crypto fallback (auto if Delta fails)',
       dhan: dhanToken.accessToken === 'placeholder' ? '⏳ no token — POST /api/dhan/token' :
                dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 86400000 ? '❌ token expired — refresh now' :
                dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 72000000 ? '⚠️  token expiring soon' : '✅ active',
@@ -1939,7 +2005,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v9.3 — ICT/SMC ENGINE      ║
+║   HYBRID TRADING BOT v9.4 — ICT/SMC ENGINE      ║
 ║   10 strategies · M15 entry · H1/H4 SL-TP       ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -1953,7 +2019,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
   await tgSend(`🚀 *Hybrid Trading Bot v9.1 Online*
-Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta Exchange)
+Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + CoinGecko fallback)
 Strategies: 10 ICT/SMC | Entry: M15 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
 ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activate NIFTY/BANKNIFTY/FINNIFTY/SENSEX' : ''}`);
