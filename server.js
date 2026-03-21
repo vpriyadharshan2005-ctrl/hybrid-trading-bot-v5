@@ -17,6 +17,8 @@ const CONFIG = {
   PORT:               process.env.PORT || 5000,
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID:   process.env.TELEGRAM_CHAT_ID,
+  FINNHUB_KEY:        process.env.FINNHUB_API_KEY,
+  FINNHUB_URL:        'https://finnhub.io/api/v1',
   TWELVE_DATA_KEY:    process.env.TWELVE_DATA_API_KEY,
   TWELVE_DATA_URL:    'https://api.twelvedata.com',
   DELTA_URL:          'https://api.india.delta.exchange', // No API key needed
@@ -36,13 +38,13 @@ const SYMBOLS = {
   BANKNIFTY: { name:'Bank NIFTY',  cat:'india',     src:'dhan', dhanId:'25', seg:'IDX_I' },
   FINNIFTY:  { name:'Fin NIFTY',   cat:'india',     src:'dhan', dhanId:'27', seg:'IDX_I' },
   SENSEX:    { name:'BSE SENSEX',  cat:'india',     src:'dhan', dhanId:'51', seg:'IDX_I' },
-  // Forex (TwelveData)
-  EURUSD:    { name:'EUR/USD',     cat:'forex',     src:'td',   td:'EUR/USD'  },
-  GBPUSD:    { name:'GBP/USD',     cat:'forex',     src:'td',   td:'GBP/USD'  },
-  USDJPY:    { name:'USD/JPY',     cat:'forex',     src:'td',   td:'USD/JPY'  },
-  AUDUSD:    { name:'AUD/USD',     cat:'forex',     src:'td',   td:'AUD/USD'  },
-  // Commodity (TwelveData)
-  XAUUSD:    { name:'Gold/USD',    cat:'commodity', src:'td',   td:'XAU/USD'  },
+  // Forex — Finnhub primary (60 req/min) | TwelveData fallback (8 req/min)
+  EURUSD:    { name:'EUR/USD',     cat:'forex',     src:'td',   td:'EUR/USD',  fh:'OANDA:EUR_USD'  },
+  GBPUSD:    { name:'GBP/USD',     cat:'forex',     src:'td',   td:'GBP/USD',  fh:'OANDA:GBP_USD'  },
+  USDJPY:    { name:'USD/JPY',     cat:'forex',     src:'td',   td:'USD/JPY',  fh:'OANDA:USD_JPY'  },
+  AUDUSD:    { name:'AUD/USD',     cat:'forex',     src:'td',   td:'AUD/USD',  fh:'OANDA:AUD_USD'  },
+  // Commodity — Finnhub primary | TwelveData fallback
+  XAUUSD:    { name:'Gold/USD',    cat:'commodity', src:'td',   td:'XAU/USD',  fh:'OANDA:XAU_USD'  },
   // Crypto (Delta Exchange India — real M15 OHLC, no API key needed)
   BTCUSDT:   { name:'BTC/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'BTCUSD'  },
   ETHUSDT:   { name:'ETH/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'ETHUSD'  },
@@ -1252,6 +1254,88 @@ class TDFetcher {
   }
 }
 
+// ── Finnhub Fetcher — primary for Forex + Gold ───────────────────────────────
+// Free tier: 60 calls/min. Real M15 OHLC from institutional brokers.
+// Docs: https://finnhub.io/docs/api/forex-candles
+class FinnhubFetcher {
+  constructor() {
+    this.key     = CONFIG.FINNHUB_KEY;
+    this.baseUrl = CONFIG.FINNHUB_URL;
+    this.cache   = {};           // symbol → { m15, h1, h4, time }
+    this.ttlM15  = 12 * 60000;  // 12 min
+    this.ttlH1   = 25 * 60000;  // 25 min
+    this.lastCall = 0;
+    this.minGap  = 200;          // ms between calls (well under 60/min)
+  }
+
+  get available() { return !!this.key; }
+
+  async _wait() {
+    const gap = this.minGap - (Date.now() - this.lastCall);
+    if (gap > 0) await new Promise(r => setTimeout(r, gap));
+    this.lastCall = Date.now();
+  }
+
+  // resolution: '15' (15min) | '60' (1h) | '240' (4h)
+  // Returns candles oldest→newest, or null on failure
+  async fetchCandles(fhSymbol, resolution = '15', days = 3) {
+    if (!this.available) return null;
+    await this._wait();
+    const to   = Math.floor(Date.now() / 1000);
+    const from = to - days * 86400;
+    try {
+      const res = await axios.get(`${this.baseUrl}/forex/candle`, {
+        params: { symbol: fhSymbol, resolution, from, to, token: this.key },
+        timeout: 15000,
+      });
+      const d = res.data;
+      if (d.s !== 'ok' || !d.t?.length) {
+        // 'no_data' means market closed or no candles in range — not an error
+        if (d.s !== 'no_data') console.warn(`[FH] ${fhSymbol}/${resolution}: status=${d.s}`);
+        return null;
+      }
+      const candles = d.t.map((ts, i) => ({
+        time:   ts * 1000,
+        open:   d.o[i], high: d.h[i],
+        low:    d.l[i], close: d.c[i],
+        volume: d.v?.[i] || 1,
+      }));
+      console.log(`[FH] ✅ ${fhSymbol} [${resolution}m]: ${candles.length} candles`);
+      return candles;
+    } catch (e) {
+      const status = e.response?.status;
+      if (status === 429) console.warn('[FH] Rate limited — slow down');
+      else console.error(`[FH] ${fhSymbol}/${resolution}: ${status || e.message}`);
+      return null;
+    }
+  }
+
+  // Fetch M15 + H1 + H4 for a symbol, with cache
+  async fetchMTF(fhSymbol) {
+    const cached = this.cache[fhSymbol];
+    if (cached && Date.now() - cached.time < this.ttlM15) return cached;
+
+    const m15 = await this.fetchCandles(fhSymbol, '15', 3);
+    if (!m15 || m15.length < 10) return cached || null;
+
+    // H1 — only refetch if stale
+    let h1 = cached?.h1 || null;
+    if (!h1 || Date.now() - (cached?.h1Time || 0) > this.ttlH1) {
+      h1 = await this.fetchCandles(fhSymbol, '60', 7);
+    }
+
+    // H4
+    const h4 = await this.fetchCandles(fhSymbol, '240', 30);
+
+    const result = {
+      m15, h1: h1 || [], h4: h4 || [],
+      time: Date.now(), h1Time: Date.now(),
+    };
+    this.cache[fhSymbol] = result;
+    return result;
+  }
+}
+
 class DeltaFetcher {
   // Delta Exchange India — https://api.india.delta.exchange
   // Public API, no key needed. Real M15 OHLC.
@@ -1391,9 +1475,10 @@ class DhanFetcher {
 
 class DataFetcher {
   constructor() {
-    this.td    = new TDFetcher();
-    this.delta = new DeltaFetcher();
-    this.dhan  = new DhanFetcher();
+    this.td      = new TDFetcher();
+    this.fh      = new FinnhubFetcher();
+    this.delta   = new DeltaFetcher();
+    this.dhan    = new DhanFetcher();
     this.cache = {};     // symbol → last known M15 candles
     this.mtfCache = {}; // symbol_mtf → { data, time }
     this.mtfTTL   = 14 * 60000; // 14 min (just under M15 cycle)
@@ -1426,10 +1511,25 @@ class DataFetcher {
 
     try {
       if (cfg.src === 'td') {
-        m15 = await this.td.fetch(cfg.td, '15min', 130);
-        h1  = await this.td.fetch(cfg.td, '1h',    100);
-        h4  = await this.td.fetch(cfg.td, '4h',    60);
-        source = 'twelvedata';
+        // ── Primary: Finnhub (60 req/min, fast) ─────────────────────
+        if (this.fh.available && cfg.fh) {
+          const fhData = await this.fh.fetchMTF(cfg.fh);
+          if (fhData?.m15?.length >= 10) {
+            m15 = fhData.m15;
+            h1  = fhData.h1?.length ? fhData.h1 : null;
+            h4  = fhData.h4?.length ? fhData.h4 : null;
+            source = 'finnhub';
+            console.log(`[FH] ✅ ${symbol}: M15(${m15.length}) H1(${h1?.length||0}) H4(${h4?.length||0})`);
+          }
+        }
+        // ── Fallback: TwelveData (8 req/min) ────────────────────────
+        if (!m15 || m15.length < 10) {
+          console.log(`[TD] ${source === 'finnhub' ? '' : 'Finnhub unavailable — '}using TwelveData for ${symbol}`);
+          m15 = await this.td.fetch(cfg.td, '15min', 130);
+          h1  = m15 ? await this.td.fetch(cfg.td, '1h', 100) : null;
+          h4  = m15 ? await this.td.fetch(cfg.td, '4h', 60)  : null;
+          source = m15 ? 'twelvedata' : 'failed';
+        }
 
       } else if (cfg.src === 'delta') {
         // Delta Exchange India — real M15 OHLC, no rate limit issues
@@ -1713,7 +1813,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '9.2.0',
+  version: '9.3.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -1724,7 +1824,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '9.2.0',
+    status: 'OK', version: '9.3.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -1737,8 +1837,9 @@ app.get('/api/health', (req, res) => {
       crypto:    'OPEN (24/7)',
     },
     dataSources: {
-      twelvedata: CONFIG.TWELVE_DATA_KEY  ? '✅' : '⚠️  key missing',
-      delta:     '✅ (real M15 OHLC)',
+      finnhub:    CONFIG.FINNHUB_KEY      ? '✅ primary forex/gold' : '⚠️  add FINNHUB_API_KEY',
+      twelvedata: CONFIG.TWELVE_DATA_KEY  ? '✅ fallback forex/gold' : '⚠️  key missing',
+      delta:     '✅ crypto (real M15)',
       dhan: dhanToken.accessToken === 'placeholder' ? '⏳ no token — POST /api/dhan/token' :
                dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 86400000 ? '❌ token expired — refresh now' :
                dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 72000000 ? '⚠️  token expiring soon' : '✅ active',
@@ -1838,7 +1939,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v9.2 — ICT/SMC ENGINE      ║
+║   HYBRID TRADING BOT v9.3 — ICT/SMC ENGINE      ║
 ║   10 strategies · M15 entry · H1/H4 SL-TP       ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -1852,7 +1953,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
   await tgSend(`🚀 *Hybrid Trading Bot v9.1 Online*
-Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ | Crypto ✅ (Delta Exchange)
+Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta Exchange)
 Strategies: 10 ICT/SMC | Entry: M15 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
 ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activate NIFTY/BANKNIFTY/FINNIFTY/SENSEX' : ''}`);
