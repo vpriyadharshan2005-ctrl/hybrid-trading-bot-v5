@@ -703,7 +703,7 @@ class Detectors {
             + (kz ? 4 : 0) + (x.volGood ? 4 : 0);
           return { id: 'FPB', name: 'First Pullback', dir: 'BUY', score,
             brokenLevel: oldSH,
-            sl_ref: { type: 'broken_level_below', val: oldSH - atr * 0.5 },
+            sl_ref: { type: 'broken_level_below', val: oldSH },  // raw level — levels() adds buffer
             tp_ref: { tp1_type: 'choch_swing_high', tp1_val: swH[swH.length - 1].v } };
         }
       }
@@ -717,7 +717,7 @@ class Detectors {
             + (kz ? 4 : 0) + (x.volGood ? 4 : 0);
           return { id: 'FPB', name: 'First Pullback', dir: 'SELL', score,
             brokenLevel: oldSL,
-            sl_ref: { type: 'broken_level_above', val: oldSL + atr * 0.5 },
+            sl_ref: { type: 'broken_level_above', val: oldSL },  // raw level — levels() adds buffer
             tp_ref: { tp1_type: 'choch_swing_low', tp1_val: swL[swL.length - 1].v } };
         }
       }
