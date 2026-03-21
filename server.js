@@ -1106,57 +1106,63 @@ class Builder {
     const dir = sig.dir;
     const isBuy = dir === 'BUY';
 
-    // H1 structure for SL fallback
-    const h1Atr = h1?.length >= 10 ? Ind.atr(h1) : atr;
-    const h1SwH = h1?.length >= 10 ? Ind.swingHighs(h1, 3) : [];
-    const h1SwL = h1?.length >= 10 ? Ind.swingLows(h1, 3)  : [];
-    const nearH1Low  = h1SwL.filter(s => s.v < price).sort((a,b) => b.v - a.v)[0];
-    const nearH1High = h1SwH.filter(s => s.v > price).sort((a,b) => a.v - b.v)[0];
+    // ── H1 structure (primary SL source) ─────────────────────────────────────
+    const h1Atr  = h1?.length >= 10 ? Ind.atr(h1) : atr * 3;
+    const h1SwH  = h1?.length >= 10 ? Ind.swingHighs(h1, 3) : [];
+    const h1SwL  = h1?.length >= 10 ? Ind.swingLows(h1, 3)  : [];
+    const h1OBs  = h1?.length >= 10 ? Ind.findOBs(h1, h1Atr) : [];
 
-    // M15 swings for TP
-    const m15SwH = Ind.swingHighs(c, 3).filter(s => s.v > price);
-    const m15SwL = Ind.swingLows(c, 3).filter(s => s.v < price);
-    const nearM15High = m15SwH.length ? m15SwH[0].v : price + atr * 2;
-    const nearM15Low  = m15SwL.length ? m15SwL[m15SwL.length-1].v : price - atr * 2;
+    // Nearest H1 swing BELOW price (BUY SL anchor)
+    const h1LowBelow  = h1SwL.filter(s => s.v < price - atr * 0.3).sort((a,b) => b.v - a.v)[0];
+    // Nearest H1 swing ABOVE price (SELL SL anchor)
+    const h1HighAbove = h1SwH.filter(s => s.v > price + atr * 0.3).sort((a,b) => a.v - b.v)[0];
+
+    // Nearest H1 OB below (BUY) / above (SELL) — structural SL
+    const h1OBBelow = h1OBs.filter(ob => ob.type === 'bull' && ob.bot < price - atr * 0.3)
+                           .sort((a,b) => b.bot - a.bot)[0];
+    const h1OBAbove = h1OBs.filter(ob => ob.type === 'bear' && ob.top > price + atr * 0.3)
+                           .sort((a,b) => a.top - b.top)[0];
+
+    // ── M15 swings for TP targets ─────────────────────────────────────────────
+    const m15SwH = Ind.swingHighs(c, 3).filter(s => s.v > price + atr * 0.3);
+    const m15SwL = Ind.swingLows(c, 3).filter(s => s.v < price - atr * 0.3);
+    const nearM15High = m15SwH.length ? m15SwH[0].v : price + atr * 2.5;
+    const nearM15Low  = m15SwL.length ? m15SwL[m15SwL.length-1].v : price - atr * 2.5;
+
+    // ── H1 swings for TP2 ────────────────────────────────────────────────────
+    const h1HighAboveTP = h1SwH.filter(s => s.v > price + atr * 0.5).sort((a,b) => a.v - b.v)[0];
+    const h1LowBelowTP  = h1SwL.filter(s => s.v < price - atr * 0.5).sort((a,b) => b.v - a.v)[0];
 
     let entry = f(price), sl = null, tp1 = null, tp2 = null, tp3 = null;
 
-    // ── Entry ─────────────────────────────────────────────────
-    // Entry is always at the current M15 close (confirmed candle close = market order on signal)
-    // For zone-based strategies, entry is at the zone edge closest to price
-    const buf = atr * 0.1; // tiny buffer to avoid spread
-
+    // ── ENTRY — at zone edge with small spread buffer ─────────────────────────
+    const buf = atr * 0.08; // 0.08 ATR buffer (tighter = better fill)
     switch (sig.id) {
       case 'FVG_OB':
-        entry = f(sig.sl_ref.val + buf * (isBuy ? 1 : -1));
+        // Enter just inside the zone edge
+        entry = f(isBuy ? sig.sl_ref.val + buf : sig.sl_ref.val - buf);
         break;
       case 'LIQ_SWEEP':
-        entry = f(sig.tp_ref.tp1_val + buf * (isBuy ? 1 : -1));
+        // Enter above swept level (BUY) / below (SELL)
+        entry = f(isBuy ? sig.tp_ref.tp1_val + buf : sig.tp_ref.tp1_val - buf);
         break;
       case 'CHOCH':
-        entry = f(sig.brokenLevel + buf * (isBuy ? 1 : -1));
-        break;
       case 'FPB':
-        entry = f(sig.brokenLevel + buf * (isBuy ? 1 : -1));
+        // Enter at retest of broken level
+        entry = f(isBuy ? sig.brokenLevel + buf : sig.brokenLevel - buf);
         break;
       case 'OTE':
-        entry = f(price); // at current price inside OTE zone
+        entry = f(price); // already inside OTE zone
         break;
       case 'BREAKER':
+        // Enter just inside breaker zone
         entry = f(isBuy ? sig.sl_ref.val + buf : sig.sl_ref.val - buf);
         break;
       case 'SILVER_BULLET':
+        // Enter at FVG edge
         entry = f(isBuy ? sig.sl_ref.val + buf : sig.sl_ref.val - buf);
         break;
-      case 'ORB':
-        entry = f(isBuy ? sig.tp_ref.tp1_val - (sig.tp_ref.tp1_val - price) + buf : sig.tp_ref.tp1_val + (price - sig.tp_ref.tp1_val) - buf);
-        entry = f(price); // ORB entry is at current price (close above/below breakout)
-        break;
-      case 'CRT':
-        entry = f(price);
-        break;
-      case 'PO3':
-        entry = f(isBuy ? sig.tp_ref.tp1_val - (sig.tp_ref.tp1_val - price) : price);
+      case 'ORB': case 'CRT': case 'PO3':
         entry = f(price);
         break;
       case 'FVG_BOS_HTF':
@@ -1166,121 +1172,256 @@ class Builder {
         entry = f(price);
     }
 
-    // ── SL — strictly from strategy's own structure ───────────
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ── SL — STRATEGY-SPECIFIC, STRUCTURAL, BEYOND NOISE ─────────────────────
+    // Key principle: SL must be placed where the SETUP IS INVALIDATED,
+    // not just beyond a tiny ATR buffer. If price reaches SL, the reason
+    // for the trade no longer exists.
+    // ═══════════════════════════════════════════════════════════════════════════
     switch (sig.id) {
+
       case 'FVG_OB':
-        // SL below OB/FVG bottom (BUY) / above OB/FVG top (SELL)
-        sl = f(isBuy ? sig.sl_ref.val - atr * 0.2 : sig.sl_ref.val + atr * 0.2);
+        // SL: below H1 swing low nearest to FVG zone (BUY)
+        // If H1 swing available → use it (structural). Otherwise → below FVG bottom - 0.5 ATR
+        // Logic: if price breaks BELOW the H1 swing that created the FVG, setup is invalidated
+        if (isBuy) {
+          sl = h1LowBelow
+            ? f(h1LowBelow.v - h1Atr * 0.15)           // below H1 swing low
+            : f(sig.sl_ref.val - atr * 0.5);            // below FVG bottom
+        } else {
+          sl = h1HighAbove
+            ? f(h1HighAbove.v + h1Atr * 0.15)
+            : f(sig.sl_ref.val + atr * 0.5);
+        }
         break;
+
       case 'LIQ_SWEEP':
-        // SL beyond sweep wick
-        sl = f(isBuy ? sig.sl_ref.val - atr * 0.15 : sig.sl_ref.val + atr * 0.15);
-        break;
-      case 'CHOCH':
-        // SL below/above the break candle
-        sl = f(isBuy ? sig.sl_ref.val - atr * 0.2 : sig.sl_ref.val + atr * 0.2);
-        break;
-      case 'FPB':
-        // SL beyond broken level
-        sl = f(sig.sl_ref.val);
-        break;
-      case 'OTE':
-        // SL below H1 OB bottom
-        sl = f(isBuy ? sig.sl_ref.val - atr * 0.15 : sig.sl_ref.val + atr * 0.15);
-        break;
-      case 'BREAKER':
-        // SL beyond breaker block
-        sl = f(isBuy ? sig.sl_ref.val - atr * 0.2 : sig.sl_ref.val + atr * 0.2);
-        break;
-      case 'SILVER_BULLET':
-        // SL below/above FVG
-        sl = f(isBuy ? sig.sl_ref.val - atr * 0.2 : sig.sl_ref.val + atr * 0.2);
-        break;
-      case 'ORB':
-        // SL opposite side of ORB range
-        sl = f(sig.sl_ref.val);
-        break;
-      case 'CRT':
-        // SL beyond the swept wick
-        sl = f(isBuy ? sig.sl_ref.val - atr * 0.15 : sig.sl_ref.val + atr * 0.15);
-        break;
-      case 'PO3':
-        // SL beyond manipulation wick
-        sl = f(isBuy ? sig.sl_ref.val - atr * 0.15 : sig.sl_ref.val + atr * 0.15);
-        break;
-      case 'FVG_BOS_HTF':
-        sl = f(isBuy ? sig.sl_ref.val - atr * 0.2 : sig.sl_ref.val + atr * 0.2);
-        break;
-      default:
+        // SL: beyond the FULL wick extreme + 0.5 ATR
+        // Logic: if price goes back BELOW the sweep low, manipulation was real — no reversal
         sl = isBuy
-          ? f(nearH1Low ? nearH1Low.v - h1Atr * 0.2 : price - atr * 2.5)
-          : f(nearH1High ? nearH1High.v + h1Atr * 0.2 : price + atr * 2.5);
+          ? f(sig.sl_ref.val - atr * 0.5)  // below wick low
+          : f(sig.sl_ref.val + atr * 0.5); // above wick high
+        break;
+
+      case 'CHOCH':
+        // SL: below the LOWEST point of the ChoCh candle - 0.3 ATR
+        // Logic: if break candle is fully negated, structure shift failed
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.3)  // below break candle low
+          : f(sig.sl_ref.val + atr * 0.3); // above break candle high
+        break;
+
+      case 'FPB':
+        // SL: 1.0 ATR beyond the broken level
+        // Logic: if price goes 1 ATR through the level, it was a fake break
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 1.0)  // 1 ATR below broken level
+          : f(sig.sl_ref.val + atr * 1.0);
+        break;
+
+      case 'OTE':
+        // SL: below H1 OB bottom - 0.5 ATR (H1 structural level)
+        // Logic: OTE is a pullback INTO institutional zone. If OB is broken, no reversal.
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.5)  // below H1 OB bottom
+          : f(sig.sl_ref.val + atr * 0.5); // above H1 OB top
+        break;
+
+      case 'BREAKER':
+        // SL: below breaker block bottom - 0.5 ATR
+        // Logic: if original OB is fully broken, the breaker concept is invalidated
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.5)
+          : f(sig.sl_ref.val + atr * 0.5);
+        break;
+
+      case 'SILVER_BULLET':
+        // SL: below FVG bottom - 0.5 ATR (kill zone structure)
+        // Logic: FVG in kill zone is the entry reason. Below FVG = setup invalid.
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.5)
+          : f(sig.sl_ref.val + atr * 0.5);
+        break;
+
+      case 'ORB':
+        // SL: opposite side of ORB range - 0.3 ATR
+        // Logic: if price trades back through the ENTIRE opening range, breakout failed
+        sl = f(isBuy ? sig.sl_ref.val - atr * 0.3 : sig.sl_ref.val + atr * 0.3);
+        break;
+
+      case 'CRT':
+        // SL: below HTF candle wick extreme - 0.5 ATR
+        // Logic: CRT setup is based on the wick sweep. If price goes below the wick, AMD failed.
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.5)  // below H1/H4 wick low
+          : f(sig.sl_ref.val + atr * 0.5); // above H1/H4 wick high
+        break;
+
+      case 'PO3':
+        // SL: below manipulation sweep extreme - 0.5 ATR
+        // Logic: PO3 entry is AFTER price sweeps Asian range and closes back inside.
+        // If price goes below the sweep low again, manipulation was not complete.
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.5)
+          : f(sig.sl_ref.val + atr * 0.5);
+        break;
+
+      case 'FVG_BOS_HTF':
+        // SL: H1 swing low below the BOS candle (strongest structural anchor)
+        // Logic: HTF combo requires all 3 TF aligned. H1 swing low is the structural SL.
+        if (isBuy) {
+          sl = h1LowBelow
+            ? f(h1LowBelow.v - h1Atr * 0.15)
+            : f(sig.sl_ref.val - atr * 0.5);
+        } else {
+          sl = h1HighAbove
+            ? f(h1HighAbove.v + h1Atr * 0.15)
+            : f(sig.sl_ref.val + atr * 0.5);
+        }
+        break;
+
+      default:
+        // Fallback: H1 structural SL (always wider than M15 noise)
+        sl = isBuy
+          ? f(h1LowBelow ? h1LowBelow.v - h1Atr * 0.15 : price - atr * 2.5)
+          : f(h1HighAbove ? h1HighAbove.v + h1Atr * 0.15 : price + atr * 2.5);
     }
 
-    // ── TP1 — from strategy's own live structure ──────────────
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ── TP — STRATEGY-SPECIFIC STRUCTURAL TARGETS ────────────────────────────
+    // TP1 = nearest meaningful target in direction of trade (M15 structure)
+    // TP2 = H1 structural target (larger move)
+    // TP3 = 3× risk (extended target, let winners run)
+    // ═══════════════════════════════════════════════════════════════════════════
     switch (sig.id) {
+
       case 'FVG_OB':
-        tp1 = f(sig.tp_ref.tp1_val); // opposite edge of FVG/OB
-        break;
-      case 'LIQ_SWEEP':
-        tp1 = f(sig.tp_ref.tp1_val); // swept level (now acts as S/R)
-        break;
-      case 'CHOCH':
-      case 'FPB':
-        tp1 = f(sig.tp_ref.tp1_val); // prior swing
-        break;
-      case 'OTE':
-        tp1 = f(sig.tp_ref.tp1_val); // swing high/low
-        break;
-      case 'BREAKER':
-        tp1 = f(sig.tp_ref.tp1_val); // origin of displacement
-        break;
-      case 'SILVER_BULLET':
-        tp1 = f(sig.tp_ref.tp1_val); // kill zone high/low
-        break;
-      case 'ORB':
-        tp1 = f(sig.tp_ref.tp1_val); // 1× range projection
-        break;
-      case 'CRT':
-        tp1 = f(sig.tp_ref.tp1_val); // HTF candle body midpoint
-        break;
-      case 'PO3':
-        tp1 = f(sig.tp_ref.tp1_val); // opposite side of Asian range
-        break;
-      case 'FVG_BOS_HTF':
+        // TP1 = opposite edge of FVG/OB (gap fill / zone flip)
+        // TP2 = next H1 swing high/low
         tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || (sig.tp_ref.tp1_val + Math.abs(sig.tp_ref.tp1_val - (entry || price))))
+          : f(h1LowBelowTP?.v  || (sig.tp_ref.tp1_val - Math.abs((entry || price) - sig.tp_ref.tp1_val)));
         break;
+
+      case 'LIQ_SWEEP':
+        // TP1 = swept level (now acts as S/R — first target after reversal)
+        // TP2 = next H1 swing in direction (liquidity target)
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || tp1 + Math.abs(tp1 - (entry || price)))
+          : f(h1LowBelowTP?.v  || tp1 - Math.abs((entry || price) - tp1));
+        break;
+
+      case 'CHOCH':
+        // TP1 = prior swing high (last swing before trend changed)
+        // TP2 = H1 swing beyond TP1 (trend continuation target)
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || tp1 + Math.abs(tp1 - (entry || price)))
+          : f(h1LowBelowTP?.v  || tp1 - Math.abs((entry || price) - tp1));
+        break;
+
+      case 'FPB':
+        // TP1 = swing high/low created by the ChoCh/BOS move (measured move)
+        // TP2 = H1 swing beyond (full trend continuation)
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || tp1 + Math.abs(tp1 - (entry || price)) * 0.8)
+          : f(h1LowBelowTP?.v  || tp1 - Math.abs((entry || price) - tp1) * 0.8);
+        break;
+
+      case 'OTE':
+        // TP1 = swing high/low that started the retracement (measured move complete)
+        // TP2 = H4 premium/discount extreme (full delivery)
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || tp1 + Math.abs(tp1 - (entry || price)) * 1.2)
+          : f(h1LowBelowTP?.v  || tp1 - Math.abs((entry || price) - tp1) * 1.2);
+        break;
+
+      case 'BREAKER':
+        // TP1 = origin of displacement move (imbalance delivery)
+        // TP2 = H1 swing beyond displacement origin
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || tp1 + Math.abs(tp1 - (entry || price)) * 0.8)
+          : f(h1LowBelowTP?.v  || tp1 - Math.abs((entry || price) - tp1) * 0.8);
+        break;
+
+      case 'SILVER_BULLET':
+        // TP1 = kill zone session high/low (where institutional delivery ends)
+        // TP2 = prior session high/low (bigger target)
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || tp1 + Math.abs(tp1 - (entry || price)))
+          : f(h1LowBelowTP?.v  || tp1 - Math.abs((entry || price) - tp1));
+        break;
+
+      case 'ORB':
+        // TP1 = 1× ORB range projection (measured move)
+        // TP2 = 2× ORB range (extended target, session high/low)
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = f(sig.tp_ref.tp2_val);
+        break;
+
+      case 'CRT':
+        // TP1 = HTF candle body midpoint (equilibrium — 50% rebalance)
+        // TP2 = opposite side of HTF candle (full range delivery)
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = f(sig.tp_ref.tp2_val);
+        break;
+
+      case 'PO3':
+        // TP1 = opposite side of Asian range (AMD distribution target)
+        // TP2 = Asian range opposite + 1 ATR extension (beyond range)
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = f(sig.tp_ref.tp2_val);
+        break;
+
+      case 'FVG_BOS_HTF':
+        // TP1 = FVG opposite edge (immediate imbalance target)
+        // TP2 = H1 swing high/low (structural continuation)
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || tp1 + Math.abs(tp1 - (entry || price)) * 1.5)
+          : f(h1LowBelowTP?.v  || tp1 - Math.abs((entry || price) - tp1) * 1.5);
+        break;
+
       default:
         tp1 = isBuy ? f(nearM15High) : f(nearM15Low);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || (tp1 + atr * 2))
+          : f(h1LowBelowTP?.v  || (tp1 - atr * 2));
     }
 
-    // ── TP2 — nearest H1 swing beyond TP1 ────────────────────
-    if (isBuy) {
-      const h1Above = h1SwH.filter(s => s.v > (tp1 || price)).sort((a,b) => a.v - b.v)[0];
-      tp2 = h1Above ? f(h1Above.v) : f((tp1 || price) + Math.abs((tp1||price) - (entry||price)));
-      // ORB/CRT: use their own TP2
-      if (sig.id === 'ORB' || sig.id === 'CRT' || sig.id === 'PO3') tp2 = f(sig.tp_ref.tp2_val);
-    } else {
-      const h1Below = h1SwL.filter(s => s.v < (tp1 || price)).sort((a,b) => b.v - a.v)[0];
-      tp2 = h1Below ? f(h1Below.v) : f((tp1 || price) - Math.abs((entry||price) - (tp1||price)));
-      if (sig.id === 'ORB' || sig.id === 'CRT' || sig.id === 'PO3') tp2 = f(sig.tp_ref.tp2_val);
-    }
-
-    // ── TP3 — 3× risk extension ───────────────────────────────
-    const risk3 = entry && sl ? Math.abs(entry - sl) * 3 : atr * 4;
+    // ── TP3 — 3× risk (let winners run) ──────────────────────────────────────
+    const risk3 = entry && sl ? Math.abs(entry - sl) * 3 : atr * 5;
     tp3 = isBuy ? f((entry || price) + risk3) : f((entry || price) - risk3);
 
-    // ── Enforce ordering ──────────────────────────────────────
+    // ── Enforce strict ordering — no TP closer than entry ────────────────────
     if (isBuy) {
-      if (entry && sl && sl >= entry) sl  = f(entry - atr);
-      if (tp1 && entry && tp1 <= entry) tp1 = f(entry + atr * 1.5);
-      if (tp2 && tp1  && tp2 <= tp1)   tp2 = f(tp1  + atr * 1.5);
-      if (tp3 && tp2  && tp3 <= tp2)   tp3 = f(tp2  + atr * 2);
+      if (sl  && entry && sl  >= entry) sl  = f(entry - atr * 1.5); // never above entry
+      if (tp1 && entry && tp1 <= entry) tp1 = f(entry + atr * 2.0);
+      if (tp2 && tp1   && tp2 <= tp1)   tp2 = f(tp1   + atr * 2.0);
+      if (tp3 && tp2   && tp3 <= tp2)   tp3 = f(tp2   + atr * 2.5);
     } else {
-      if (entry && sl && sl <= entry) sl  = f(entry + atr);
-      if (tp1 && entry && tp1 >= entry) tp1 = f(entry - atr * 1.5);
-      if (tp2 && tp1  && tp2 >= tp1)   tp2 = f(tp1  - atr * 1.5);
-      if (tp3 && tp2  && tp3 >= tp2)   tp3 = f(tp2  - atr * 2);
+      if (sl  && entry && sl  <= entry) sl  = f(entry + atr * 1.5);
+      if (tp1 && entry && tp1 >= entry) tp1 = f(entry - atr * 2.0);
+      if (tp2 && tp1   && tp2 >= tp1)   tp2 = f(tp1   - atr * 2.0);
+      if (tp3 && tp2   && tp3 >= tp2)   tp3 = f(tp2   - atr * 2.5);
+    }
+
+    // ── Minimum RR check: reject if RR < 1:1.5 ───────────────────────────────
+    if (sl && tp1 && entry) {
+      const risk   = Math.abs(entry - sl);
+      const reward = Math.abs(tp1   - entry);
+      if (risk > 0 && reward / risk < 1.5) {
+        // Extend TP1 to enforce minimum 1:1.5 RR
+        tp1 = isBuy
+          ? f((entry || price) + risk * 1.5)
+          : f((entry || price) - risk * 1.5);
+      }
     }
 
     return { entry, sl, tp1, tp2, tp3 };
@@ -1487,6 +1628,55 @@ class DeltaFetcher {
 }
 
 
+// ── Binance Fallback — true M15 OHLC for crypto (free, no key) ──────────────
+// Used when Delta Exchange fails. Returns real M15 candles.
+// Endpoint: https://api.binance.com/api/v3/klines
+class BinanceFallback {
+  constructor() {
+    this.baseUrl  = 'https://api.binance.com';
+    this.cache    = {};
+    this.ttl      = 12 * 60000; // 12 min
+    this.lastCall = 0;
+    // Map deltaSymbol → Binance symbol
+    this.symMap   = {
+      'BTCUSD': 'BTCUSDT', 'ETHUSD': 'ETHUSDT',
+      'XRPUSD': 'XRPUSDT', 'BNBUSD':  'BNBUSDT',
+    };
+  }
+
+  async fetch(deltaSymbol, interval = '15m', limit = 200) {
+    const binSym = this.symMap[deltaSymbol];
+    if (!binSym) return null;
+    const cached = this.cache[binSym];
+    if (cached && Date.now() - cached.time < this.ttl) return cached.candles;
+    // 300ms rate limit
+    const gap = 300 - (Date.now() - this.lastCall);
+    if (gap > 0) await new Promise(r => setTimeout(r, gap));
+    this.lastCall = Date.now();
+    try {
+      const res = await axios.get(`${this.baseUrl}/api/v3/klines`, {
+        params: { symbol: binSym, interval, limit },
+        headers: { 'User-Agent': 'HybridTradingBot/9.5' },
+        timeout: 15000,
+      });
+      if (!res.data?.length) return null;
+      // Binance kline: [openTime, open, high, low, close, volume, ...]
+      const candles = res.data.map(k => ({
+        time:   k[0],
+        open:   parseFloat(k[1]), high:  parseFloat(k[2]),
+        low:    parseFloat(k[3]), close: parseFloat(k[4]),
+        volume: parseFloat(k[5]),
+      }));
+      console.log(`[Binance-FB] ✅ ${binSym} [${interval}]: ${candles.length} candles`);
+      this.cache[binSym] = { candles, time: Date.now() };
+      return candles;
+    } catch (e) {
+      console.error(`[Binance-FB] ${binSym}: ${e.response?.status || e.message}`);
+      return this.cache[binSym]?.candles || null;
+    }
+  }
+}
+
 // ── CoinGecko Fallback — only used when Delta Exchange fails ─────────────────
 // Simpler than the old CGFetcher: no prefetch, just fetch on demand.
 // Returns 30-min candles (best CG free tier offers) as M15 proxy.
@@ -1588,7 +1778,8 @@ class DataFetcher {
     this.td      = new TDFetcher();
     this.fh      = new FinnhubFetcher();
     this.delta   = new DeltaFetcher();
-    this.cgFb    = new CGFallback();     // CoinGecko fallback for crypto
+    this.binFb   = new BinanceFallback(); // Binance fallback (real M15, no key)
+    this.cgFb    = new CGFallback();      // CoinGecko last resort (30-min proxy)
     this.dhan    = new DhanFetcher();
     this.cache = {};     // symbol → last known M15 candles
     this.mtfCache = {}; // symbol_mtf → { data, time }
@@ -1651,16 +1842,30 @@ class DataFetcher {
           h4  = dtf.h4?.length ? dtf.h4 : null;
           source = 'delta';
         }
-        // ── Fallback: CoinGecko (30-min proxy if Delta fails) ────────
+        // ── Fallback 1: Binance (real M15, no key, no rate limit issues) ──
         if (!m15 || m15.length < 10) {
-          console.log(`[CG-FB] Delta failed for ${symbol} — trying CoinGecko fallback`);
+          console.log(`[Binance-FB] Delta failed for ${symbol} — trying Binance`);
+          const binM15 = await this.binFb.fetch(cfg.deltaSymbol, '15m', 200);
+          if (binM15?.length >= 10) {
+            const binH1 = await this.binFb.fetch(cfg.deltaSymbol, '1h', 100);
+            const binH4 = await this.binFb.fetch(cfg.deltaSymbol, '4h', 60);
+            m15    = binM15;
+            h1     = binH1 || this.resample(binM15, 4);
+            h4     = binH4 || this.resample(binM15, 16);
+            source = 'binance_fallback';
+            console.log(`[Binance-FB] ✅ ${symbol}: M15(${m15.length})`);
+          }
+        }
+        // ── Fallback 2: CoinGecko (30-min proxy — last resort) ─────────
+        if (!m15 || m15.length < 10) {
+          console.log(`[CG-FB] Binance also failed — trying CoinGecko`);
           const cgCandles = await this.cgFb.fetch(cfg.cgId);
           if (cgCandles?.length >= 10) {
             m15    = cgCandles;
-            h1     = this.resample(cgCandles, 2);  // 2 × 30min = 1h proxy
-            h4     = this.resample(cgCandles, 8);  // 8 × 30min = 4h proxy
+            h1     = this.resample(cgCandles, 2);
+            h4     = this.resample(cgCandles, 8);
             source = 'coingecko_fallback';
-            console.log(`[CG-FB] ✅ ${symbol}: using CoinGecko (${cgCandles.length} candles)`);
+            console.log(`[CG-FB] ✅ ${symbol}: ${cgCandles.length} candles (30-min proxy)`);
           }
         }
 
@@ -1938,7 +2143,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '9.5.0',
+  version: '9.6.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -1949,7 +2154,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '9.5.0',
+    status: 'OK', version: '9.6.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -2065,7 +2270,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v9.5 — ICT/SMC ENGINE      ║
+║   HYBRID TRADING BOT v9.6 — ICT/SMC ENGINE      ║
 ║   10 strategies · M15 entry · H1/H4 SL-TP       ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
