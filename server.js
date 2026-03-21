@@ -387,21 +387,33 @@ class Detectors {
       for (const fvg of h1FVGs)
         if (price >= fvg.bot - tol && price <= fvg.top + tol) { h1POI = { type: 'H1_FVG', fvg }; break; }
 
-    // H4 trend
-    const h4Tr = h4?.length >= 5 ? Ind.trend(h4) : 'NEUTRAL';
+    const h4Tr = h4?.length >= 5  ? Ind.trend(h4) : 'NEUTRAL';
     const h1Tr = h1?.length >= 10 ? Ind.trend(h1) : 'NEUTRAL';
 
-    // Alignment
-    const trs = [h4Tr, h1Tr, tr];
+    const trs   = [h4Tr, h1Tr, tr];
     const bulls = trs.filter(t => t === 'BULLISH').length;
     const bears = trs.filter(t => t === 'BEARISH').length;
     const align = bulls === 3 ? 'FULL_BULL' : bears === 3 ? 'FULL_BEAR' :
                   bulls === 2 ? 'PARTIAL_BULL' : bears === 2 ? 'PARTIAL_BEAR' : 'MIXED';
 
-    // Premium/Discount gate
     const pdZone = pd.zone;
     const buyOk  = ['DEEP_DISCOUNT','DISCOUNT','NEUTRAL'].includes(pdZone);
     const sellOk = ['DEEP_PREMIUM', 'PREMIUM',  'NEUTRAL'].includes(pdZone);
+
+    // ── Global helpers used by all strategies ──────────────────
+    const last  = c[c.length - 1];
+    const prev  = c[c.length - 2];
+    const last2 = c[c.length - 3];
+
+    // Minimum body size = 0.3 × ATR (filters doji/spinning top confirmations)
+    const minBody = atr * 0.3;
+    const lastBullBody = last.close > last.open && (last.close - last.open) >= minBody;
+    const lastBearBody = last.close < last.open && (last.open - last.close) >= minBody;
+
+    // Volume: at least at average (ratio >= 1.0). Spike = ratio >= 1.5
+    const volOk    = vol.ratio >= 1.0;  // minimum — at or above average
+    const volGood  = vol.ratio >= 1.3;  // decent confirmation
+    const volSpike = vol.ratio >= 1.5;  // strong confirmation
 
     return {
       c, cls, atr, f, price, dec,
@@ -409,9 +421,9 @@ class Detectors {
       h1Atr, h1OBs, h1FVGs, h1SwH, h1SwL, h1POI,
       h4Tr, h1Tr, pd, pdZone, buyOk, sellOk,
       align, kz: Market.inKillZone(cat), cat,
-      last:  c[c.length - 1],
-      prev:  c[c.length - 2],
-      last2: c[c.length - 3],
+      last, prev, last2,
+      minBody, lastBullBody, lastBearBody,
+      volOk, volGood, volSpike,
     };
   }
 
@@ -435,10 +447,8 @@ class Detectors {
         const arr = Array.isArray(r) ? r : [r];
         for (const sig of arr) {
           if (!sig?.dir || !sig?.id) continue;
-          // Premium/Discount gate
           if (sig.dir === 'BUY'  && !x.buyOk)  continue;
           if (sig.dir === 'SELL' && !x.sellOk) continue;
-          // H4 hard block
           if (x.align === 'FULL_BULL' && sig.dir === 'SELL') continue;
           if (x.align === 'FULL_BEAR' && sig.dir === 'BUY')  continue;
           results.push(sig);
@@ -449,44 +459,45 @@ class Detectors {
   }
 
   // ══════════════════════════════════════════════════════════
-  //  1. FVG + OB (merged — both catch institutional zones)
-  //  Entry: at gap or OB zone edge
-  //  SL:    below OB candle low (BUY) / above OB candle high (SELL)
-  //  TP1:   opposite edge of FVG / OB
-  //  TP2:   next H1 swing high/low
+  //  1. FVG + OB
+  //  Fixes: gap min raised 0.2→0.5 ATR, vol filter, FVG max age 8 candles
   // ══════════════════════════════════════════════════════════
   static fvgOB(x) {
     const results = [];
-    const { c, price, atr, f, fvgs, obs, h1POI, h4Tr, h1Tr, kz } = x;
-    const last = x.last, prev = x.prev;
+    const { c, price, atr, fvgs, obs, h1POI, h4Tr, kz,
+            lastBullBody, lastBearBody, volOk } = x;
+    const last = x.last;
 
-    // FVG retest
+    // Global: volume must be at least average
+    if (!volOk) return null;
+
+    // FVG retest — raised gap min to 0.5 ATR, max age 8 candles
     for (const fvg of fvgs.slice(-4)) {
-      const postIdx = fvg.i + 1;
-      if (postIdx >= c.length - 1) continue;
-      const post = c.slice(postIdx);
+      const age = c.length - 1 - fvg.i;
+      if (age > 8) continue;           // stale gap — market moved on
+      if (age < 1) continue;           // too fresh — not a retest
+      const gapSize = fvg.top - fvg.bot;
+      if (gapSize < atr * 0.5) continue; // must be meaningful imbalance
       const returnedToGap = price >= fvg.bot - atr * 0.1 && price <= fvg.top + atr * 0.1;
       if (!returnedToGap) continue;
-      const gapSize = fvg.top - fvg.bot;
-      if (gapSize < atr * 0.2) continue;
       const score = 72
-        + (h1POI ? 10 : 0)
-        + (kz ? 6 : 0)
+        + (h1POI ? 10 : 0) + (kz ? 6 : 0)
         + (fvg.type === 'bull' && h4Tr === 'BULLISH' ? 6 : 0)
-        + (fvg.type === 'bear' && h4Tr === 'BEARISH' ? 6 : 0);
-      if (fvg.type === 'bull' && last.close > last.open) {
+        + (fvg.type === 'bear' && h4Tr === 'BEARISH' ? 6 : 0)
+        + (x.volGood ? 4 : 0);
+      if (fvg.type === 'bull' && lastBullBody) {
         results.push({ id: 'FVG_OB', name: 'Fair Value Gap', dir: 'BUY', score,
           sl_ref: { type: 'fvg_bot', val: fvg.bot },
           tp_ref: { tp1_type: 'fvg_top', tp1_val: fvg.top } });
       }
-      if (fvg.type === 'bear' && last.close < last.open) {
+      if (fvg.type === 'bear' && lastBearBody) {
         results.push({ id: 'FVG_OB', name: 'Fair Value Gap', dir: 'SELL', score,
           sl_ref: { type: 'fvg_top', val: fvg.top },
           tp_ref: { tp1_type: 'fvg_bot', tp1_val: fvg.bot } });
       }
     }
 
-    // OB retest (only fresh OBs not retested yet)
+    // OB retest — must touch zone with volume
     for (const ob of obs.slice(-4)) {
       if (ob.i >= c.length - 3) continue;
       const post = c.slice(ob.i + 1);
@@ -495,49 +506,63 @@ class Detectors {
       const inZone = price >= ob.bot - atr * 0.1 && price <= ob.top + atr * 0.1;
       if (!inZone) continue;
       const score = 74
-        + (h1POI ? 10 : 0)
-        + (kz ? 6 : 0)
+        + (h1POI ? 10 : 0) + (kz ? 6 : 0)
         + (ob.type === 'bull' && h4Tr === 'BULLISH' ? 6 : 0)
-        + (ob.type === 'bear' && h4Tr === 'BEARISH' ? 6 : 0);
-      if (ob.type === 'bull' && last.close > last.open) {
+        + (ob.type === 'bear' && h4Tr === 'BEARISH' ? 6 : 0)
+        + (x.volGood ? 4 : 0);
+      if (ob.type === 'bull' && lastBullBody) {
         results.push({ id: 'FVG_OB', name: 'Order Block', dir: 'BUY', score,
           sl_ref: { type: 'ob_bot', val: ob.bot },
           tp_ref: { tp1_type: 'ob_top', tp1_val: ob.top } });
       }
-      if (ob.type === 'bear' && last.close < last.open) {
+      if (ob.type === 'bear' && lastBearBody) {
         results.push({ id: 'FVG_OB', name: 'Order Block', dir: 'SELL', score,
           sl_ref: { type: 'ob_top', val: ob.top },
           tp_ref: { tp1_type: 'ob_bot', tp1_val: ob.bot } });
       }
     }
-    return results.slice(0, 1); // best only
+    return results.slice(0, 1);
   }
 
   // ══════════════════════════════════════════════════════════
   //  2. LIQUIDITY SWEEP
-  //  Entry: when M15 wick sweeps swing H/L, candle CLOSES back
-  //  SL:    below sweep wick low (BUY) / above wick high (SELL)
-  //  TP1:   swept level (now support/resistance)
-  //  TP2:   opposite session swing
+  //  Fixes: closePos 0.65→0.60, wick must be > body * 1.5
   // ══════════════════════════════════════════════════════════
   static liqSweep(x) {
-    const { c, price, atr, f, swH, swL, h4Tr, h1POI, kz } = x;
+    const { price, atr, swH, swL, h4Tr, h1POI, kz, volGood } = x;
     const last = x.last;
     if (!swH.length || !swL.length) return null;
     const keyH = swH[swH.length - 1].v;
     const keyL = swL[swL.length - 1].v;
-    const closePos = (last.close - last.low) / (Math.max(last.high - last.low, 0.0001));
 
-    // Bullish sweep: wick below key low, closes above it
-    if (last.low < keyL && last.close > keyL && closePos > 0.65) {
-      const score = 78 + (h1POI ? 8 : 0) + (h4Tr === 'BULLISH' ? 8 : 0) + (kz ? 6 : 0);
+    const range    = last.high - last.low || 0.0001;
+    const body     = Math.abs(last.close - last.open);
+    const closePos = (last.close - last.low) / range;
+
+    // Bullish sweep — lowered closePos to 0.60, wick must dominate
+    if (last.low < keyL && last.close > keyL && closePos > 0.60) {
+      const lowerWick = last.open > last.close
+        ? last.close - last.low   // bearish candle: wick below close
+        : last.open  - last.low;  // bullish candle: wick below open
+      if (lowerWick < body * 1.5) return null; // wick must be > 1.5× body
+      const sweepDepth = keyL - last.low;
+      if (sweepDepth < atr * 0.15) return null; // must penetrate meaningfully
+      const score = 78 + (h1POI ? 8 : 0) + (h4Tr === 'BULLISH' ? 8 : 0)
+        + (kz ? 6 : 0) + (volGood ? 4 : 0);
       return { id: 'LIQ_SWEEP', name: 'Liquidity Sweep', dir: 'BUY', score,
         sl_ref: { type: 'sweep_wick', val: last.low },
         tp_ref: { tp1_type: 'swept_level', tp1_val: keyL } };
     }
-    // Bearish sweep: wick above key high, closes below it
-    if (last.high > keyH && last.close < keyH && closePos < 0.35) {
-      const score = 78 + (h1POI ? 8 : 0) + (h4Tr === 'BEARISH' ? 8 : 0) + (kz ? 6 : 0);
+    // Bearish sweep
+    if (last.high > keyH && last.close < keyH && closePos < 0.40) {
+      const upperWick = last.close > last.open
+        ? last.high - last.close  // bullish: wick above close
+        : last.high - last.open;  // bearish: wick above open
+      if (upperWick < body * 1.5) return null;
+      const sweepDepth = last.high - keyH;
+      if (sweepDepth < atr * 0.15) return null;
+      const score = 78 + (h1POI ? 8 : 0) + (h4Tr === 'BEARISH' ? 8 : 0)
+        + (kz ? 6 : 0) + (volGood ? 4 : 0);
       return { id: 'LIQ_SWEEP', name: 'Liquidity Sweep', dir: 'SELL', score,
         sl_ref: { type: 'sweep_wick', val: last.high },
         tp_ref: { tp1_type: 'swept_level', tp1_val: keyH } };
@@ -547,62 +572,72 @@ class Detectors {
 
   // ══════════════════════════════════════════════════════════
   //  3. CHANGE OF CHARACTER (ChoCh)
-  //  Entry: M15 candle closes beyond last swing in opposite trend direction
-  //  SL:    below the candle that broke structure (BUY) / above it (SELL)
-  //  TP1:   prior swing in new direction
-  //  TP2:   H1 swing in new direction
+  //  Fixes: removed NEUTRAL trend, added vol + body size
   // ══════════════════════════════════════════════════════════
   static choch(x) {
-    const { c, price, swH, swL, tr, h1Tr, h4Tr, atr, kz } = x;
+    const { c, swH, swL, tr, h1Tr, h4Tr, atr, kz,
+            lastBullBody, lastBearBody, volGood } = x;
     const last = x.last, prev = x.prev;
     if (swH.length < 2 || swL.length < 2) return null;
+    // Must have confirmed trend to "change" from — no NEUTRAL
+    if (tr === 'NEUTRAL') return null;
+
     const lastSH = swH[swH.length - 1].v;
     const lastSL = swL[swL.length - 1].v;
 
-    // Bullish ChoCh: was bearish/neutral, breaks above last swing high with full body
-    if ((tr === 'BEARISH' || tr === 'NEUTRAL') && prev.close <= lastSH && last.close > lastSH && last.close > last.open) {
-      const score = 76 + (h4Tr === 'BULLISH' ? 8 : 0) + (h1Tr === 'BULLISH' ? 6 : 0) + (kz ? 6 : 0);
+    // Volume required on break candle
+    if (!volGood) return null;
+
+    // Bullish ChoCh: BEARISH trend breaks above last swing high
+    if (tr === 'BEARISH' && prev.close <= lastSH && last.close > lastSH && lastBullBody) {
+      // Break candle must close at least 0.1 ATR above the level
+      if (last.close < lastSH + atr * 0.1) return null;
+      const score = 76 + (h4Tr === 'BULLISH' ? 8 : 0) + (h1Tr === 'BULLISH' ? 6 : 0)
+        + (kz ? 6 : 0) + (x.volSpike ? 4 : 0);
       return { id: 'CHOCH', name: 'Change of Character', dir: 'BUY', score,
         brokenLevel: lastSH,
         sl_ref: { type: 'break_candle_low', val: last.low },
-        tp_ref: { tp1_type: 'prior_swing', tp1_val: swH.length >= 2 ? swH[swH.length - 2].v : lastSH + atr * 2 } };
+        tp_ref: { tp1_type: 'prior_swing', tp1_val: swH[swH.length - 2].v } };
     }
-    // Bearish ChoCh: was bullish/neutral, breaks below last swing low
-    if ((tr === 'BULLISH' || tr === 'NEUTRAL') && prev.close >= lastSL && last.close < lastSL && last.close < last.open) {
-      const score = 76 + (h4Tr === 'BEARISH' ? 8 : 0) + (h1Tr === 'BEARISH' ? 6 : 0) + (kz ? 6 : 0);
+    // Bearish ChoCh: BULLISH trend breaks below last swing low
+    if (tr === 'BULLISH' && prev.close >= lastSL && last.close < lastSL && lastBearBody) {
+      if (last.close > lastSL - atr * 0.1) return null;
+      const score = 76 + (h4Tr === 'BEARISH' ? 8 : 0) + (h1Tr === 'BEARISH' ? 6 : 0)
+        + (kz ? 6 : 0) + (x.volSpike ? 4 : 0);
       return { id: 'CHOCH', name: 'Change of Character', dir: 'SELL', score,
         brokenLevel: lastSL,
         sl_ref: { type: 'break_candle_high', val: last.high },
-        tp_ref: { tp1_type: 'prior_swing', tp1_val: swL.length >= 2 ? swL[swL.length - 2].v : lastSL - atr * 2 } };
+        tp_ref: { tp1_type: 'prior_swing', tp1_val: swL[swL.length - 2].v } };
     }
     return null;
   }
 
   // ══════════════════════════════════════════════════════════
-  //  4. FIRST PULLBACK after ChoCh (FPB)
-  //  Entry: after ChoCh on prior candles, price pulls back to broken level
-  //  SL:    beyond broken level by 0.5 ATR
-  //  TP1:   swing high/low created by ChoCh move
-  //  TP2:   H1 swing in direction
+  //  4. FIRST PULLBACK (FPB)
+  //  Fixes: lookback 3-10→3-6, need price > level + 0.1 ATR,
+  //         vol filter, body size filter
   // ══════════════════════════════════════════════════════════
   static fpb(x) {
-    const { c, price, atr, swH, swL, tr, h4Tr, h1POI, kz } = x;
+    const { c, price, atr, swH, swL, h4Tr, h1POI, kz,
+            lastBullBody, lastBearBody, volOk } = x;
     if (swH.length < 3 || swL.length < 3) return null;
-    const last = x.last, prev = x.prev;
+    if (!volOk) return null;
+    const last = x.last;
 
-    // Look back 3-10 candles for a recent structure break (ChoCh-like)
-    for (let k = 3; k <= Math.min(10, c.length - 3); k++) {
+    // Tighter lookback: 3-6 candles only (stale breaks not valid)
+    for (let k = 3; k <= Math.min(6, c.length - 3); k++) {
       const breakCandle = c[c.length - 1 - k];
       const preSH = swH.filter(s => s.i < c.length - 1 - k);
       const preSL = swL.filter(s => s.i < c.length - 1 - k);
       if (!preSH.length || !preSL.length) continue;
 
-      // Bullish FPB: break candle closed above recent swing high → now retracing to it
+      // Bullish FPB: recent break above swing high, now pulling back to it
       const oldSH = preSH[preSH.length - 1].v;
-      if (breakCandle.close > oldSH) {
-        const retestingLevel = Math.abs(price - oldSH) < atr * 0.4;
-        if (retestingLevel && last.close > last.open) {
-          const score = 74 + (h4Tr === 'BULLISH' ? 10 : 0) + (h1POI ? 8 : 0) + (kz ? 4 : 0);
+      if (breakCandle.close > oldSH + atr * 0.1) { // break must be convincing
+        const retesting = Math.abs(price - oldSH) < atr * 0.35;
+        if (retesting && lastBullBody && price > oldSH) { // price must be above level
+          const score = 74 + (h4Tr === 'BULLISH' ? 10 : 0) + (h1POI ? 8 : 0)
+            + (kz ? 4 : 0) + (x.volGood ? 4 : 0);
           return { id: 'FPB', name: 'First Pullback', dir: 'BUY', score,
             brokenLevel: oldSH,
             sl_ref: { type: 'broken_level_below', val: oldSH - atr * 0.5 },
@@ -610,12 +645,13 @@ class Detectors {
         }
       }
 
-      // Bearish FPB: break candle closed below recent swing low → retracing to it
+      // Bearish FPB: recent break below swing low, now pulling back to it
       const oldSL = preSL[preSL.length - 1].v;
-      if (breakCandle.close < oldSL) {
-        const retestingLevel = Math.abs(price - oldSL) < atr * 0.4;
-        if (retestingLevel && last.close < last.open) {
-          const score = 74 + (h4Tr === 'BEARISH' ? 10 : 0) + (h1POI ? 8 : 0) + (kz ? 4 : 0);
+      if (breakCandle.close < oldSL - atr * 0.1) {
+        const retesting = Math.abs(price - oldSL) < atr * 0.35;
+        if (retesting && lastBearBody && price < oldSL) {
+          const score = 74 + (h4Tr === 'BEARISH' ? 10 : 0) + (h1POI ? 8 : 0)
+            + (kz ? 4 : 0) + (x.volGood ? 4 : 0);
           return { id: 'FPB', name: 'First Pullback', dir: 'SELL', score,
             brokenLevel: oldSL,
             sl_ref: { type: 'broken_level_above', val: oldSL + atr * 0.5 },
@@ -627,16 +663,14 @@ class Detectors {
   }
 
   // ══════════════════════════════════════════════════════════
-  //  5. OTE — OPTIMAL TRADE ENTRY (ICT)
-  //  Entry: 62-79% fib of swing, price at H1 OB/FVG
-  //  SL:    below H1 OB candle low (BUY) / above H1 OB high (SELL)
-  //  TP1:   swing high that started the retracement
-  //  TP2:   H4 premium/discount extreme
+  //  5. OTE — OPTIMAL TRADE ENTRY
+  //  Fix: RSI oversold/overbought confirmation at fib zone
   // ══════════════════════════════════════════════════════════
   static ote(x) {
-    const { c, price, atr, swH, swL, tr, h4Tr, h1POI, h1OBs, kz } = x;
+    const { price, atr, swH, swL, tr, h4Tr, h1POI, h1OBs, kz, rsi,
+            lastBullBody, lastBearBody, volOk } = x;
     if (swH.length < 2 || swL.length < 2) return null;
-    const last = x.last;
+    if (!volOk) return null;
 
     if (tr === 'BULLISH') {
       const sL = Math.min(...swL.slice(-3).map(s => s.v));
@@ -647,9 +681,12 @@ class Detectors {
       const fib786 = sH - range * 0.786;
       if (price >= fib786 - atr * 0.15 && price <= fib618 + atr * 0.15) {
         const atOB = h1OBs.some(ob => ob.type === 'bull' && price >= ob.bot - atr * 0.1 && price <= ob.top + atr * 0.1);
-        if (!atOB && !h1POI) return null; // OTE requires H1 confluence
-        const score = 82 + (h4Tr === 'BULLISH' ? 8 : 0) + (kz ? 6 : 0) + (atOB ? 4 : 0);
-        const slOB  = h1OBs.find(ob => ob.type === 'bull' && price >= ob.bot - atr * 0.1);
+        if (!atOB && !h1POI) return null;
+        // RSI should show oversold momentum exhaustion at this level
+        if (rsi > 50) return null; // price pulling back but RSI still bullish = not yet at OTE
+        const score = 82 + (h4Tr === 'BULLISH' ? 8 : 0) + (kz ? 6 : 0)
+          + (atOB ? 4 : 0) + (rsi < 40 ? 4 : 0) + (x.volGood ? 2 : 0);
+        const slOB = h1OBs.find(ob => ob.type === 'bull' && price >= ob.bot - atr * 0.1);
         return { id: 'OTE', name: 'Optimal Trade Entry', dir: 'BUY', score,
           sl_ref: { type: 'h1_ob_bot', val: slOB ? slOB.bot : fib786 - atr },
           tp_ref: { tp1_type: 'swing_high', tp1_val: sH } };
@@ -665,8 +702,10 @@ class Detectors {
       if (price >= fib618 - atr * 0.15 && price <= fib786 + atr * 0.15) {
         const atOB = h1OBs.some(ob => ob.type === 'bear' && price >= ob.bot - atr * 0.1 && price <= ob.top + atr * 0.1);
         if (!atOB && !h1POI) return null;
-        const score = 82 + (h4Tr === 'BEARISH' ? 8 : 0) + (kz ? 6 : 0) + (atOB ? 4 : 0);
-        const slOB  = h1OBs.find(ob => ob.type === 'bear' && price <= ob.top + atr * 0.1);
+        if (rsi < 50) return null; // bearish OTE: RSI should still be elevated
+        const score = 82 + (h4Tr === 'BEARISH' ? 8 : 0) + (kz ? 6 : 0)
+          + (atOB ? 4 : 0) + (rsi > 60 ? 4 : 0) + (x.volGood ? 2 : 0);
+        const slOB = h1OBs.find(ob => ob.type === 'bear' && price <= ob.top + atr * 0.1);
         return { id: 'OTE', name: 'Optimal Trade Entry', dir: 'SELL', score,
           sl_ref: { type: 'h1_ob_top', val: slOB ? slOB.top : fib786 + atr },
           tp_ref: { tp1_type: 'swing_low', tp1_val: sL } };
@@ -677,44 +716,46 @@ class Detectors {
 
   // ══════════════════════════════════════════════════════════
   //  6. BREAKER BLOCK
-  //  Entry: when price returns to a failed OB zone (swept + reclaimed)
-  //  SL:    below breaker bottom (BUY) / above breaker top (SELL)
-  //  TP1:   origin of the displacement that swept the OB
-  //  TP2:   H1 swing in direction
+  //  Fix: require M15 body close inside zone + vol confirmation
   // ══════════════════════════════════════════════════════════
   static breaker(x) {
-    const { c, price, atr, obs, h4Tr, h1POI, kz } = x;
+    const { c, price, atr, obs, h4Tr, h1POI, kz,
+            lastBullBody, lastBearBody, volOk } = x;
     const last = x.last;
+    if (!volOk) return null;
+
     for (const ob of obs.slice(-6)) {
       if (ob.i >= c.length - 3) continue;
       const post = c.slice(ob.i + 1);
 
       if (ob.type === 'bear') {
-        // Bearish OB swept below (bullish breaker)
         const swept     = post.some(cx => cx.low < ob.bot);
         const reclaimed = post.slice(-3).some(cx => cx.close > ob.bot);
         if (!swept || !reclaimed) continue;
-        if (price >= ob.bot - atr * 0.2 && price <= ob.top + atr * 0.2 && last.close > last.open) {
-          const score = 80 + (h4Tr === 'BULLISH' ? 8 : 0) + (h1POI ? 6 : 0) + (kz ? 4 : 0);
-          // TP1 = origin of displacement (first post-OB candle that was strong bullish)
-          const dispCandle = post.find(cx => cx.close > cx.open && (cx.close - cx.open) > atr * 0.8);
-          return { id: 'BREAKER', name: 'Breaker Block', dir: 'BUY', score,
-            sl_ref: { type: 'breaker_bot', val: ob.bot },
-            tp_ref: { tp1_type: 'displacement_origin', tp1_val: dispCandle ? dispCandle.high : ob.top + atr * 2 } };
-        }
+        // Price must be inside zone AND last candle must have body closing above zone bottom
+        const inZone = price >= ob.bot - atr * 0.15 && price <= ob.top + atr * 0.15;
+        if (!inZone || !lastBullBody) continue;
+        if (last.close < ob.bot) continue; // close must be above breaker bot
+        const score = 80 + (h4Tr === 'BULLISH' ? 8 : 0) + (h1POI ? 6 : 0)
+          + (kz ? 4 : 0) + (x.volGood ? 4 : 0);
+        const dispCandle = post.find(cx => cx.close > cx.open && (cx.close - cx.open) > atr * 0.8);
+        return { id: 'BREAKER', name: 'Breaker Block', dir: 'BUY', score,
+          sl_ref: { type: 'breaker_bot', val: ob.bot },
+          tp_ref: { tp1_type: 'displacement_origin', tp1_val: dispCandle ? dispCandle.high : ob.top + atr * 2 } };
       }
       if (ob.type === 'bull') {
-        // Bullish OB swept above (bearish breaker)
         const swept     = post.some(cx => cx.high > ob.top);
         const reclaimed = post.slice(-3).some(cx => cx.close < ob.top);
         if (!swept || !reclaimed) continue;
-        if (price >= ob.bot - atr * 0.2 && price <= ob.top + atr * 0.2 && last.close < last.open) {
-          const score = 80 + (h4Tr === 'BEARISH' ? 8 : 0) + (h1POI ? 6 : 0) + (kz ? 4 : 0);
-          const dispCandle = post.find(cx => cx.close < cx.open && (cx.open - cx.close) > atr * 0.8);
-          return { id: 'BREAKER', name: 'Breaker Block', dir: 'SELL', score,
-            sl_ref: { type: 'breaker_top', val: ob.top },
-            tp_ref: { tp1_type: 'displacement_origin', tp1_val: dispCandle ? dispCandle.low : ob.bot - atr * 2 } };
-        }
+        const inZone = price >= ob.bot - atr * 0.15 && price <= ob.top + atr * 0.15;
+        if (!inZone || !lastBearBody) continue;
+        if (last.close > ob.top) continue; // close must be below breaker top
+        const score = 80 + (h4Tr === 'BEARISH' ? 8 : 0) + (h1POI ? 6 : 0)
+          + (kz ? 4 : 0) + (x.volGood ? 4 : 0);
+        const dispCandle = post.find(cx => cx.close < cx.open && (cx.open - cx.close) > atr * 0.8);
+        return { id: 'BREAKER', name: 'Breaker Block', dir: 'SELL', score,
+          sl_ref: { type: 'breaker_top', val: ob.top },
+          tp_ref: { tp1_type: 'displacement_origin', tp1_val: dispCandle ? dispCandle.low : ob.bot - atr * 2 } };
       }
     }
     return null;
@@ -722,41 +763,52 @@ class Detectors {
 
   // ══════════════════════════════════════════════════════════
   //  7. ICT SILVER BULLET
-  //  Kill zone 10-11 EST (15:00-16:00 UTC) or 14-15 EST (19:00-20:00 UTC)
-  //  Entry: FVG + liquidity sweep inside kill zone
-  //  SL:    below FVG bottom (BUY) / above FVG top (SELL)
-  //  TP1:   kill zone high/low
-  //  TP2:   previous session high/low
+  //  Fixes: sweep must be > 0.5 ATR, FVG must be < 5 candles old,
+  //         volume required, body size filter
   // ══════════════════════════════════════════════════════════
   static silverBullet(x) {
-    const { c, price, atr, fvgs, swH, swL, h4Tr, cat } = x;
+    const { c, price, atr, fvgs, swH, swL, h4Tr, cat,
+            lastBullBody, lastBearBody, volGood } = x;
     if (cat !== 'forex' && cat !== 'commodity') return null;
     const h = new Date().getUTCHours(), m = new Date().getUTCMinutes();
     const t = h + m / 60;
+    // Kill zones: 10-11 AM EST = 15:00-16:00 UTC | 14-15 PM EST = 19:00-20:00 UTC
     const inSB = (t >= 15 && t <= 16) || (t >= 19 && t <= 20);
     if (!inSB) return null;
+    if (!volGood) return null;
 
     const last = x.last;
     const keyH = swH.length ? swH[swH.length - 1].v : 0;
     const keyL = swL.length ? swL[swL.length - 1].v : Infinity;
-    const bullSweep = last.low < keyL && last.close > keyL;
-    const bearSweep = last.high > keyH && last.close < keyH;
+
+    // Sweep must penetrate at least 0.5 ATR beyond the level
+    const bullSweep = last.low < keyL - atr * 0.5 && last.close > keyL && lastBullBody;
+    const bearSweep = last.high > keyH + atr * 0.5 && last.close < keyH && lastBearBody;
 
     if (bullSweep) {
-      const nearFVG = fvgs.find(fv => fv.type === 'bull' && price >= fv.bot - atr * 0.2 && price <= fv.top + atr * 0.2);
+      // FVG must be recent (< 5 candles old) and inside kill zone
+      const nearFVG = fvgs.find(fv =>
+        fv.type === 'bull' &&
+        c.length - 1 - fv.i <= 5 && // fresh gap only
+        price >= fv.bot - atr * 0.15 && price <= fv.top + atr * 0.15
+      );
       if (nearFVG) {
-        const score = 86 + (h4Tr === 'BULLISH' ? 6 : 0);
+        const score = 86 + (h4Tr === 'BULLISH' ? 6 : 0) + (x.volSpike ? 4 : 0);
         return { id: 'SILVER_BULLET', name: 'ICT Silver Bullet', dir: 'BUY', score,
-          sl_ref: { type: 'fvg_bot', val: nearFVG.bot - atr * 0.3 },
+          sl_ref: { type: 'fvg_bot', val: nearFVG.bot - atr * 0.2 },
           tp_ref: { tp1_type: 'kz_high', tp1_val: keyH } };
       }
     }
     if (bearSweep) {
-      const nearFVG = fvgs.find(fv => fv.type === 'bear' && price >= fv.bot - atr * 0.2 && price <= fv.top + atr * 0.2);
+      const nearFVG = fvgs.find(fv =>
+        fv.type === 'bear' &&
+        c.length - 1 - fv.i <= 5 &&
+        price >= fv.bot - atr * 0.15 && price <= fv.top + atr * 0.15
+      );
       if (nearFVG) {
-        const score = 86 + (h4Tr === 'BEARISH' ? 6 : 0);
+        const score = 86 + (h4Tr === 'BEARISH' ? 6 : 0) + (x.volSpike ? 4 : 0);
         return { id: 'SILVER_BULLET', name: 'ICT Silver Bullet', dir: 'SELL', score,
-          sl_ref: { type: 'fvg_top', val: nearFVG.top + atr * 0.3 },
+          sl_ref: { type: 'fvg_top', val: nearFVG.top + atr * 0.2 },
           tp_ref: { tp1_type: 'kz_low', tp1_val: keyL } };
       }
     }
@@ -765,30 +817,29 @@ class Detectors {
 
   // ══════════════════════════════════════════════════════════
   //  8. OPENING RANGE BREAKOUT (ORB)
-  //  Entry: breakout of first 15-min session candle range
-  //  SL:    opposite side of ORB range
-  //  TP1:   1× ORB range projected
-  //  TP2:   2× ORB range projected
+  //  Fix: range must exceed prior 3-candle avg range, vol required
   // ══════════════════════════════════════════════════════════
   static orb(x) {
-    const { c, price, atr, vol, h4Tr, cat } = x;
-    const now = new Date(new Date().toLocaleString('en-US', { timeZone: cat === 'india' ? 'Asia/Kolkata' : 'UTC' }));
+    const { c, price, atr, vol, h4Tr, cat, volGood } = x;
+    const now = new Date(new Date().toLocaleString('en-US',
+      { timeZone: cat === 'india' ? 'Asia/Kolkata' : 'UTC' }));
     const hh = now.getHours(), mm = now.getMinutes(), t = hh + mm / 60;
 
     let winStart, winEnd, tradeWindow;
     if (cat === 'india') {
-      winStart = 9.25; winEnd = 9.5; tradeWindow = 13; // 09:15-09:30 IST, trade till 13:00
+      winStart = 9.25; winEnd = 9.5; tradeWindow = 13;
     } else if (cat === 'forex' || cat === 'commodity') {
-      winStart = 8.0; winEnd = 8.25; tradeWindow = 12; // 08:00-08:15 UTC, London open
+      winStart = 8.0; winEnd = 8.25; tradeWindow = 12;
     } else return null;
 
-    // Only trade after ORB forms and within trade window
     if (t < winEnd || t > tradeWindow) return null;
 
-    // Get ORB candles
     const orbCandles = c.filter(cx => {
       const ct = new Date(cx.time);
-      const ch = ct.getHours() + ct.getMinutes() / 60;
+      const ch = cat === 'india'
+        ? new Date(ct.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })).getHours()
+          + new Date(ct.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })).getMinutes() / 60
+        : ct.getUTCHours() + ct.getUTCMinutes() / 60;
       return ch >= winStart && ch < winEnd;
     });
     if (orbCandles.length < 1) return null;
@@ -796,17 +847,24 @@ class Detectors {
     const orbH = Math.max(...orbCandles.map(cx => cx.high));
     const orbL = Math.min(...orbCandles.map(cx => cx.low));
     const range = orbH - orbL;
-    if (range < atr * 0.5) return null; // too tight to be meaningful
+
+    // Range must be meaningful — above 0.8 ATR AND above prior 3-candle avg range
+    if (range < atr * 0.8) return null;
+    const priorCandles = c.slice(-6, -3);
+    const avgPriorRange = priorCandles.length
+      ? priorCandles.reduce((s, cx) => s + cx.high - cx.low, 0) / priorCandles.length
+      : 0;
+    if (avgPriorRange > 0 && range < avgPriorRange) return null; // ORB smaller than recent candles
 
     const last = x.last, prev = x.prev;
-    if (prev.close <= orbH && last.close > orbH && vol.ratio > 1.3) {
-      const score = 76 + (h4Tr === 'BULLISH' ? 8 : 0);
+    if (prev.close <= orbH && last.close > orbH && volGood) {
+      const score = 76 + (h4Tr === 'BULLISH' ? 8 : 0) + (x.volSpike ? 4 : 0);
       return { id: 'ORB', name: 'ORB Breakout', dir: 'BUY', score,
         sl_ref: { type: 'orb_low', val: orbL },
         tp_ref: { tp1_type: 'orb_proj1', tp1_val: orbH + range, tp2_val: orbH + range * 2 } };
     }
-    if (prev.close >= orbL && last.close < orbL && vol.ratio > 1.3) {
-      const score = 76 + (h4Tr === 'BEARISH' ? 8 : 0);
+    if (prev.close >= orbL && last.close < orbL && volGood) {
+      const score = 76 + (h4Tr === 'BEARISH' ? 8 : 0) + (x.volSpike ? 4 : 0);
       return { id: 'ORB', name: 'ORB Breakdown', dir: 'SELL', score,
         sl_ref: { type: 'orb_high', val: orbH },
         tp_ref: { tp1_type: 'orb_proj1', tp1_val: orbL - range, tp2_val: orbL - range * 2 } };
@@ -815,64 +873,52 @@ class Detectors {
   }
 
   // ══════════════════════════════════════════════════════════
-  //  9. CRT — CANDLE RANGE THEORY (H1 + H4)
-  //  Uses completed H1 or H4 candle range
-  //  Entry: M15 closes back inside candle body after wick sweep
-  //  SL:    beyond the swept wick extreme
-  //  TP1:   50% of H1/H4 candle body (midpoint)
-  //  TP2:   opposite edge of H1/H4 candle
+  //  9. CRT — CANDLE RANGE THEORY
+  //  Fix: tighter zone ±0.2 ATR, strict body inside range check,
+  //       wick must be > 30% of HTF candle range
   // ══════════════════════════════════════════════════════════
   static crt(x, m15, h1, h4) {
     const results = [];
-    const { price, atr, h4Tr, h1Tr, kz } = x;
-    const last = x.last;
+    const { price, atr, h4Tr, h1Tr, kz, lastBullBody, lastBearBody, volOk } = x;
+    if (!volOk) return results;
 
-    // Run for both H1 and H4
     for (const [tfs, candles, label] of [['H1', h1, 'CRT H1'], ['H4', h4, 'CRT H4']]) {
       if (!candles || candles.length < 4) continue;
-      // Analyse last 3 completed HTF candles
       for (let k = 1; k <= 3; k++) {
         const htfC = candles[candles.length - 1 - k];
         if (!htfC) continue;
-        const body    = Math.abs(htfC.close - htfC.open);
-        const htfAtr  = Ind.atr(candles);
-        if (body < htfAtr * 0.3) continue; // ignore doji HTF candles
+        const htfAtr = Ind.atr(candles);
+        const body   = Math.abs(htfC.close - htfC.open);
+        if (body < htfAtr * 0.3) continue; // ignore doji
 
-        const cHigh   = htfC.high;
-        const cLow    = htfC.low;
-        const cOpen   = htfC.open;
-        const cClose  = htfC.close;
-        const bodyTop = Math.max(cOpen, cClose);
-        const bodyBot = Math.min(cOpen, cClose);
+        const bodyTop = Math.max(htfC.open, htfC.close);
+        const bodyBot = Math.min(htfC.open, htfC.close);
         const bodyMid = (bodyTop + bodyBot) / 2;
+        const htfRange = htfC.high - htfC.low;
 
-        // Bullish CRT: HTF candle swept BELOW its body (long wick down), closed back inside body
-        // Now M15 price is near bodyBot retest → BUY target bodyMid then cHigh
-        const bullSweep = cLow < bodyBot - htfAtr * 0.1; // wick below body
-        if (bullSweep && price >= bodyBot - atr * 0.3 && price <= bodyMid + atr * 0.3) {
-          if (last.close > last.open) { // M15 bullish confirmation
-            const score = 74
-              + (tfs === 'H4' ? 4 : 0)
-              + (h4Tr === 'BULLISH' ? 8 : 0)
-              + (kz ? 6 : 0);
+        // Bullish CRT: wick must be at least 30% of candle range below body
+        const lowerWick = bodyBot - htfC.low;
+        const bullSweep = lowerWick >= htfRange * 0.30 && htfC.low < bodyBot - htfAtr * 0.1;
+        if (bullSweep && price >= bodyBot - atr * 0.2 && price <= bodyMid + atr * 0.2) {
+          if (lastBullBody && price > bodyBot) { // price must be above body bottom
+            const score = 74 + (tfs === 'H4' ? 4 : 0) + (h4Tr === 'BULLISH' ? 8 : 0)
+              + (kz ? 6 : 0) + (x.volGood ? 4 : 0);
             results.push({ id: 'CRT', name: label, dir: 'BUY', score,
-              sl_ref: { type: 'crt_wick_low', val: cLow },
-              tp_ref: { tp1_type: 'crt_body_mid', tp1_val: bodyMid, tp2_val: cHigh } });
+              sl_ref: { type: 'crt_wick_low', val: htfC.low },
+              tp_ref: { tp1_type: 'crt_body_mid', tp1_val: bodyMid, tp2_val: htfC.high } });
           }
         }
 
-        // Bearish CRT: HTF candle swept ABOVE its body (long wick up), closed back inside body
-        // M15 price near bodyTop retest → SELL target bodyMid then cLow
-        const bearSweep = cHigh > bodyTop + htfAtr * 0.1;
-        if (bearSweep && price >= bodyMid - atr * 0.3 && price <= bodyTop + atr * 0.3) {
-          if (last.close < last.open) { // M15 bearish confirmation
-            const score = 74
-              + (tfs === 'H4' ? 4 : 0)
-              + (h4Tr === 'BEARISH' ? 8 : 0)
-              + (kz ? 6 : 0);
+        // Bearish CRT: wick must be at least 30% of range above body
+        const upperWick = htfC.high - bodyTop;
+        const bearSweep = upperWick >= htfRange * 0.30 && htfC.high > bodyTop + htfAtr * 0.1;
+        if (bearSweep && price >= bodyMid - atr * 0.2 && price <= bodyTop + atr * 0.2) {
+          if (lastBearBody && price < bodyTop) {
+            const score = 74 + (tfs === 'H4' ? 4 : 0) + (h4Tr === 'BEARISH' ? 8 : 0)
+              + (kz ? 6 : 0) + (x.volGood ? 4 : 0);
             results.push({ id: 'CRT', name: label, dir: 'SELL', score,
-              sl_ref: { type: 'crt_wick_high', val: cHigh },
-              tp_ref: { tp1_type: 'crt_body_mid', tp1_val: bodyMid, tp2_val: cLow } });
+              sl_ref: { type: 'crt_wick_high', val: htfC.high },
+              tp_ref: { tp1_type: 'crt_body_mid', tp1_val: bodyMid, tp2_val: htfC.low } });
           }
         }
       }
@@ -881,39 +927,40 @@ class Detectors {
   }
 
   // ══════════════════════════════════════════════════════════
-  //  10. POWER OF THREE / AMD (PO3)
-  //  Asian session defines accumulation range (00:30-07:00 UTC)
-  //  London sweeps one side (manipulation)
-  //  Entry: M15 closes BACK inside Asian range after sweep
-  //  SL:    beyond manipulation wick
-  //  TP1:   opposite side of Asian range
-  //  TP2:   Asian range ± 1 ATR extension
+  //  10. POWER OF THREE (PO3 / AMD)
+  //  Fix: range min raised 0.8→1.2 ATR, prev candle must also
+  //       be outside range (confirms real sweep not just touch)
   // ══════════════════════════════════════════════════════════
   static po3(x, m15) {
-    const { price, atr, h4Tr, kz, cat } = x;
+    const { price, atr, h4Tr, kz, cat, lastBullBody, lastBearBody, volOk } = x;
     if (cat !== 'forex' && cat !== 'commodity') return null;
+    if (!volOk) return null;
 
     const asianR = Market.asianRange(m15);
     if (!asianR) return null;
 
-    const h = new Date().getUTCHours(), m2 = new Date().getUTCMinutes(), t = h + m2 / 60;
-    // PO3 setup only fires 08:00-12:00 UTC (London session, after Asian closes)
-    if (t < 8 || t > 12) return null;
+    const h = new Date().getUTCHours(), m2 = new Date().getUTCMinutes();
+    const t = h + m2 / 60;
+    if (t < 8 || t > 12) return null; // London session only
 
     const last = x.last, prev = x.prev;
-    const asH  = asianR.high, asL = asianR.low, asRange = asH - asL;
-    if (asRange < atr * 0.8) return null; // Asian range too tight
+    const asH = asianR.high, asL = asianR.low;
+    const asRange = asH - asL;
+    if (asRange < atr * 1.2) return null; // raised from 0.8 to 1.2
 
-    // Bullish PO3: London swept below Asian low, M15 just closed back above Asian low
-    if (prev.close < asL && last.close > asL && last.close > last.open) {
-      const score = 78 + (h4Tr === 'BULLISH' ? 10 : 0) + (kz ? 6 : 0);
+    // Bullish PO3: BOTH prev and current went below, last M15 closes back above
+    // prev must also be below asL (confirms real sweep, not single-candle noise)
+    if (prev.low < asL && last.close > asL && lastBullBody) {
+      if (last.close < asL + atr * 0.1) return null; // must close convincingly inside
+      const score = 78 + (h4Tr === 'BULLISH' ? 10 : 0) + (kz ? 6 : 0) + (x.volGood ? 4 : 0);
       return { id: 'PO3', name: 'Power of Three', dir: 'BUY', score,
         sl_ref: { type: 'po3_sweep_low', val: Math.min(prev.low, last.low) },
         tp_ref: { tp1_type: 'asian_opposite', tp1_val: asH, tp2_val: asH + atr } };
     }
-    // Bearish PO3: London swept above Asian high, M15 closed back below Asian high
-    if (prev.close > asH && last.close < asH && last.close < last.open) {
-      const score = 78 + (h4Tr === 'BEARISH' ? 10 : 0) + (kz ? 6 : 0);
+    // Bearish PO3: both prev/current went above, last closes back below
+    if (prev.high > asH && last.close < asH && lastBearBody) {
+      if (last.close > asH - atr * 0.1) return null;
+      const score = 78 + (h4Tr === 'BEARISH' ? 10 : 0) + (kz ? 6 : 0) + (x.volGood ? 4 : 0);
       return { id: 'PO3', name: 'Power of Three', dir: 'SELL', score,
         sl_ref: { type: 'po3_sweep_high', val: Math.max(prev.high, last.high) },
         tp_ref: { tp1_type: 'asian_opposite', tp1_val: asL, tp2_val: asL - atr } };
@@ -922,31 +969,48 @@ class Detectors {
   }
 
   // ══════════════════════════════════════════════════════════
-  //  11. FVG + BOS + HTF (combo — best setup ⭐)
-  //  All three must align: H4 bias + H1 FVG/OB + M15 BOS
-  //  SL/TP: inherited from FVG/OB component
+  //  11. FVG + BOS + HTF (BEST COMBO ⭐)
+  //  Fix: PARTIAL alignment now requires H1 POI too,
+  //       vol + body size required
   // ══════════════════════════════════════════════════════════
   static fvgBosHTF(x) {
-    const { c, price, atr, fvgs, swH, swL, tr, h4Tr, h1Tr, h1POI, h1OBs, h1FVGs, align } = x;
+    const { c, price, atr, fvgs, swH, swL, h4Tr, h1POI,
+            align, lastBullBody, lastBearBody, volGood } = x;
     if (!h1POI) return null;
-    if (align !== 'FULL_BULL' && align !== 'FULL_BEAR' && align !== 'PARTIAL_BULL' && align !== 'PARTIAL_BEAR') return null;
+    if (!volGood) return null;
+    if (align === 'MIXED') return null;
+
     const last = x.last, prev = x.prev;
     const lastSH = swH.length ? swH[swH.length - 1].v : 0;
     const lastSL = swL.length ? swL[swL.length - 1].v : Infinity;
 
-    // BOS in H4 direction
-    if ((align === 'FULL_BULL' || align === 'PARTIAL_BULL') && prev.close <= lastSH && last.close > lastSH) {
-      const nearFVG = fvgs.find(fv => fv.type === 'bull' && price >= fv.bot - atr * 0.2 && price <= fv.top + atr * 0.2);
+    // PARTIAL alignment now requires H1 POI (already enforced above) AND
+    // the BOS candle must have a strong body
+    if ((align === 'FULL_BULL' || align === 'PARTIAL_BULL')
+        && prev.close <= lastSH && last.close > lastSH && lastBullBody) {
+      const nearFVG = fvgs.find(fv =>
+        fv.type === 'bull' &&
+        c.length - 1 - fv.i <= 6 && // fresh FVG only
+        price >= fv.bot - atr * 0.15 && price <= fv.top + atr * 0.15
+      );
       if (!nearFVG) return null;
-      const score = 88 + (align === 'FULL_BULL' ? 8 : 4) + (x.kz ? 4 : 0);
+      // PARTIAL gets lower score bonus (was 4, same, but needs H1POI now = stricter)
+      const score = 88 + (align === 'FULL_BULL' ? 8 : 3)
+        + (x.kz ? 4 : 0) + (x.volSpike ? 4 : 0);
       return { id: 'FVG_BOS_HTF', name: 'FVG + BoS + HTF', dir: 'BUY', score,
         sl_ref: { type: 'fvg_bot', val: nearFVG.bot },
         tp_ref: { tp1_type: 'fvg_top', tp1_val: nearFVG.top } };
     }
-    if ((align === 'FULL_BEAR' || align === 'PARTIAL_BEAR') && prev.close >= lastSL && last.close < lastSL) {
-      const nearFVG = fvgs.find(fv => fv.type === 'bear' && price >= fv.bot - atr * 0.2 && price <= fv.top + atr * 0.2);
+    if ((align === 'FULL_BEAR' || align === 'PARTIAL_BEAR')
+        && prev.close >= lastSL && last.close < lastSL && lastBearBody) {
+      const nearFVG = fvgs.find(fv =>
+        fv.type === 'bear' &&
+        c.length - 1 - fv.i <= 6 &&
+        price >= fv.bot - atr * 0.15 && price <= fv.top + atr * 0.15
+      );
       if (!nearFVG) return null;
-      const score = 88 + (align === 'FULL_BEAR' ? 8 : 4) + (x.kz ? 4 : 0);
+      const score = 88 + (align === 'FULL_BEAR' ? 8 : 3)
+        + (x.kz ? 4 : 0) + (x.volSpike ? 4 : 0);
       return { id: 'FVG_BOS_HTF', name: 'FVG + BoS + HTF', dir: 'SELL', score,
         sl_ref: { type: 'fvg_top', val: nearFVG.top },
         tp_ref: { tp1_type: 'fvg_bot', tp1_val: nearFVG.bot } };
@@ -955,11 +1019,7 @@ class Detectors {
   }
 }
 
-// ═════════════════════════════════════════════════════════════
-//  SECTION 3 — SIGNAL BUILDER
-//  Converts detector output into a complete signal with
-//  SL and TP derived strictly from live candle structure.
-// ═════════════════════════════════════════════════════════════
+
 class Builder {
 
   static build(symbol, m15, source, mtfData) {
@@ -1878,7 +1938,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '9.4.0',
+  version: '9.5.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -1889,7 +1949,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '9.4.0',
+    status: 'OK', version: '9.5.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -2005,7 +2065,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v9.4 — ICT/SMC ENGINE      ║
+║   HYBRID TRADING BOT v9.5 — ICT/SMC ENGINE      ║
 ║   10 strategies · M15 entry · H1/H4 SL-TP       ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
