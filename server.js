@@ -19,7 +19,7 @@ const CONFIG = {
   TELEGRAM_CHAT_ID:   process.env.TELEGRAM_CHAT_ID,
   TWELVE_DATA_KEY:    process.env.TWELVE_DATA_API_KEY,
   TWELVE_DATA_URL:    'https://api.twelvedata.com',
-  COINGECKO_URL:      'https://api.coingecko.com/api/v3',
+  DELTA_URL:          'https://api.india.delta.exchange', // No API key needed
   DHAN_URL:           'https://api.dhan.co',
   SIGNAL_QUALITY_MIN: 80,
   CANDLE_LIMIT:       130,   // M15 candles to fetch
@@ -43,11 +43,11 @@ const SYMBOLS = {
   AUDUSD:    { name:'AUD/USD',     cat:'forex',     src:'td',   td:'AUD/USD'  },
   // Commodity (TwelveData)
   XAUUSD:    { name:'Gold/USD',    cat:'commodity', src:'td',   td:'XAU/USD'  },
-  // Crypto (CoinGecko)
-  BTCUSDT:   { name:'BTC/USDT',   cat:'crypto',    src:'cg',   cgId:'bitcoin'     },
-  ETHUSDT:   { name:'ETH/USDT',   cat:'crypto',    src:'cg',   cgId:'ethereum'    },
-  XRPUSDT:   { name:'XRP/USDT',   cat:'crypto',    src:'cg',   cgId:'ripple'      },
-  BNBUSDT:   { name:'BNB/USDT',   cat:'crypto',    src:'cg',   cgId:'binancecoin' },
+  // Crypto (Delta Exchange India — real M15 OHLC, no API key needed)
+  BTCUSDT:   { name:'BTC/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'BTCUSD'  },
+  ETHUSDT:   { name:'ETH/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'ETHUSD'  },
+  XRPUSDT:   { name:'XRP/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'XRPUSD'  },
+  BNBUSDT:   { name:'BNB/USDT',   cat:'crypto',    src:'delta', deltaSymbol:'BNBUSD'  },
 };
 
 // ── Live Dhan token (updated at runtime, no redeploy) ─────────
@@ -1252,61 +1252,95 @@ class TDFetcher {
   }
 }
 
-class CGFetcher {
+class DeltaFetcher {
+  // Delta Exchange India — https://api.india.delta.exchange
+  // Public API, no key needed. Real M15 OHLC.
+  // Docs: https://docs.delta.exchange/#get-ohlc-candles
   constructor() {
-    this.cache = {};     // cgId → { candles, time }
-    this.ttl   = 8 * 60000;
-    this.backoff = 0;
+    this.baseUrl  = 'https://api.india.delta.exchange';
+    this.cache    = {};   // symbol → { m15, h1, time }
+    this.ttlM15   = 12 * 60000; // 12 min cache (just under M15 cycle)
+    this.ttlH1    = 25 * 60000; // 25 min cache for H1
+    this.lastCall = 0;
+    this.minGap   = 300;  // ms between calls (Delta allows ~5 req/sec)
   }
 
-  async prefetchAll(ids) {
-    if (this.backoff > Date.now()) {
-      console.log('[CG] Backoff active — skipping prefetch');
-      return;
-    }
-    // Stagger fetch OHLC for each coin: 2.5s between calls to avoid 429
-    for (const id of ids) {
-      await this.fetchOHLC(id);
-      await new Promise(r => setTimeout(r, 2500));
-    }
-    console.log('[CG] Prefetch done');
+  // Rate limit guard — 300ms between calls
+  async _wait() {
+    const gap = this.minGap - (Date.now() - this.lastCall);
+    if (gap > 0) await new Promise(r => setTimeout(r, gap));
+    this.lastCall = Date.now();
   }
 
-  async fetchOHLC(cgId) {
-    if (this.backoff > Date.now()) return this.cache[cgId]?.candles || null;
-    const cached = this.cache[cgId];
-    if (cached && Date.now() - cached.time < this.ttl) return cached.candles;
-    await new Promise(r => setTimeout(r, 1500)); // CG rate limit spacing
+  // Fetch candles from Delta Exchange
+  // resolution: '15m' | '1h' | '4h'
+  // returns candles oldest→newest, or null on failure
+  async fetchCandles(symbol, resolution = '15m', days = 2) {
+    await this._wait();
+    const end   = Math.floor(Date.now() / 1000);
+    const start = end - days * 86400;
     try {
-      const res = await axios.get(`${CONFIG.COINGECKO_URL}/coins/${cgId}/ohlc`, {
-        params: { vs_currency: 'usd', days: 1 },
+      const res = await axios.get(`${this.baseUrl}/v2/history/candles`, {
+        params: { symbol, resolution, start, end },
+        headers: { 'Accept': 'application/json', 'User-Agent': 'HybridTradingBot/9.1' },
         timeout: 15000,
       });
-      if (!res.data?.length) return null;
-      const candles = res.data.map(([t, o, h, l, c]) => ({ time: t, open: o, high: h, low: l, close: c, volume: 1000000 }));
-      this.cache[cgId] = { candles, time: Date.now() };
+      const raw = res.data?.result;
+      if (!raw?.length) { console.warn(`[Delta] No data for ${symbol}/${resolution}`); return null; }
+      // Delta returns newest-first — reverse to oldest-first
+      const candles = raw.reverse().map(d => ({
+        time:   d.time * 1000,  // seconds → ms
+        open:   parseFloat(d.open),
+        high:   parseFloat(d.high),
+        low:    parseFloat(d.low),
+        close:  parseFloat(d.close),
+        volume: parseFloat(d.volume || 0),
+      }));
+      console.log(`[Delta] ✅ ${symbol} [${resolution}]: ${candles.length} candles`);
       return candles;
     } catch (e) {
-      if (e.response?.status === 429) { this.backoff = Date.now() + 120000; console.warn('[CG] 429 — 2 min backoff'); }
-      return this.cache[cgId]?.candles || null;
+      const status = e.response?.status;
+      console.error(`[Delta] ${symbol}/${resolution}: ${status || e.message}`);
+      return null;
     }
   }
 
-  async fetchH1(cgId) {
-    try {
-      const res = await axios.get(`${CONFIG.COINGECKO_URL}/coins/${cgId}/market_chart`, {
-        params: { vs_currency: 'usd', days: 7, interval: 'hourly' },
-        timeout: 15000,
-      });
-      if (!res.data?.prices?.length) return null;
-      const prices = res.data.prices;
-      return prices.map((p, i) => {
-        const prev = prices[i - 1] || p;
-        return { time: p[0], open: prev[1], high: Math.max(p[1], prev[1]), low: Math.min(p[1], prev[1]), close: p[1], volume: 1000000 };
-      });
-    } catch { return null; }
+  // Fetch M15 + H1 + H4 for a symbol, with cache
+  async fetchMTF(symbol) {
+    const cached = this.cache[symbol];
+    // Return cache if M15 is fresh
+    if (cached && Date.now() - cached.time < this.ttlM15) {
+      return cached;
+    }
+    // Fetch M15 (2 days = ~192 candles)
+    const m15 = await this.fetchCandles(symbol, '15m', 2);
+    if (!m15 || m15.length < 10) return cached || null; // fallback to stale
+
+    // Fetch H1 (7 days = 168 candles) — only if H1 cache stale
+    let h1 = cached?.h1 || null;
+    if (!h1 || Date.now() - cached.h1Time > this.ttlH1) {
+      h1 = await this.fetchCandles(symbol, '1h', 7);
+    }
+
+    // H4 — fetch directly (Delta supports it)
+    let h4 = await this.fetchCandles(symbol, '4h', 30);
+
+    const result = { m15, h1: h1 || [], h4: h4 || [], time: Date.now(), h1Time: Date.now() };
+    this.cache[symbol] = result;
+    return result;
+  }
+
+  // Prefetch all symbols (called at cycle start)
+  async prefetchAll(symbols) {
+    console.log(`[Delta] Prefetching ${symbols.length} symbols...`);
+    for (let i = 0; i < symbols.length; i++) {
+      await this.fetchCandles(symbols[i], '15m', 2);
+      if (i < symbols.length - 1) await new Promise(r => setTimeout(r, 400));
+    }
+    console.log('[Delta] Prefetch done');
   }
 }
+
 
 class DhanFetcher {
   constructor() {}
@@ -1358,7 +1392,7 @@ class DhanFetcher {
 class DataFetcher {
   constructor() {
     this.td    = new TDFetcher();
-    this.cg    = new CGFetcher();
+    this.delta = new DeltaFetcher();
     this.dhan  = new DhanFetcher();
     this.cache = {};     // symbol → last known M15 candles
     this.mtfCache = {}; // symbol_mtf → { data, time }
@@ -1397,12 +1431,13 @@ class DataFetcher {
         h4  = await this.td.fetch(cfg.td, '4h',    60);
         source = 'twelvedata';
 
-      } else if (cfg.src === 'cg') {
-        m15 = await this.cg.fetchOHLC(cfg.cgId);  // ~30min candles used as M15 proxy
-        const h1Raw = await this.cg.fetchH1(cfg.cgId);
-        h1  = h1Raw;
-        h4  = h1 ? this.resample(h1, 4) : null;
-        source = 'coingecko';
+      } else if (cfg.src === 'delta') {
+        // Delta Exchange India — real M15 OHLC, no rate limit issues
+        const dtf = await this.delta.fetchMTF(cfg.deltaSymbol);
+        m15 = dtf?.m15 || null;
+        h1  = dtf?.h1  || null;
+        h4  = dtf?.h4  || null;
+        source = 'delta';
 
       } else if (cfg.src === 'dhan') {
         // Dhan: fetch M15 directly, resample for H1 and H4
@@ -1604,9 +1639,9 @@ async function runCycle() {
   const ist = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
   console.log(`\n[v9.1] ⚡ M15 Cycle — ${ist}`);
 
-  // Prefetch all crypto at once
-  const cgIds = Object.values(SYMBOLS).filter(s => s.src === 'cg').map(s => s.cgId);
-  await dataFetcher.cg.prefetchAll(cgIds).catch(() => {});
+  // Prefetch all Delta crypto symbols
+  const deltaSyms = Object.values(SYMBOLS).filter(s => s.src === 'delta').map(s => s.deltaSymbol);
+  await dataFetcher.delta.prefetchAll(deltaSyms).catch(() => {});
 
   // Track which categories are closed this cycle (send one message per cat)
   const closedSent = new Set();
@@ -1678,7 +1713,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '9.1.0',
+  version: '9.2.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -1689,7 +1724,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '9.1.0',
+    status: 'OK', version: '9.2.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -1703,7 +1738,7 @@ app.get('/api/health', (req, res) => {
     },
     dataSources: {
       twelvedata: CONFIG.TWELVE_DATA_KEY  ? '✅' : '⚠️  key missing',
-      coingecko:  '✅',
+      delta:     '✅ (real M15 OHLC)',
       dhan: dhanToken.accessToken === 'placeholder' ? '⏳ no token — POST /api/dhan/token' :
                dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 86400000 ? '❌ token expired — refresh now' :
                dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 72000000 ? '⚠️  token expiring soon' : '✅ active',
@@ -1803,7 +1838,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v9.1 — ICT/SMC ENGINE      ║
+║   HYBRID TRADING BOT v9.2 — ICT/SMC ENGINE      ║
 ║   10 strategies · M15 entry · H1/H4 SL-TP       ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -1817,7 +1852,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
   await tgSend(`🚀 *Hybrid Trading Bot v9.1 Online*
-Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ | Crypto ✅
+Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ | Crypto ✅ (Delta Exchange)
 Strategies: 10 ICT/SMC | Entry: M15 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
 ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activate NIFTY/BANKNIFTY/FINNIFTY/SENSEX' : ''}`);
