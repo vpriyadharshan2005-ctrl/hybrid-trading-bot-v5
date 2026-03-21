@@ -351,7 +351,7 @@ class Ind {
 class Detectors {
 
   // ─── shared context prepared once per cycle ───────────────
-  static ctx(m15, h1, h4, cat) {
+  static ctx(m15, h1, h4, cat, daily = null) {
     const c   = Ind.confirmed(m15);
     const cls = c.map(x => x.close);
     const atr = Ind.atr(c);
@@ -415,6 +415,58 @@ class Detectors {
     const volGood  = vol.ratio >= 1.3;  // decent confirmation
     const volSpike = vol.ratio >= 1.5;  // strong confirmation
 
+    // ── Daily bias (one more TF above H4) ─────────────────────────────────
+    let dailyBias = 'NEUTRAL', dailyBullOk = true, dailySellOk = true;
+    if (daily && daily.length >= 3) {
+      const dlast  = daily[daily.length - 1];
+      const dprev  = daily[daily.length - 2];
+      // Daily candle direction — use last 2 daily candles for bias
+      const d2Bull = dlast.close > dlast.open && dprev.close > dprev.open;
+      const d2Bear = dlast.close < dlast.open && dprev.close < dprev.open;
+      if (d2Bull) { dailyBias = 'BULLISH'; dailySellOk = false; }
+      else if (d2Bear) { dailyBias = 'BEARISH'; dailyBullOk = false; }
+      // Single candle: weaker signal — allow both but note bias
+      else if (dlast.close > dlast.open) dailyBias = 'BULLISH';
+      else if (dlast.close < dlast.open) dailyBias = 'BEARISH';
+    }
+
+    // ── Equal Highs / Equal Lows (EQH/EQL) ─────────────────────────────────
+    // Two+ swing highs/lows within 0.15 ATR = liquidity pool
+    const eqTol = atr * 0.15;
+    const eqH = [], eqL = [];
+    for (let i = 0; i < swH.length - 1; i++) {
+      for (let j = i + 1; j < swH.length; j++) {
+        if (Math.abs(swH[i].v - swH[j].v) <= eqTol)
+          eqH.push({ level: (swH[i].v + swH[j].v) / 2, idx1: swH[i].i, idx2: swH[j].i });
+      }
+    }
+    for (let i = 0; i < swL.length - 1; i++) {
+      for (let j = i + 1; j < swL.length; j++) {
+        if (Math.abs(swL[i].v - swL[j].v) <= eqTol)
+          eqL.push({ level: (swL[i].v + swL[j].v) / 2, idx1: swL[i].i, idx2: swL[j].i });
+      }
+    }
+
+    // ── Session High/Low (prior session extremes) ───────────────────────────
+    // Sessions in UTC: Asian 00-08, London 08-16, NY 13-22
+    const nowH = new Date().getUTCHours();
+    // Find candles from prior session based on current session
+    let sessionBound = 0;
+    if (nowH >= 8  && nowH < 13) sessionBound = 0;   // London open: use Asian H/L
+    if (nowH >= 13 && nowH < 22) sessionBound = 8;   // NY open: use London H/L
+    if (nowH >= 22 || nowH < 8)  sessionBound = 13;  // Asian: use NY H/L
+
+    const priorSessCandles = c.filter(cx => {
+      const ch = new Date(cx.time).getUTCHours();
+      return sessionBound === 0
+        ? ch >= 0 && ch < 8
+        : sessionBound === 8
+          ? ch >= 8 && ch < 16
+          : ch >= 13 && ch < 22;
+    });
+    const sessHigh = priorSessCandles.length ? Math.max(...priorSessCandles.map(cx => cx.high)) : null;
+    const sessLow  = priorSessCandles.length ? Math.min(...priorSessCandles.map(cx => cx.low))  : null;
+
     return {
       c, cls, atr, f, price, dec,
       swH, swL, obs, fvgs, vol, rsi, macd, tr,
@@ -424,14 +476,18 @@ class Detectors {
       last, prev, last2,
       minBody, lastBullBody, lastBearBody,
       volOk, volGood, volSpike,
+      // New additions
+      dailyBias, dailyBullOk, dailySellOk,
+      eqH, eqL,
+      sessHigh, sessLow,
     };
   }
 
   // ─── run all detectors ────────────────────────────────────
-  static runAll(m15, h1, h4, cat) {
+  static runAll(m15, h1, h4, cat, daily = null) {
     if (!m15 || m15.length < 40) return [];
     let x;
-    try { x = this.ctx(m15, h1, h4, cat); }
+    try { x = this.ctx(m15, h1, h4, cat, daily); }
     catch { return []; }
 
     const results = [];
@@ -439,6 +495,7 @@ class Detectors {
       this.fvgOB, this.liqSweep, this.choch, this.fpb, this.ote,
       this.breaker, this.silverBullet, this.orb, this.crt, this.po3,
       this.fvgBosHTF,
+      this.eqhEql, this.gapGo, this.sessRaid,  // new additions
     ];
     for (const fn of runners) {
       try {
@@ -447,10 +504,16 @@ class Detectors {
         const arr = Array.isArray(r) ? r : [r];
         for (const sig of arr) {
           if (!sig?.dir || !sig?.id) continue;
+          // P/D zone gate
           if (sig.dir === 'BUY'  && !x.buyOk)  continue;
           if (sig.dir === 'SELL' && !x.sellOk) continue;
+          // H4 full bias hard block
           if (x.align === 'FULL_BULL' && sig.dir === 'SELL') continue;
           if (x.align === 'FULL_BEAR' && sig.dir === 'BUY')  continue;
+          // Daily bias gate — if 2 consecutive daily candles confirm direction,
+          // block signals in opposite direction (strongest filter)
+          if (!x.dailyBullOk && sig.dir === 'BUY')  continue;
+          if (!x.dailySellOk && sig.dir === 'SELL') continue;
           results.push(sig);
         }
       } catch { /* skip */ }
@@ -969,6 +1032,202 @@ class Detectors {
   }
 
   // ══════════════════════════════════════════════════════════
+  //  12. EQUAL HIGHS / EQUAL LOWS (EQH/EQL)
+  //  Two+ swing H/L at same level = liquidity pool
+  //  Entry: M15 close back ABOVE swept EQL (BUY) / below EQH (SELL)
+  //  SL:    beyond the sweep wick + 0.5 ATR
+  //  TP1:   opposite EQ level | TP2: H1 swing beyond
+  //  Works: ALL markets especially India + Crypto
+  // ══════════════════════════════════════════════════════════
+  static eqhEql(x) {
+    const { c, price, atr, eqH, eqL, h4Tr, h1POI, kz,
+            lastBullBody, lastBearBody, volGood } = x;
+    const last = x.last, prev = x.prev;
+    if (!volGood) return null;
+
+    // ── Bullish: EQL pool swept → closes back above ─────────
+    for (const eq of eqL.slice(-3)) {
+      // Price must have swept below the EQL level
+      const swept  = prev.low < eq.level - atr * 0.1;
+      // Current M15 must close back above EQL
+      const reclaim = last.close > eq.level && lastBullBody;
+      if (!swept || !reclaim) continue;
+      // EQL must be recent (within last 30 candles)
+      const age = c.length - 1 - Math.max(eq.idx1, eq.idx2);
+      if (age > 30) continue;
+      const score = 76
+        + (h4Tr === 'BULLISH' ? 8 : 0)
+        + (h1POI ? 6 : 0)
+        + (kz ? 4 : 0)
+        + (x.volSpike ? 4 : 0);
+      return {
+        id: 'EQH_EQL', name: 'Equal Lows Raid', dir: 'BUY', score,
+        sl_ref: { type: 'eql_sweep', val: prev.low },
+        tp_ref: {
+          tp1_type: 'eqh_level',
+          tp1_val: eqH.length ? eqH[eqH.length - 1].level : price + atr * 2,
+        },
+      };
+    }
+
+    // ── Bearish: EQH pool swept → closes back below ─────────
+    for (const eq of eqH.slice(-3)) {
+      const swept  = prev.high > eq.level + atr * 0.1;
+      const reclaim = last.close < eq.level && lastBearBody;
+      if (!swept || !reclaim) continue;
+      const age = c.length - 1 - Math.max(eq.idx1, eq.idx2);
+      if (age > 30) continue;
+      const score = 76
+        + (h4Tr === 'BEARISH' ? 8 : 0)
+        + (h1POI ? 6 : 0)
+        + (kz ? 4 : 0)
+        + (x.volSpike ? 4 : 0);
+      return {
+        id: 'EQH_EQL', name: 'Equal Highs Raid', dir: 'SELL', score,
+        sl_ref: { type: 'eqh_sweep', val: prev.high },
+        tp_ref: {
+          tp1_type: 'eql_level',
+          tp1_val: eqL.length ? eqL[eqL.length - 1].level : price - atr * 2,
+        },
+      };
+    }
+    return null;
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  13. GAP & GO (Opening Gap — India NSE only)
+  //  NIFTY/BANKNIFTY opens > 0.3% from prior close
+  //  Entry: M15 first candle after open in gap direction + volume
+  //  SL:    opposite side of gap candle - 0.3 ATR
+  //  TP1:   prior day close (gap fill zone)
+  //  TP2:   1× gap size projected
+  //  Works: INDIA only, Mon-Fri 09:15-10:00 IST
+  // ══════════════════════════════════════════════════════════
+  static gapGo(x, m15) {
+    const { price, atr, h4Tr, cat, lastBullBody, lastBearBody, volGood } = x;
+    if (cat !== 'india') return null;
+    if (!volGood) return null;
+
+    // Only in first 45 min after open: 09:15-10:00 IST
+    const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const hh = nowIST.getHours(), mm = nowIST.getMinutes();
+    const t  = hh + mm / 60;
+    if (t < 9.25 || t > 10.0) return null;
+
+    // Find prior day candles to get yesterday's close
+    const today    = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    today.setHours(0, 0, 0, 0);
+    const todayMs  = today.getTime();
+    // IST offset = +5:30 = 330 min
+    const istOffset = 330 * 60000;
+
+    const priorDay = m15.filter(cx => {
+      const candleIST = new Date(cx.time + istOffset);
+      return candleIST.getTime() < todayMs + istOffset;
+    });
+    if (priorDay.length < 1) return null;
+    const priorClose = priorDay[priorDay.length - 1].close;
+    if (!priorClose) return null;
+
+    // Gap % from prior close to today's first candle
+    const todayFirst = m15.filter(cx => {
+      const candleIST = new Date(cx.time + istOffset);
+      return candleIST.getTime() >= todayMs + istOffset;
+    })[0];
+    if (!todayFirst) return null;
+
+    const gapPct = Math.abs(todayFirst.open - priorClose) / priorClose;
+    if (gapPct < 0.003) return null; // must be > 0.3% gap
+
+    const last = x.last;
+    const gapUp   = todayFirst.open > priorClose;
+    const gapDown = todayFirst.open < priorClose;
+
+    // Bullish gap: gap up, price holding above prior close, bullish M15 body
+    if (gapUp && price > priorClose && lastBullBody) {
+      const score = 74
+        + (h4Tr === 'BULLISH' ? 8 : 0)
+        + (gapPct > 0.005 ? 4 : 0)  // bonus for larger gap
+        + (x.volSpike ? 4 : 0);
+      return {
+        id: 'GAP_GO', name: 'Gap & Go', dir: 'BUY', score,
+        sl_ref: { type: 'gap_candle_low', val: last.low },
+        tp_ref: { tp1_type: 'gap_proj', tp1_val: price + (todayFirst.open - priorClose) },
+        priorClose,
+      };
+    }
+    // Bearish gap: gap down, price below prior close
+    if (gapDown && price < priorClose && lastBearBody) {
+      const score = 74
+        + (h4Tr === 'BEARISH' ? 8 : 0)
+        + (gapPct > 0.005 ? 4 : 0)
+        + (x.volSpike ? 4 : 0);
+      return {
+        id: 'GAP_GO', name: 'Gap & Go', dir: 'SELL', score,
+        sl_ref: { type: 'gap_candle_high', val: last.high },
+        tp_ref: { tp1_type: 'gap_proj', tp1_val: price - (priorClose - todayFirst.open) },
+        priorClose,
+      };
+    }
+    return null;
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  14. SESSION HIGH/LOW RAID
+  //  Prior session extreme swept in new session → reversal
+  //  Entry: M15 closes back inside prior session range
+  //  SL:    beyond sweep wick + 0.5 ATR
+  //  TP1:   50% of prior session range | TP2: opposite session extreme
+  //  Works: Forex, Gold, Crypto (24-hour markets)
+  // ══════════════════════════════════════════════════════════
+  static sessRaid(x) {
+    const { price, atr, cat, h4Tr, h1POI, kz, sessHigh, sessLow,
+            lastBullBody, lastBearBody, volGood } = x;
+    if (cat !== 'forex' && cat !== 'commodity' && cat !== 'crypto') return null;
+    if (!sessHigh || !sessLow) return null;
+    if (!volGood) return null;
+
+    const last = x.last, prev = x.prev;
+    const sessRange = sessHigh - sessLow;
+    if (sessRange < atr * 0.8) return null; // session too narrow
+
+    const sessMid = (sessHigh + sessLow) / 2;
+
+    // ── Bullish raid: prior session LOW swept, closes back above ─────
+    if (prev.low < sessLow - atr * 0.1 && last.close > sessLow && lastBullBody) {
+      const sweepDepth = sessLow - prev.low;
+      if (sweepDepth < atr * 0.2) return null; // must be real penetration
+      const score = 78
+        + (h4Tr === 'BULLISH' ? 8 : 0)
+        + (h1POI ? 6 : 0)
+        + (kz ? 4 : 0)
+        + (x.volSpike ? 4 : 0);
+      return {
+        id: 'SESS_RAID', name: 'Session Low Raid', dir: 'BUY', score,
+        sl_ref: { type: 'sess_sweep_low', val: prev.low },
+        tp_ref: { tp1_type: 'sess_mid', tp1_val: sessMid, tp2_val: sessHigh },
+      };
+    }
+
+    // ── Bearish raid: prior session HIGH swept, closes back below ────
+    if (prev.high > sessHigh + atr * 0.1 && last.close < sessHigh && lastBearBody) {
+      const sweepDepth = prev.high - sessHigh;
+      if (sweepDepth < atr * 0.2) return null;
+      const score = 78
+        + (h4Tr === 'BEARISH' ? 8 : 0)
+        + (h1POI ? 6 : 0)
+        + (kz ? 4 : 0)
+        + (x.volSpike ? 4 : 0);
+      return {
+        id: 'SESS_RAID', name: 'Session High Raid', dir: 'SELL', score,
+        sl_ref: { type: 'sess_sweep_high', val: prev.high },
+        tp_ref: { tp1_type: 'sess_mid', tp1_val: sessMid, tp2_val: sessLow },
+      };
+    }
+    return null;
+  }
+
+  // ══════════════════════════════════════════════════════════
   //  11. FVG + BOS + HTF (BEST COMBO ⭐)
   //  Fix: PARTIAL alignment now requires H1 POI too,
   //       vol + body size required
@@ -1027,10 +1286,11 @@ class Builder {
     const cfg  = SYMBOLS[symbol];
     if (!cfg)  return null;
     const cat  = cfg.cat;
-    const h1   = mtfData?.h1 || null;
-    const h4   = mtfData?.h4 || null;
+    const h1    = mtfData?.h1    || null;
+    const h4    = mtfData?.h4    || null;
+    const daily = mtfData?.daily || null;
 
-    const fired = Detectors.runAll(m15, h1, h4, cat);
+    const fired = Detectors.runAll(m15, h1, h4, cat, daily);
     if (!fired.length) return null;
 
     // Best signal by score
@@ -1070,6 +1330,7 @@ class Builder {
       levels:      lvls,
       confirmedBy: conf.map(s => ({ id: s.id, name: s.name })),
       mtf: {
+        daily: ctx.dailyBias,
         h4:    ctx.h4Tr,
         h1:    ctx.h1Tr,
         m15:   ctx.tr,
@@ -1167,6 +1428,15 @@ class Builder {
         break;
       case 'FVG_BOS_HTF':
         entry = f(isBuy ? sig.sl_ref.val + buf : sig.sl_ref.val - buf);
+        break;
+      case 'EQH_EQL':
+        // Enter above EQL (BUY) / below EQH (SELL) — at level with buffer
+        entry = f(isBuy ? sig.tp_ref.tp1_val - atr * 0.1 : sig.tp_ref.tp1_val + atr * 0.1);
+        entry = f(price); // use current M15 close
+        break;
+      case 'GAP_GO':
+      case 'SESS_RAID':
+        entry = f(price);
         break;
       default:
         entry = f(price);
@@ -1280,6 +1550,27 @@ class Builder {
         }
         break;
 
+      case 'EQH_EQL':
+        // SL: beyond sweep wick + 0.5 ATR (below EQL sweep or above EQH sweep)
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.5)
+          : f(sig.sl_ref.val + atr * 0.5);
+        break;
+
+      case 'GAP_GO':
+        // SL: opposite side of gap candle + 0.3 ATR
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.3)
+          : f(sig.sl_ref.val + atr * 0.3);
+        break;
+
+      case 'SESS_RAID':
+        // SL: beyond session sweep wick + 0.5 ATR
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.5)
+          : f(sig.sl_ref.val + atr * 0.5);
+        break;
+
       default:
         // Fallback: H1 structural SL (always wider than M15 noise)
         sl = isBuy
@@ -1388,6 +1679,27 @@ class Builder {
           : f(h1LowBelowTP?.v  || tp1 - Math.abs((entry || price) - tp1) * 1.5);
         break;
 
+      case 'EQH_EQL':
+        // TP1 = opposite EQ level | TP2 = H1 swing beyond
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || tp1 + atr * 2)
+          : f(h1LowBelowTP?.v  || tp1 - atr * 2);
+        break;
+
+      case 'GAP_GO':
+        // TP1 = gap projection | TP2 = 1.5× gap size
+        tp1 = f(sig.tp_ref.tp1_val);
+        { const gapSize = Math.abs(tp1 - (entry || price));
+          tp2 = isBuy ? f((entry || price) + gapSize * 1.5) : f((entry || price) - gapSize * 1.5); }
+        break;
+
+      case 'SESS_RAID':
+        // TP1 = session midpoint | TP2 = opposite session extreme
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = f(sig.tp_ref.tp2_val);
+        break;
+
       default:
         tp1 = isBuy ? f(nearM15High) : f(nearM15Low);
         tp2 = isBuy
@@ -1395,9 +1707,35 @@ class Builder {
           : f(h1LowBelowTP?.v  || (tp1 - atr * 2));
     }
 
-    // ── TP3 — 3× risk (let winners run) ──────────────────────────────────────
-    const risk3 = entry && sl ? Math.abs(entry - sl) * 3 : atr * 5;
-    tp3 = isBuy ? f((entry || price) + risk3) : f((entry || price) - risk3);
+    // ── TP3 — Fibonacci 161.8% extension OR 3× risk (whichever is larger) ────
+    // Fib extension: measure the swing that created the setup, project 161.8%
+    // For zone strategies: use the distance from setup origin to entry
+    // For sweep strategies: use the sweep range
+    const risk = entry && sl ? Math.abs(entry - sl) : atr;
+    let fibTP3  = null;
+    // 161.8% of risk = classic fib extension target
+    const fib1618 = risk * 1.618;
+    // 127% of risk = first fib extension (more conservative)
+    const fib127  = risk * 1.27;
+    if (tp2 && entry) {
+      // TP3 = TP2 + (TP2-entry) × 0.618 (next fib level beyond TP2)
+      const tp2Dist = Math.abs(tp2 - (entry || price));
+      fibTP3 = isBuy
+        ? f((tp2 || price) + tp2Dist * 0.618)
+        : f((tp2 || price) - tp2Dist * 0.618);
+    }
+    const risk3 = Math.max(risk * 3, fib1618);
+    const riskTP3 = isBuy ? f((entry || price) + risk3) : f((entry || price) - risk3);
+    tp3 = fibTP3 || riskTP3;
+
+    // Also update TP2 to use 127% fib extension if it would be better
+    if (tp1 && tp2 && entry && risk > 0) {
+      const currentTP2Dist = Math.abs((tp2 || 0) - (entry || price));
+      if (fib127 > currentTP2Dist) {
+        // Fib 127% gives a better target than current H1 swing
+        tp2 = isBuy ? f((entry || price) + fib127) : f((entry || price) - fib127);
+      }
+    }
 
     // ── Enforce strict ordering — no TP closer than entry ────────────────────
     if (isBuy) {
@@ -1512,7 +1850,7 @@ class FinnhubFetcher {
     }
   }
 
-  // Fetch M15 + H1 + H4 for a symbol, with cache
+  // Fetch M15 + H1 + H4 + Daily for a symbol, with cache
   async fetchMTF(fhSymbol) {
     const cached = this.cache[fhSymbol];
     if (cached && Date.now() - cached.time < this.ttlM15) return cached;
@@ -1520,18 +1858,19 @@ class FinnhubFetcher {
     const m15 = await this.fetchCandles(fhSymbol, '15', 3);
     if (!m15 || m15.length < 10) return cached || null;
 
-    // H1 — only refetch if stale
     let h1 = cached?.h1 || null;
     if (!h1 || Date.now() - (cached?.h1Time || 0) > this.ttlH1) {
       h1 = await this.fetchCandles(fhSymbol, '60', 7);
     }
-
-    // H4
-    const h4 = await this.fetchCandles(fhSymbol, '240', 30);
-
+    const h4    = await this.fetchCandles(fhSymbol, '240', 30);
+    // Daily candle (resolution 'D') — 60 days. Cached 6 hours.
+    let daily = cached?.daily || null;
+    if (!daily || Date.now() - (cached?.dailyTime || 0) > 6 * 3600000) {
+      daily = await this.fetchCandles(fhSymbol, 'D', 60);
+    }
     const result = {
-      m15, h1: h1 || [], h4: h4 || [],
-      time: Date.now(), h1Time: Date.now(),
+      m15, h1: h1 || [], h4: h4 || [], daily: daily || [],
+      time: Date.now(), h1Time: Date.now(), dailyTime: Date.now(),
     };
     this.cache[fhSymbol] = result;
     return result;
@@ -1809,7 +2148,7 @@ class DataFetcher {
     if (this.mtfCache[key] && Date.now() - this.mtfCache[key].time < this.mtfTTL)
       return this.mtfCache[key].data;
 
-    let m15 = null, h1 = null, h4 = null, source = 'unknown';
+    let m15 = null, h1 = null, h4 = null, daily = null, source = 'unknown';
 
     try {
       if (cfg.src === 'td') {
@@ -1832,6 +2171,15 @@ class DataFetcher {
           h4  = m15 ? await this.td.fetch(cfg.td, '4h', 60)  : null;
           source = m15 ? 'twelvedata' : 'failed';
         }
+        // Daily candle — try Finnhub first, fallback TwelveData
+        if (!daily && this.fh.available && cfg.fh) {
+          const fhD = await this.fh.fetchCandles(cfg.fh, 'D', 60);
+          if (fhD?.length) daily = fhD;
+        }
+        if (!daily && m15) {
+          // Resample daily from available H4 candles (6 × H4 = 1 day)
+          daily = h4 ? this.resample(h4, 6) : null;
+        }
 
       } else if (cfg.src === 'delta') {
         // ── Primary: Delta Exchange India (real M15, no API key) ────
@@ -1841,6 +2189,8 @@ class DataFetcher {
           h1  = dtf.h1?.length ? dtf.h1 : null;
           h4  = dtf.h4?.length ? dtf.h4 : null;
           source = 'delta';
+        // Daily from H4 (6 × 4h = 1 day)
+        if (m15 && h4?.length >= 6) daily = this.resample(h4, 6);
         }
         // ── Fallback 1: Binance (real M15, no key, no rate limit issues) ──
         if (!m15 || m15.length < 10) {
@@ -1877,6 +2227,8 @@ class DataFetcher {
           h4 = this.resample(m15, 16);  // 16 × 15min = 4h
         }
         source = 'dhan';
+        // Daily from H4 (6 × 4h = 1 day)
+        if (m15 && h4?.length >= 6) daily = this.resample(h4, 6);
       }
     } catch (e) { console.error(`[DataFetcher] ${symbol}:`, e.message); }
 
@@ -1893,7 +2245,7 @@ class DataFetcher {
     if (!h1 || h1.length < 8)  h1 = this.resample(m15, 4);
     if (!h4 || h4.length < 4)  h4 = this.resample(m15, 16);
 
-    const result = { m15, h1, h4, source };
+    const result = { m15, h1, h4, daily: daily || [], source };
     this.mtfCache[key] = { data: result, time: Date.now() };
     return result;
   }
@@ -1929,7 +2281,7 @@ async function tgSignal(sig) {
 ⚡ *${sig.strategy.name}*
 💯 Quality: *${sig.quality}/100* [${bar}]
 
-📡 *Bias:* H4:${sig.mtf.h4} | H1:${sig.mtf.h1} | M15:${sig.mtf.m15} [${sig.mtf.align}]
+📡 *Bias:* D:${sig.mtf.daily || 'N/A'} | H4:${sig.mtf.h4} | H1:${sig.mtf.h1} | M15:${sig.mtf.m15} [${sig.mtf.align}]
 🌍 *Session:* ${sig.session} | KZ: ${sig.mtf.kz ? '✅' : '❌'}
 📍 *Zone:* ${pd} | H1 POI: ${sig.mtf.h1POI || 'none'}
 
@@ -2090,8 +2442,8 @@ async function runCycle() {
           // Send closed message at most once per hour per category
           if (now - lastNotif > 3600000) {
             state.closedNotified[cfg.cat] = now;
-            const catLabel = { india: 'India NSE/BSE', forex: 'Forex/Commodity', crypto: 'Crypto' };
-            await tgSend(`🔴 *${catLabel[cfg.cat] || cfg.cat} Market Closed*\n${Market.closedMessage(cfg.cat, symbol)}`);
+            const catLabel = { india: 'India NSE/BSE', forex: 'Forex', commodity: 'Commodity', crypto: 'Crypto' };
+            await tgSend(`🔴 *${catLabel[cfg.cat] || cfg.cat.charAt(0).toUpperCase()+cfg.cat.slice(1)} Market Closed*\n${Market.closedMessage(cfg.cat, symbol)}`);
           }
         }
         console.log(`[v9.1] 🔴 ${symbol}: ${cfg.cat} market closed`);
@@ -2143,7 +2495,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '9.6.0',
+  version: '9.7.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -2154,7 +2506,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '9.6.0',
+    status: 'OK', version: '9.7.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -2192,8 +2544,8 @@ app.get('/api/signals/:symbol',  (req, res) => {
 });
 
 app.get('/api/strategies',       (req, res) => res.json({
-  version: '9.1', total: 10,
-  note: 'All 10 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
+  version: '9.7', total: 14,
+  note: 'All 14 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
   strategies: [
     { id: 'FVG_OB',       name: 'Fair Value Gap + Order Block',  cat: 'SMC', wr: '60-68%', rr: '1:2-1:4' },
     { id: 'LIQ_SWEEP',    name: 'Liquidity Sweep',               cat: 'ICT', wr: '62-70%', rr: '1:2-1:5' },
@@ -2206,6 +2558,9 @@ app.get('/api/strategies',       (req, res) => res.json({
     { id: 'CRT',          name: 'Candle Range Theory (H1+H4)',   cat: 'ICT', wr: '65-72%', rr: '1:2-1:5' },
     { id: 'PO3',          name: 'Power of Three / AMD',          cat: 'ICT', wr: '65-72%', rr: '1:2-1:4' },
     { id: 'FVG_BOS_HTF',  name: 'FVG + BoS + HTF Combo',        cat: 'COMBO', wr: '68-75%', rr: '1:3-1:6' },
+    { id: 'EQH_EQL',      name: 'Equal Highs/Lows Raid',         cat: 'ICT',   wr: '62-70%', rr: '1:2-1:4' },
+    { id: 'GAP_GO',       name: 'Gap & Go (India NSE)',           cat: 'PA',    wr: '60-68%', rr: '1:2-1:3' },
+    { id: 'SESS_RAID',    name: 'Session H/L Raid',               cat: 'ICT',   wr: '63-70%', rr: '1:2-1:4' },
   ],
 }));
 
@@ -2270,7 +2625,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v9.6 — ICT/SMC ENGINE      ║
+║   HYBRID TRADING BOT v9.7 — ICT/SMC ENGINE      ║
 ║   10 strategies · M15 entry · H1/H4 SL-TP       ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -2283,8 +2638,8 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v9.1 Online*
-Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + CoinGecko fallback)
+  await tgSend(`🚀 *Hybrid Trading Bot v9.7 Online*
+Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 10 ICT/SMC | Entry: M15 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
 ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activate NIFTY/BANKNIFTY/FINNIFTY/SENSEX' : ''}`);
