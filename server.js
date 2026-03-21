@@ -1474,11 +1474,12 @@ class Builder {
         break;
 
       case 'CHOCH':
-        // SL: below the LOWEST point of the ChoCh candle - 0.3 ATR
+        // SL: below break candle low - 0.5 ATR
         // Logic: if break candle is fully negated, structure shift failed
+        // 0.5 ATR ensures noise (avg 0.3 ATR) can't reach SL
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.3)  // below break candle low
-          : f(sig.sl_ref.val + atr * 0.3); // above break candle high
+          ? f(sig.sl_ref.val - atr * 0.5)  // below break candle low
+          : f(sig.sl_ref.val + atr * 0.5); // above break candle high
         break;
 
       case 'FPB':
@@ -1514,9 +1515,9 @@ class Builder {
         break;
 
       case 'ORB':
-        // SL: opposite side of ORB range - 0.3 ATR
-        // Logic: if price trades back through the ENTIRE opening range, breakout failed
-        sl = f(isBuy ? sig.sl_ref.val - atr * 0.3 : sig.sl_ref.val + atr * 0.3);
+        // SL: opposite side of ORB range - 0.5 ATR
+        // Logic: full ORB range reclaim = breakout failed. 0.5 ATR prevents noise hits.
+        sl = f(isBuy ? sig.sl_ref.val - atr * 0.5 : sig.sl_ref.val + atr * 0.5);
         break;
 
       case 'CRT':
@@ -1558,10 +1559,10 @@ class Builder {
         break;
 
       case 'GAP_GO':
-        // SL: opposite side of gap candle + 0.3 ATR
+        // SL: below gap candle low - 0.5 ATR (India NSE — noise ~20pts on NIFTY)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.3)
-          : f(sig.sl_ref.val + atr * 0.3);
+          ? f(sig.sl_ref.val - atr * 0.5)
+          : f(sig.sl_ref.val + atr * 0.5);
         break;
 
       case 'SESS_RAID':
