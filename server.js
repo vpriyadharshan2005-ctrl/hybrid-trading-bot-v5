@@ -71,7 +71,7 @@ const SYMBOLS = {
   BANKNIFTY:  { name:'Bank NIFTY',    cat:'india',     src:'dhan', dhanId:'25',  seg:'IDX_I' },
   FINNIFTY:   { name:'Fin NIFTY',     cat:'india',     src:'dhan', dhanId:'27',  seg:'IDX_I' },
   SENSEX:     { name:'BSE SENSEX',    cat:'india',     src:'dhan', dhanId:'51',  seg:'IDX_I' }, // BSE index — signals only, limited F&O access
-  MIDCPNIFTY: { name:'Midcap NIFTY',  cat:'india',     src:'dhan', dhanId:'11915', seg:'IDX_I' }, // ⚠️ verify dhanId at web.dhan.co
+  MIDCPNIFTY: { name:'Nifty Midcap Select', cat:'india', src:'dhan', dhanId:'11915', seg:'IDX_I' }, // ✅ verified — Nifty Midcap Select F&O
 
   // ── Forex — Finnhub primary | TwelveData fallback ──────────────────────
   // Majors (highest volume globally)
@@ -2955,6 +2955,9 @@ class Gate {
 
 const gate = new Gate();
 
+// Global sets for runtime state (must be declared before any function that uses them)
+const ECO_PAUSE_REASONS = new Set(); // forex news pause — populated by checkEconomicCalendar
+
 // ═════════════════════════════════════════════════════════════
 //  SECTION 7 — BOT STATE & EXPIRY CHECKER
 // ═════════════════════════════════════════════════════════════
@@ -3354,8 +3357,6 @@ ${stLines || '  No completed trades'}`,
 // ── Economic Calendar — pause forex signals 30min before high-impact news ──────
 // Uses free ForexFactory-style approach: maintain a list of known recurring events
 // and add manual pauses via /pause command for one-off news
-const ECO_PAUSE_REASONS = new Set(); // set by /econews command or auto-detected
-
 async function checkEconomicCalendar() {
   // Only affects forex/commodity (not India/Crypto)
   // Check if we're within 30 minutes of a known high-impact event
@@ -3592,13 +3593,13 @@ async function runCycle() {
   // ── Pause guard ─────────────────────────────────────────────────────────
   if (state.pauseUntil && Date.now() < state.pauseUntil) {
     const left = Math.ceil((state.pauseUntil - Date.now()) / 60000);
-    console.log(`[v10.3] ⏸ Bot paused — ${left}m remaining`);
+    console.log(`[v10.4] ⏸ Bot paused — ${left}m remaining`);
     return;
   }
   state.running = true;
   const t0 = Date.now();
   const ist = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  console.log(`\n[v10.3] ⚡ M15 Cycle — ${ist}`);
+  console.log(`\n[v10.4] ⚡ M15 Cycle — ${ist}`);
 
   // Prefetch all Delta crypto symbols
   const deltaSyms = Object.values(SYMBOLS).filter(s => s.src === 'delta').map(s => s.deltaSymbol);
@@ -3614,7 +3615,7 @@ async function runCycle() {
 
       // ── Disabled symbol check ──────────────────────────────────
       if (CONFIG.DISABLED_SYMBOLS.includes(symbol)) {
-        console.log(`[v10.3] ⏭ ${symbol}: disabled via DISABLED_SYMBOLS`);
+        console.log(`[v10.4] ⏭ ${symbol}: disabled via DISABLED_SYMBOLS`);
         continue;
       }
 
@@ -3631,32 +3632,32 @@ async function runCycle() {
             await tgSend(`🔴 *${catLabel[cfg.cat] || cfg.cat.charAt(0).toUpperCase()+cfg.cat.slice(1)} Market Closed*\n${Market.closedMessage(cfg.cat, symbol)}`);
           }
         }
-        console.log(`[v10.3] 🔴 ${symbol}: ${cfg.cat} market closed`);
+        console.log(`[v10.4] 🔴 ${symbol}: ${cfg.cat} market closed`);
         continue;
       }
 
       // ── Fetch candles ──────────────────────────────────────
       const mtf = await dataFetcher.fetchMTF(symbol);
-      if (!mtf?.m15?.length) { console.log(`[v10.3] ⚠️  No data: ${symbol}`); continue; }
+      if (!mtf?.m15?.length) { console.log(`[v10.4] ⚠️  No data: ${symbol}`); continue; }
 
       // ── Build signal ───────────────────────────────────────
       const sig      = Builder.build(symbol, mtf.m15, mtf.source, mtf);
       const curPrice = mtf.m15[mtf.m15.length - 1].close;
 
-      if (!sig) { console.log(`[v10.3] ℹ️  No signal: ${symbol}`); continue; }
+      if (!sig) { console.log(`[v10.4] ℹ️  No signal: ${symbol}`); continue; }
 
       // ── Gate check ─────────────────────────────────────────
       const g = gate.check(sig, curPrice, state.signals.filter(s => s.ts && Date.now() - new Date(s.ts).getTime() < 900000));
       if (!g.ok) {
         cycleBlocked++; state.stats.blocked++;
-        console.log(`[v10.3] 🚫 ${symbol}: ${g.why}`);
+        console.log(`[v10.4] 🚫 ${symbol}: ${g.why}`);
         continue;
       }
 
       // ✅ Max open trades guard
       const openTrades = state.signals.filter(s => !s.expired && !s.slHit).length;
       if (openTrades >= CONFIG.MAX_OPEN_TRADES) {
-        console.log(`[v10.3] ⏸ ${symbol}: max open trades (${openTrades}/${CONFIG.MAX_OPEN_TRADES}) reached`);
+        console.log(`[v10.4] ⏸ ${symbol}: max open trades (${openTrades}/${CONFIG.MAX_OPEN_TRADES}) reached`);
         cycleBlocked++; state.stats.blocked++;
         continue;
       }
@@ -3665,7 +3666,7 @@ async function runCycle() {
       const todayStr = new Date().toISOString().slice(0, 10);
       const todayCount = state.signals.filter(s => s.ts?.slice(0,10) === todayStr).length;
       if (todayCount >= CONFIG.MAX_DAILY_SIGNALS) {
-        console.log(`[v10.3] ⏸ ${symbol}: max daily signals (${todayCount}/${CONFIG.MAX_DAILY_SIGNALS}) reached`);
+        console.log(`[v10.4] ⏸ ${symbol}: max daily signals (${todayCount}/${CONFIG.MAX_DAILY_SIGNALS}) reached`);
         cycleBlocked++; state.stats.blocked++;
         continue;
       }
@@ -3697,11 +3698,11 @@ async function runCycle() {
       cycleSignals++;
       savePersist(); // persist state after every new signal
 
-      console.log(`[v10.3] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
+      console.log(`[v10.4] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
       await tgSignal(sig);
       await new Promise(r => setTimeout(r, 500));
 
-    } catch (e) { console.error(`[v10.3] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
+    } catch (e) { console.error(`[v10.4] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
   }
 
   // ── Economic calendar check (pause forex before high-impact news) ─────────
@@ -3758,8 +3759,6 @@ ${stLines || '  No completed trades'}`,
 // ── Economic Calendar — pause forex signals 30min before high-impact news ──────
 // Uses free ForexFactory-style approach: maintain a list of known recurring events
 // and add manual pauses via /pause command for one-off news
-const ECO_PAUSE_REASONS = new Set(); // set by /econews command or auto-detected
-
 async function checkEconomicCalendar() {
   // Only affects forex/commodity (not India/Crypto)
   // Check if we're within 30 minutes of a known high-impact event
@@ -3817,7 +3816,7 @@ function forexPausedForNews() {
 
   await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
-  console.log(`[v10.3] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
+  console.log(`[v10.4] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
   state.running = false;
 }
 
@@ -3826,7 +3825,7 @@ function forexPausedForNews() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v10.3 — ICT/SMC Engine',
-  version: '10.4.0',
+  version: '10.4.1',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -3837,7 +3836,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.4.0',
+    status: 'OK', version: '10.4.1',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -4364,7 +4363,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v10.4.0 — ICT/SMC ENGINE   ║
+║  HYBRID TRADING BOT v10.4.1 — ICT/SMC ENGINE   ║
 ║   16 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -4376,11 +4375,11 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Forex:9 · Commodity:2 · Cr
   // Connect MongoDB and restore state
   await connectMongo();
   await loadPersist();
-  console.log('[v10.3] Waiting 5s before first cycle (CG rate limit buffer)...');
+  console.log('[v10.4] Waiting 5s before first cycle (CG rate limit buffer)...');
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.4.0 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.4.1 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 16 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -4391,12 +4390,14 @@ ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activat
   // */15 fires at :00, :15, :30, :45 of every hour — perfect M15 alignment
   // Offset cron by 2 min to avoid clash with startup cycle
   // Fires at :02, :17, :32, :47 of every hour
-  cron.schedule('2,17,32,47 * * * *', runCycle);
+  // M15 cron: fires at :00/:15/:30/:45 (aligned with M15 candle close)
+  // state.running guard prevents double-cycle if startup cycle overlaps
+  cron.schedule('*/15 * * * *', runCycle);
   // Weekly trade report — every Sunday at 20:00 IST (14:30 UTC)
   cron.schedule('30 14 * * 0', sendWeeklyReport);
   // Separate 1-min cron for TP/SL tracking — catches intra-candle TP hits
   cron.schedule('* * * * *', async () => {
     if (!state.running) await checkExpiry();
   });
-  console.log('[v10.3] Cron scheduled: M15 every :02 offset + TP/SL check every 1min. Bot running.\n');
+  console.log('[v10.4] Cron scheduled: M15 every :02 offset + TP/SL check every 1min. Bot running.\n');
 });
