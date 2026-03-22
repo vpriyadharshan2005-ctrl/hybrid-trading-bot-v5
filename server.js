@@ -30,8 +30,26 @@ const CONFIG = {
   COOLDOWN_MIN:       45,    // minutes between signals per symbol
   FLIP_BLOCK_MIN:     120,   // minutes before direction can flip
   EXPIRY_MIN:         20,    // signal expires after 20 min (next M15 candle)
-  ACCOUNT_SIZE:       parseFloat(process.env.ACCOUNT_SIZE || '100000'), // ₹1L default
-  RISK_PER_TRADE:     parseFloat(process.env.RISK_PCT     || '1'),      // 1% risk per trade
+  // ── Per-market risk configuration ─────────────────────────────────────────
+  // India NSE — fixed ₹ risk per trade (self-funded)
+  INDIA_RISK_INR:     parseFloat(process.env.INDIA_RISK_INR  || '6000'),  // ₹6,000 per trade
+
+  // Crypto — fixed ₹ risk per trade (Delta Exchange, self-funded)
+  CRYPTO_RISK_INR:    parseFloat(process.env.CRYPTO_RISK_INR || '3000'),  // ₹3,000 per trade
+
+  // Forex + Commodity — FundingPips 5K account (% based, must respect DD rules)
+  FP_ACCOUNT_USD:     parseFloat(process.env.FP_ACCOUNT_USD  || '5000'),  // $5,000 FP account
+  FP_RISK_PCT:        parseFloat(process.env.FP_RISK_PCT      || '0.5'),  // 0.5% = $25/trade (conservative for challenge)
+  USD_TO_INR:         parseFloat(process.env.USD_TO_INR        || '83'),  // approx rate for display
+
+  // ── FundingPips Challenge Tracker ───────────────────────────────────────────
+  FP_PHASE:           parseInt(process.env.FP_PHASE           || '1'),    // current phase (1 or 2)
+  FP_PHASE1_TARGET:   8,    // 8% profit target for Phase 1 (2-Step Standard)
+  FP_PHASE2_TARGET:   5,    // 5% profit target for Phase 2
+  FP_MAX_DD_PCT:      10,   // 10% max drawdown (static from initial balance)
+  FP_DAILY_DD_PCT:    5,    // 5% max daily drawdown
+  FP_WARN_DD_PCT:     3,    // warn when daily DD reaches 3% (buffer before 5% limit)
+  FP_WARN_MAX_DD:     7,    // warn when total DD reaches 7% (buffer before 10% limit)
 };
 
 // ── Symbols ───────────────────────────────────────────────────
@@ -1398,16 +1416,43 @@ class Builder {
     const rr     = risk > 0 ? `1:${(reward / risk).toFixed(1)}` : 'N/A';
     lvls.rr      = rr;
 
-    // ── Position sizing ───────────────────────────────────────────────────────
-    const riskAmt  = CONFIG.ACCOUNT_SIZE * (CONFIG.RISK_PER_TRADE / 100);
+    // ── Per-market position sizing ──────────────────────────────────────────────
     const riskUnit = lvls.entry && lvls.sl ? Math.abs(lvls.entry - lvls.sl) : null;
     const dec2     = Ind.dec(lvls.entry || 1);
-    lvls.riskAmount  = Math.round(riskAmt);
-    lvls.riskPerUnit = riskUnit ? Ind.fmt(riskUnit, dec2) : null;
-    lvls.lotSize     = riskUnit && riskUnit > 0 ? Math.floor(riskAmt / riskUnit) : null;
-    lvls.profitTP1   = lvls.lotSize && lvls.tp1 && lvls.entry
+    let   riskAmt, currency, riskLabel;
+
+    if (cat === 'india') {
+      // India NSE — fixed ₹6,000 risk per trade
+      riskAmt   = CONFIG.INDIA_RISK_INR;
+      currency  = '₹';
+      riskLabel = `₹${riskAmt.toLocaleString('en-IN')} (India fixed)`;
+    } else if (cat === 'crypto') {
+      // Crypto — fixed ₹3,000 risk per trade
+      riskAmt   = CONFIG.CRYPTO_RISK_INR;
+      currency  = '₹';
+      riskLabel = `₹${riskAmt.toLocaleString('en-IN')} (Crypto fixed)`;
+    } else {
+      // Forex + Commodity — FundingPips 0.5% of $5,000
+      const fpRiskUSD = CONFIG.FP_ACCOUNT_USD * (CONFIG.FP_RISK_PCT / 100);
+      // Check if daily DD protection should halve risk
+      const todayKey  = new Date().toISOString().slice(0, 10);
+      const todayPnL  = state.fp.dailyPnL[todayKey] || 0;
+      const dailyDDpct = Math.abs(Math.min(todayPnL, 0)) / CONFIG.FP_ACCOUNT_USD * 100;
+      const halfRisk   = dailyDDpct >= CONFIG.FP_WARN_DD_PCT; // halve if >3% daily used
+      const effectiveRisk = halfRisk ? fpRiskUSD / 2 : fpRiskUSD;
+      riskAmt   = Math.round(effectiveRisk * CONFIG.USD_TO_INR); // convert to ₹ for display
+      currency  = '$';
+      riskLabel = `$${effectiveRisk.toFixed(0)} (${CONFIG.FP_RISK_PCT}% of $${CONFIG.FP_ACCOUNT_USD} FP${halfRisk ? ' ⚠️ halved' : ''})`;
+    }
+
+    lvls.riskAmount   = riskAmt;
+    lvls.riskLabel    = riskLabel;
+    lvls.currency     = currency;
+    lvls.riskPerUnit  = riskUnit ? Ind.fmt(riskUnit, dec2) : null;
+    lvls.lotSize      = riskUnit && riskUnit > 0 ? parseFloat((riskAmt / riskUnit).toFixed(2)) : null;
+    lvls.profitTP1    = lvls.lotSize && lvls.tp1 && lvls.entry
       ? Math.round(lvls.lotSize * Math.abs(lvls.tp1 - lvls.entry)) : null;
-    lvls.profitTP2   = lvls.lotSize && lvls.tp2 && lvls.entry
+    lvls.profitTP2    = lvls.lotSize && lvls.tp2 && lvls.entry
       ? Math.round(lvls.lotSize * Math.abs(lvls.tp2 - lvls.entry)) : null;
 
     return {
@@ -2445,7 +2490,7 @@ async function tgSignal(sig) {
 🎯 *TP2:*   \`${sig.levels.tp2}\`
 🎯 *TP3:*   \`${sig.levels.tp3}\`
 📐 *R:R:*   ${sig.levels.rr}
-💼 *Risk:*  ₹${sig.levels.riskAmount?.toLocaleString('en-IN') || 'N/A'} | Lots: ${sig.levels.lotSize || 'N/A'}
+💼 *Risk:*  ${sig.levels.riskLabel || 'N/A'} | Lots: ${sig.levels.lotSize || 'N/A'}
 💵 *TP1 profit:* ₹${sig.levels.profitTP1?.toLocaleString('en-IN') || 'N/A'} | *TP2:* ₹${sig.levels.profitTP2?.toLocaleString('en-IN') || 'N/A'}
 ⏱ *Expires:* ${exp} IST | Setup: M15 | Entry: ${sig.entryTF} | SL: H1 struct
 
@@ -2491,6 +2536,7 @@ async function tgTPHit(sig, level) {
     `${level === 'TP1' ? '🔒 SL moved to break-even (entry)' : ''}`;
   await tgSend(msg);
   console.log(`[TP] ✅ ${level} hit: ${sig.dir} ${sig.symbol} | ${price}${profitStr}`);
+  fpUpdatePnL(sig, level);
 }
 
 async function tgExpiry(sig, reason) {
@@ -2534,6 +2580,8 @@ async function tgExpiry(sig, reason) {
       `${sig.tp1Hit ? 'TP1 ✅' : ''} ${sig.tp2Hit ? 'TP2 ✅' : ''}`.trim();
   }
   await tgSend(msg);
+  // Track FP P&L on SL outcomes
+  if (['SL_HIT','SL_BREAKEVEN','SL_AT_TP1'].includes(reason)) fpUpdatePnL(sig, reason);
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -2599,8 +2647,142 @@ const state = {
   stats: { total: 0, blocked: 0, analyzed: 0, startTime: Date.now() },
   lastCycle: null,
   running: false,
-  closedNotified: {}, // cat → last notification time
+  closedNotified: {},
+
+  // ── FundingPips Challenge Tracker ──────────────────────────────────────────
+  fp: {
+    phase:          1,
+    startedAt:      null,   // date trading started
+    dailyPnL:       {},     // date → estimated P&L in USD
+    totalPnL:       0,      // cumulative USD P&L estimate
+    tradesThisPhase: 0,
+    warningsSent:   {},     // track warnings to avoid spam (key → lastSentTime)
+  },
 };
+
+// ── FundingPips P&L tracker ──────────────────────────────────────────────────
+// Called after TP/SL events to update challenge progress
+function fpUpdatePnL(sig, outcome) {
+  if (sig.cat !== 'forex' && sig.cat !== 'commodity') return; // only forex/gold
+  const todayKey = new Date().toISOString().slice(0, 10);
+  if (!state.fp.dailyPnL[todayKey]) state.fp.dailyPnL[todayKey] = 0;
+  if (!state.fp.startedAt) state.fp.startedAt = todayKey;
+
+  const riskUSD = CONFIG.FP_ACCOUNT_USD * (CONFIG.FP_RISK_PCT / 100);
+  let pnlUSD = 0;
+
+  if (outcome === 'TP1') {
+    // TP1 hit: estimate 1× risk profit (conservative — actual depends on RR)
+    const rr = sig.levels?.rr ? parseFloat(sig.levels.rr.split(':')[1] || '1.5') : 1.5;
+    pnlUSD = riskUSD * Math.min(rr, 1.5); // cap at 1.5× for conservative tracking
+  } else if (outcome === 'TP2') {
+    const rr = sig.levels?.rr ? parseFloat(sig.levels.rr.split(':')[1] || '2') : 2;
+    pnlUSD = riskUSD * Math.min(rr, 2.5);
+  } else if (outcome === 'TP3') {
+    pnlUSD = riskUSD * 3;
+  } else if (outcome === 'SL_HIT') {
+    pnlUSD = -riskUSD; // full loss
+  } else if (outcome === 'SL_BREAKEVEN') {
+    pnlUSD = 0; // no loss/gain
+  }
+
+  state.fp.dailyPnL[todayKey] = (state.fp.dailyPnL[todayKey] || 0) + pnlUSD;
+  state.fp.totalPnL            = (state.fp.totalPnL || 0) + pnlUSD;
+  state.fp.tradesThisPhase     = (state.fp.tradesThisPhase || 0) + 1;
+  console.log(`[FP] P&L updated: today $${state.fp.dailyPnL[todayKey].toFixed(2)} | total $${state.fp.totalPnL.toFixed(2)}`);
+}
+
+// FundingPips watchdog — called every cycle
+async function fpWatchdog() {
+  const todayKey    = new Date().toISOString().slice(0, 10);
+  const todayPnL    = state.fp.dailyPnL[todayKey] || 0;
+  const totalPnL    = state.fp.totalPnL || 0;
+  const acct        = CONFIG.FP_ACCOUNT_USD;
+  const now         = Date.now();
+  const spamGuard   = 3 * 3600000; // max 1 warning per type per 3h
+
+  // ── Daily DD watchdog ─────────────────────────────────────────────────────
+  const dailyDDpct = Math.abs(Math.min(todayPnL, 0)) / acct * 100;
+  if (dailyDDpct >= CONFIG.FP_WARN_DD_PCT) { // 3% daily used
+    const key = 'daily_dd_warn';
+    if (!state.fp.warningsSent[key] || now - state.fp.warningsSent[key] > spamGuard) {
+      state.fp.warningsSent[key] = now;
+      await tgSend(
+        `⚠️ *FundingPips Daily DD Warning*
+` +
+        `Used: ${dailyDDpct.toFixed(1)}% of ${CONFIG.FP_DAILY_DD_PCT}% daily limit
+` +
+        `Today P&L: $${todayPnL.toFixed(2)}
+` +
+        `Risk is now HALVED for remaining signals today.
+` +
+        `Stop trading if daily loss reaches $${(acct * 0.045).toFixed(0)} (4.5%).`
+      );
+    }
+  }
+
+  // ── Hard daily DD brake — stop all forex/gold signals if at 4.5% ─────────
+  if (dailyDDpct >= 4.5) {
+    const key = 'daily_hard_brake';
+    if (!state.fp.warningsSent[key] || now - state.fp.warningsSent[key] > spamGuard) {
+      state.fp.warningsSent[key] = now;
+      await tgSend(
+        `🛑 *FundingPips STOP TRADING*
+` +
+        `Daily DD at ${dailyDDpct.toFixed(1)}% — approaching 5% hard limit.
+` +
+        `NO MORE Forex/Gold signals today. Resumes tomorrow.`
+      );
+    }
+  }
+
+  // ── Max total DD watchdog ─────────────────────────────────────────────────
+  const totalDDpct = Math.abs(Math.min(totalPnL, 0)) / acct * 100;
+  if (totalDDpct >= CONFIG.FP_WARN_MAX_DD) { // 7% total used
+    const key = 'total_dd_warn';
+    if (!state.fp.warningsSent[key] || now - state.fp.warningsSent[key] > spamGuard) {
+      state.fp.warningsSent[key] = now;
+      await tgSend(
+        `🚨 *FundingPips Max DD Warning*
+` +
+        `Total DD: ${totalDDpct.toFixed(1)}% of ${CONFIG.FP_MAX_DD_PCT}% allowed.
+` +
+        `Remaining room: $${(acct * (CONFIG.FP_MAX_DD_PCT/100) - Math.abs(Math.min(totalPnL,0))).toFixed(0)}
+` +
+        `⚠️ SLOW DOWN — you are near account breach.`
+      );
+    }
+  }
+
+  // ── Phase progress message (once per day at 09:00 IST) ───────────────────
+  const istHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })).getHours();
+  const istMin  = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })).getMinutes();
+  if (istHour === 9 && istMin < 15) {
+    const key = 'daily_summary';
+    if (!state.fp.warningsSent[key] || now - state.fp.warningsSent[key] > 23 * 3600000) {
+      state.fp.warningsSent[key] = now;
+      const phase       = state.fp.phase;
+      const target      = phase === 1 ? CONFIG.FP_PHASE1_TARGET : CONFIG.FP_PHASE2_TARGET;
+      const targetUSD   = acct * target / 100;
+      const progress    = Math.max(0, totalPnL);
+      const progressPct = Math.min(100, (progress / targetUSD * 100)).toFixed(1);
+      const tradingDays = Object.keys(state.fp.dailyPnL).length;
+      await tgSend(
+        `📊 *FundingPips Phase ${phase} Progress*
+` +
+        `${'█'.repeat(Math.floor(parseFloat(progressPct)/10))}${'░'.repeat(10-Math.floor(parseFloat(progressPct)/10))} ${progressPct}%
+` +
+        `Profit: $${progress.toFixed(2)} / $${targetUSD.toFixed(0)} target
+` +
+        `Trading days: ${tradingDays} | Trades: ${state.fp.tradesThisPhase}
+` +
+        `Daily limit: $${((acct * CONFIG.FP_DAILY_DD_PCT/100) - Math.abs(Math.min(todayPnL,0))).toFixed(0)} remaining today
+` +
+        `Risk per trade: $${(acct * CONFIG.FP_RISK_PCT/100).toFixed(0)} (${CONFIG.FP_RISK_PCT}%)`
+      );
+    }
+  }
+}
 
 async function checkExpiry() {
   const active = state.signals.filter(s => !s.expired && !s.slHit);
@@ -2760,6 +2942,18 @@ async function runCycle() {
         continue;
       }
 
+      // ✅ FundingPips daily DD guard — block forex/gold if at 4.5% daily DD
+      if ((cfg.cat === 'forex' || cfg.cat === 'commodity')) {
+        const todayKey2  = new Date().toISOString().slice(0, 10);
+        const todayPnL2  = state.fp.dailyPnL[todayKey2] || 0;
+        const dailyDD2   = Math.abs(Math.min(todayPnL2, 0)) / CONFIG.FP_ACCOUNT_USD * 100;
+        if (dailyDD2 >= 4.5) {
+          console.log(`[FP] 🛑 ${symbol}: daily DD ${dailyDD2.toFixed(1)}% — blocking forex signal`);
+          cycleBlocked++; state.stats.blocked++;
+          continue;
+        }
+      }
+
       // ✅ Signal passes all checks
       gate.record(sig);
       state.signals.unshift(sig);
@@ -2775,6 +2969,7 @@ async function runCycle() {
   }
 
   await checkExpiry();
+  await fpWatchdog(); // FundingPips DD watchdog
 
   await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
@@ -2787,7 +2982,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '10.1.0',
+  version: '10.2.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -2798,7 +2993,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.1.0',
+    status: 'OK', version: '10.2.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -2897,6 +3092,49 @@ app.get('/api/stats',            (req, res) => {
 });
 
 // Live Dhan token update — no redeploy needed
+// FundingPips challenge state + phase management
+app.get('/api/fp', (req, res) => {
+  const acct    = CONFIG.FP_ACCOUNT_USD;
+  const phase   = state.fp.phase;
+  const target  = phase === 1 ? CONFIG.FP_PHASE1_TARGET : CONFIG.FP_PHASE2_TARGET;
+  const tgtUSD  = acct * target / 100;
+  const progress = Math.max(0, state.fp.totalPnL);
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const todayPnL = state.fp.dailyPnL[todayKey] || 0;
+  res.json({
+    phase,
+    accountSize:     `$${acct.toLocaleString()}`,
+    riskPerTrade:    `$${(acct * CONFIG.FP_RISK_PCT / 100).toFixed(2)} (${CONFIG.FP_RISK_PCT}%)`,
+    phase_target:    `${target}% = $${tgtUSD.toFixed(0)}`,
+    current_profit:  `$${state.fp.totalPnL.toFixed(2)}`,
+    progress:        `${Math.min(100,(progress/tgtUSD*100)).toFixed(1)}%`,
+    today_pnl:       `$${todayPnL.toFixed(2)}`,
+    daily_dd_used:   `${(Math.abs(Math.min(todayPnL,0))/acct*100).toFixed(2)}% of ${CONFIG.FP_DAILY_DD_PCT}%`,
+    total_dd_used:   `${(Math.abs(Math.min(state.fp.totalPnL,0))/acct*100).toFixed(2)}% of ${CONFIG.FP_MAX_DD_PCT}%`,
+    daily_limit_rem: `$${(acct*CONFIG.FP_DAILY_DD_PCT/100 - Math.abs(Math.min(todayPnL,0))).toFixed(2)} remaining`,
+    trading_days:    Object.keys(state.fp.dailyPnL).length,
+    trades:          state.fp.tradesThisPhase,
+    daily_pnl_hist:  state.fp.dailyPnL,
+  });
+});
+
+// Update FP phase + risk settings live
+app.post('/api/fp', (req, res) => {
+  const { phase, riskPct, accountUsd, usdToInr } = req.body;
+  if (phase && [1, 2].includes(parseInt(phase))) {
+    state.fp.phase            = parseInt(phase);
+    state.fp.tradesThisPhase  = 0;
+    console.log(`[FP] Phase updated to ${phase}`);
+    tgSend(`🎯 *FundingPips Phase ${phase} Started*
+Target: ${phase === 1 ? CONFIG.FP_PHASE1_TARGET : CONFIG.FP_PHASE2_TARGET}% = $${(CONFIG.FP_ACCOUNT_USD * (phase === 1 ? CONFIG.FP_PHASE1_TARGET : CONFIG.FP_PHASE2_TARGET)/100).toFixed(0)}
+Risk: $${(CONFIG.FP_ACCOUNT_USD * CONFIG.FP_RISK_PCT / 100).toFixed(0)} per trade`);
+  }
+  if (riskPct)    CONFIG.FP_RISK_PCT    = parseFloat(riskPct);
+  if (accountUsd) CONFIG.FP_ACCOUNT_USD = parseFloat(accountUsd);
+  if (usdToInr)   CONFIG.USD_TO_INR     = parseFloat(usdToInr);
+  res.json({ ok: true, phase: state.fp.phase, riskPct: CONFIG.FP_RISK_PCT, accountUsd: CONFIG.FP_ACCOUNT_USD });
+});
+
 // Update account size for position sizing (no redeploy needed)
 app.post('/api/account', (req, res) => {
   const { size, riskPct } = req.body;
@@ -2947,7 +3185,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v10.1 — ICT/SMC ENGINE     ║
+║   HYBRID TRADING BOT v10.2 — ICT/SMC ENGINE     ║
 ║   14 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -2960,7 +3198,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.1 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.2 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 14 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
