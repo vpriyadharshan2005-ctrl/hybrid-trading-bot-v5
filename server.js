@@ -2115,16 +2115,16 @@ class Builder {
       if (isBuy) {
         if (m5last.close > m5last.open && m5body >= m5minBody && m5last.close > m5prev.close) {
           m5Confirmation = true;
-          m5EntryNote = `M5 momentum ✅ confirmed — Enter at M15 close: \`${entry}\``;
+          m5EntryNote = `M5 momentum ✅ confirmed — Enter at M15 close: ${entry}`;
         } else {
-          m5EntryNote = `M5 not yet confirmed — still enter at M15 close: \`${entry}\``;
+          m5EntryNote = `M5 not yet confirmed — still enter at M15 close: ${entry}`;
         }
       } else {
         if (m5last.close < m5last.open && m5body >= m5minBody && m5last.close < m5prev.close) {
           m5Confirmation = true;
-          m5EntryNote = `M5 momentum ✅ confirmed — Enter at M15 close: \`${entry}\``;
+          m5EntryNote = `M5 momentum ✅ confirmed — Enter at M15 close: ${entry}`;
         } else {
-          m5EntryNote = `M5 not yet confirmed — still enter at M15 close: \`${entry}\``;
+          m5EntryNote = `M5 not yet confirmed — still enter at M15 close: ${entry}`;
         }
       }
       // Entry price NEVER modified — always M15 candle close
@@ -2324,11 +2324,8 @@ class DeltaFetcher {
     const m15 = await this.fetchCandles(symbol, '15m', 2);
     if (!m15 || m15.length < 10) return cached || null; // fallback to stale
 
-    // Fetch H1 (7 days = 168 candles) — only if H1 cache stale
-    let h1 = cached?.h1 || null;
-    if (!h1 || Date.now() - cached.h1Time > this.ttlH1) {
-      h1 = await this.fetchCandles(symbol, '1h', 7);
-    }
+    // Fetch H1 (7 days = 168 candles) — always fetch fresh each MTF call
+    const h1 = await this.fetchCandles(symbol, '1h', 7);
 
     // H4 — fetch directly (Delta supports it)
     let h4 = await this.fetchCandles(symbol, '4h', 30);
@@ -2716,15 +2713,31 @@ const dataFetcher = new DataFetcher();
 //  SECTION 5 — TELEGRAM
 // ═════════════════════════════════════════════════════════════
 
-async function tgSend(text) {
+async function tgSend(text, parseMode = 'Markdown') {
   if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) return;
   try {
     await axios.post(
       `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
-      { chat_id: CONFIG.TELEGRAM_CHAT_ID, text, parse_mode: 'Markdown', disable_web_page_preview: true },
+      { chat_id: CONFIG.TELEGRAM_CHAT_ID, text, parse_mode: parseMode, disable_web_page_preview: true },
       { timeout: 10000 }
     );
-  } catch (e) { console.error('[TG] Send error:', e.message); }
+  } catch (e) {
+    console.error('[TG] Send error:', e.message);
+    // Retry as plain text (strips all formatting — always works)
+    if (parseMode !== 'none') {
+      try {
+        const plain = text
+          .replace(/[*_`]/g, '')       // strip Markdown chars
+          .replace(/<[^>]+>/g, '');    // strip HTML tags
+        await axios.post(
+          `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
+          { chat_id: CONFIG.TELEGRAM_CHAT_ID, text: plain, disable_web_page_preview: true },
+          { timeout: 10000 }
+        );
+        console.log('[TG] ✅ Sent (plain text fallback):', plain.slice(0, 60));
+      } catch (e2) { console.error('[TG] Plain text also failed:', e2.message); }
+    }
+  }
 }
 
 async function tgSignal(sig) {
@@ -2734,6 +2747,7 @@ async function tgSignal(sig) {
   const confirms = sig.confirmedBy.map(s => `  • ${s.name}`).join('\n');
   const exp = sig.expiresAt ? new Date(sig.expiresAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' }) : 'N/A';
 
+  const safeNum = v => v != null ? String(v).replace(/[_*`]/g,'') : 'N/A';
   const msg = `${em} *${sig.dir} — ${sig.symbol}*
 ━━━━━━━━━━━━━━━━━━━━
 📊 *${sig.name}* | ${sig.cat.toUpperCase()}
@@ -2744,18 +2758,19 @@ async function tgSignal(sig) {
 🌍 *Session:* ${sig.session} | KZ: ${sig.mtf.kz ? '✅' : '❌'}
 📍 *Zone:* ${pd} | H1 POI: ${sig.mtf.h1POI || 'none'}
 
-💰 *Entry:*  \`${sig.levels.entry}\` (${sig.entryTF})${sig.levels.sl}\`
-🎯 *TP1:*   \`${sig.levels.tp1}\`
-🎯 *TP2:*   \`${sig.levels.tp2}\`
-🎯 *TP3:*   \`${sig.levels.tp3}\`
+💰 *Entry:* ${safeNum(sig.levels.entry)} (M15${sig.m5Confirmed ? ' | M5 ✅' : ''})
+🛑 *SL:*    ${safeNum(sig.levels.sl)}
+🎯 *TP1:*   ${safeNum(sig.levels.tp1)}
+🎯 *TP2:*   ${safeNum(sig.levels.tp2)}
+🎯 *TP3:*   ${safeNum(sig.levels.tp3)}
 📐 *R:R:*   ${sig.levels.rr}
 💼 *Risk:*  ${sig.levels.riskLabel || 'N/A'} | Lots: ${sig.levels.lotSize || 'N/A'}
 💵 *TP1 profit:* ₹${sig.levels.profitTP1?.toLocaleString('en-IN') || 'N/A'} | *TP2:* ₹${sig.levels.profitTP2?.toLocaleString('en-IN') || 'N/A'}
-⏱ *Expires:* ${exp} IST | Setup: M15 | Entry: ${sig.entryTF} | SL: H1 struct
 
+⏱ *Expires:* ${exp} IST | Setup+Entry: M15 | SL: H1 struct
 📈 RSI: ${sig.indicators.rsi} | Vol: ${sig.indicators.vol.ratio}x | ATR: ${sig.indicators.atr}
 
-${sig.m5EntryNote ? `⚡ *M5 Entry:* ${sig.m5EntryNote}\n\n` : ''}✅ *Confirmed by:*
+${sig.m5EntryNote ? `⚡ *M5:* ${sig.m5EntryNote}\n` : ''}✅ *Confirmed by:*
 ${confirms}
 
 🔌 ${sig.source.toUpperCase()} | ${sig.candles} M15 candles
@@ -2781,14 +2796,14 @@ async function tgTPHit(sig, level) {
                : level === 'TP2' ? lvls.profitTP2
                : null;
   const profitStr = profit ? ` | +₹${profit.toLocaleString('en-IN')}` : '';
-  const nextTarget = level === 'TP1' ? `TP2: \`${lvls.tp2 || 'N/A'}\``
-                   : level === 'TP2' ? `TP3: \`${lvls.tp3 || 'N/A'}\``
+  const nextTarget = level === 'TP1' ? `TP2: ${lvls.tp2 || 'N/A'}`
+                   : level === 'TP2' ? `TP3: ${lvls.tp3 || 'N/A'}`
                    : 'Trade complete 🎯';
   const msg = `✅ *${level} HIT* — ${sig.dir} ${sig.symbol}${profitStr}
 ` +
     `Strategy: ${sig.strategy.name} | Quality: ${sig.quality}
 ` +
-    `${level}: \`${price}\` ✅
+    `${level}: ${price} ✅
 ` +
     `${nextTarget}
 ` +
@@ -2806,7 +2821,7 @@ async function tgExpiry(sig, reason) {
 ` +
       `Strategy: ${sig.strategy.name}
 ` +
-      `Entry: \`${sig.levels.entry}\` | SL: \`${sig.levels.sl}\`
+      `Entry: ${sig.levels.entry} | SL: ${sig.levels.sl}
 ` +
       `TP1 hit first: ${sig.tp1Hit ? '✅ Yes (break-even)' : '❌ No (full loss)'}`;
   } else if (reason === 'SL_BREAKEVEN') {
@@ -3125,9 +3140,9 @@ async function checkExpiry() {
           await tgSend(
             `🔒 *Break-Even SL Moved* — ${sig.dir} ${sig.symbol}
 ` +
-            `Old SL: \`${oldSL}\` → New SL: \`${lvls.entry}\` (entry)
+            `Old SL: ${oldSL} → New SL: ${lvls.entry} (entry)
 ` +
-            `Position is now risk-free. TP2: \`${lvls.tp2 || 'N/A'}\``
+            `Position is now risk-free. TP2: ${lvls.tp2 || 'N/A'}`
           );
           console.log(`[BE] ${sig.symbol}: SL moved to entry ${lvls.entry} after TP1 hit`);
         }
@@ -3148,7 +3163,7 @@ async function checkExpiry() {
           await tgSend(
             `🔒 *SL Moved to TP1* — ${sig.dir} ${sig.symbol}
 ` +
-            `SL: \`${lvls.tp1}\` | Targeting TP3: \`${lvls.tp3 || 'N/A'}\``
+            `SL: ${lvls.tp1} | Targeting TP3: ${lvls.tp3 || 'N/A'}`
           );
         }
         continue;
@@ -3349,9 +3364,9 @@ async function checkSMT() {
         `→ Institutional ${bearSMT ? 'distribution' : 'accumulation'} signal
 
 ` +
-        `Entry: \`${smtSig.levels.entry}\` | SL: \`${smtSig.levels.sl}\`
+        `Entry: ${smtSig.levels.entry} | SL: ${smtSig.levels.sl}
 ` +
-        `TP1: \`${smtSig.levels.tp1}\` | TP2: \`${smtSig.levels.tp2}\`
+        `TP1: ${smtSig.levels.tp1} | TP2: ${smtSig.levels.tp2}
 ` +
         `Quality: 85/100 | WR: 70-78% | Single-strategy signal`
       );
@@ -3491,7 +3506,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v10.3 — ICT/SMC Engine',
-  version: '10.3.4',
+  version: '10.3.5',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -3502,7 +3517,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.3.4',
+    status: 'OK', version: '10.3.5',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -3750,8 +3765,8 @@ app.post('/tg/webhook', async (req, res) => {
       }
       const lines = active.map(s =>
         `${s.dir === 'BUY' ? '🟢' : '🔴'} *${s.symbol}* ${s.dir} | Q:${s.quality}\n` +
-        `Entry: \`${s.levels.entry}\` | SL: \`${s.levels.sl}\`\n` +
-        `TP1: \`${s.levels.tp1}\` ${s.tp1Hit ? '✅' : ''} TP2: \`${s.levels.tp2}\` ${s.tp2Hit ? '✅' : ''}\n` +
+        `Entry: ${s.levels.entry} | SL: ${s.levels.sl}\n` +
+        `TP1: ${s.levels.tp1} ${s.tp1Hit ? '✅' : ''} TP2: ${s.levels.tp2} ${s.tp2Hit ? '✅' : ''}\n` +
         `${s.strategy.name}`
       ).join('\n─\n');
       await tgSend(`📊 *Active Signals (${active.length})*\n\n${lines}`);
@@ -3872,7 +3887,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v10.3.4 — ICT/SMC ENGINE   ║
+║  HYBRID TRADING BOT v10.3.5 — ICT/SMC ENGINE   ║
 ║   16 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -3887,7 +3902,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Forex:9 · Commodity:2 · Cr
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.3.4 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.3.5 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 16 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
