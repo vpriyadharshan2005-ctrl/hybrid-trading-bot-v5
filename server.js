@@ -30,6 +30,8 @@ const CONFIG = {
   COOLDOWN_MIN:       45,    // minutes between signals per symbol
   FLIP_BLOCK_MIN:     120,   // minutes before direction can flip
   EXPIRY_MIN:         20,    // signal expires after 20 min (next M15 candle)
+  ACCOUNT_SIZE:       parseFloat(process.env.ACCOUNT_SIZE || '100000'), // ₹1L default
+  RISK_PER_TRADE:     parseFloat(process.env.RISK_PCT     || '1'),      // 1% risk per trade
 };
 
 // ── Symbols ───────────────────────────────────────────────────
@@ -1396,6 +1398,18 @@ class Builder {
     const rr     = risk > 0 ? `1:${(reward / risk).toFixed(1)}` : 'N/A';
     lvls.rr      = rr;
 
+    // ── Position sizing ───────────────────────────────────────────────────────
+    const riskAmt  = CONFIG.ACCOUNT_SIZE * (CONFIG.RISK_PER_TRADE / 100);
+    const riskUnit = lvls.entry && lvls.sl ? Math.abs(lvls.entry - lvls.sl) : null;
+    const dec2     = Ind.dec(lvls.entry || 1);
+    lvls.riskAmount  = Math.round(riskAmt);
+    lvls.riskPerUnit = riskUnit ? Ind.fmt(riskUnit, dec2) : null;
+    lvls.lotSize     = riskUnit && riskUnit > 0 ? Math.floor(riskAmt / riskUnit) : null;
+    lvls.profitTP1   = lvls.lotSize && lvls.tp1 && lvls.entry
+      ? Math.round(lvls.lotSize * Math.abs(lvls.tp1 - lvls.entry)) : null;
+    lvls.profitTP2   = lvls.lotSize && lvls.tp2 && lvls.entry
+      ? Math.round(lvls.lotSize * Math.abs(lvls.tp2 - lvls.entry)) : null;
+
     return {
       id:          `${symbol}_${Date.now()}`,
       symbol,
@@ -1434,6 +1448,11 @@ class Builder {
       expiresAt: new Date(Date.now() + CONFIG.EXPIRY_MIN * 60000).toISOString(),
       expired:   false,
       slHit:     false,
+      tp1Hit:    false,
+      tp2Hit:    false,
+      tp3Hit:    false,
+      beMoveDone:false,   // break-even SL move done
+      slMoved:   false,   // SL has been moved to break-even
     };
   }
 
@@ -2426,6 +2445,8 @@ async function tgSignal(sig) {
 🎯 *TP2:*   \`${sig.levels.tp2}\`
 🎯 *TP3:*   \`${sig.levels.tp3}\`
 📐 *R:R:*   ${sig.levels.rr}
+💼 *Risk:*  ₹${sig.levels.riskAmount?.toLocaleString('en-IN') || 'N/A'} | Lots: ${sig.levels.lotSize || 'N/A'}
+💵 *TP1 profit:* ₹${sig.levels.profitTP1?.toLocaleString('en-IN') || 'N/A'} | *TP2:* ₹${sig.levels.profitTP2?.toLocaleString('en-IN') || 'N/A'}
 ⏱ *Expires:* ${exp} IST | Setup: M15 | Entry: ${sig.entryTF} | SL: H1 struct
 
 📈 RSI: ${sig.indicators.rsi} | Vol: ${sig.indicators.vol.ratio}x | ATR: ${sig.indicators.atr}
@@ -2449,11 +2470,69 @@ async function tgClosed(cat, symbol) {
   // The cycle summary handles this.
 }
 
+async function tgTPHit(sig, level) {
+  const lvls   = sig.levels;
+  const price  = lvls[level.toLowerCase()];
+  const profit = level === 'TP1' ? lvls.profitTP1
+               : level === 'TP2' ? lvls.profitTP2
+               : null;
+  const profitStr = profit ? ` | +₹${profit.toLocaleString('en-IN')}` : '';
+  const nextTarget = level === 'TP1' ? `TP2: \`${lvls.tp2 || 'N/A'}\``
+                   : level === 'TP2' ? `TP3: \`${lvls.tp3 || 'N/A'}\``
+                   : 'Trade complete 🎯';
+  const msg = `✅ *${level} HIT* — ${sig.dir} ${sig.symbol}${profitStr}
+` +
+    `Strategy: ${sig.strategy.name} | Quality: ${sig.quality}
+` +
+    `${level}: \`${price}\` ✅
+` +
+    `${nextTarget}
+` +
+    `${level === 'TP1' ? '🔒 SL moved to break-even (entry)' : ''}`;
+  await tgSend(msg);
+  console.log(`[TP] ✅ ${level} hit: ${sig.dir} ${sig.symbol} | ${price}${profitStr}`);
+}
+
 async function tgExpiry(sig, reason) {
-  const em  = reason === 'SL_HIT' ? '❌' : '⏱';
-  const msg = reason === 'SL_HIT'
-    ? `${em} *SL HIT* — ${sig.dir} ${sig.symbol}\nStrategy: ${sig.strategy.name}\nSL: \`${sig.levels.sl}\``
-    : `${em} *EXPIRED* — ${sig.dir} ${sig.symbol} (${sig.strategy.name})\nNo TP hit in ${CONFIG.EXPIRY_MIN} min.`;
+  let em, msg;
+  if (reason === 'SL_HIT') {
+    em  = '❌';
+    msg = `${em} *SL HIT* — ${sig.dir} ${sig.symbol}
+` +
+      `Strategy: ${sig.strategy.name}
+` +
+      `Entry: \`${sig.levels.entry}\` | SL: \`${sig.levels.sl}\`
+` +
+      `TP1 hit first: ${sig.tp1Hit ? '✅ Yes (break-even)' : '❌ No (full loss)'}`;
+  } else if (reason === 'SL_BREAKEVEN') {
+    em  = '🔒';
+    msg = `${em} *SL Hit at Break-Even* — ${sig.dir} ${sig.symbol}
+` +
+      `TP1 ✅ was hit. Closed at entry = zero loss.
+` +
+      `Strategy: ${sig.strategy.name}`;
+  } else if (reason === 'SL_AT_TP1') {
+    em  = '💰';
+    msg = `${em} *Closed with Profit* — ${sig.dir} ${sig.symbol}
+` +
+      `TP1 ✅ + TP2 ✅ hit. Closed at TP1 level.
+` +
+      `Strategy: ${sig.strategy.name}`;
+  } else if (reason === 'TP3') {
+    em  = '🏆';
+    msg = `${em} *FULL TARGET HIT* — ${sig.dir} ${sig.symbol}
+` +
+      `All 3 TPs hit! TP1 ✅ TP2 ✅ TP3 ✅
+` +
+      `Strategy: ${sig.strategy.name}`;
+  } else {
+    em  = '⏱';
+    msg = `${em} *EXPIRED* — ${sig.dir} ${sig.symbol} (${sig.strategy.name})
+` +
+      `No TP hit in ${CONFIG.EXPIRY_MIN} min.
+` +
+      `${sig.tp1Hit ? 'TP1 ✅' : ''} ${sig.tp2Hit ? 'TP2 ✅' : ''}`.trim();
+  }
   await tgSend(msg);
 }
 
@@ -2525,21 +2604,99 @@ const state = {
 
 async function checkExpiry() {
   const active = state.signals.filter(s => !s.expired && !s.slHit);
+
   for (const sig of active) {
-    // Time expiry
+    // ── Get current price ─────────────────────────────────────────────────
+    const mtf = dataFetcher.mtfCache[`${sig.symbol}_mtf`];
+    if (!mtf?.data?.m15?.length) {
+      // Time expiry fallback when no price data
+      if (new Date(sig.expiresAt) < new Date()) {
+        sig.expired = true;
+        await tgExpiry(sig, 'EXPIRED');
+      }
+      continue;
+    }
+    const price = mtf.data.m15[mtf.data.m15.length - 1].close;
+    const isBuy = sig.dir === 'BUY';
+    const lvls  = sig.levels;
+
+    // ── TP1 hit detection ─────────────────────────────────────────────────
+    if (!sig.tp1Hit && lvls.tp1) {
+      const tp1Hit = isBuy ? price >= lvls.tp1 : price <= lvls.tp1;
+      if (tp1Hit) {
+        sig.tp1Hit = true;
+        state.stats.tp1Hits = (state.stats.tp1Hits || 0) + 1;
+        await tgTPHit(sig, 'TP1');
+
+        // ── Break-even SL move ─────────────────────────────────────────
+        // After TP1 hit: move SL to entry price (no-loss position)
+        if (!sig.beMoveDone && lvls.entry) {
+          const oldSL = lvls.sl;
+          lvls.sl        = lvls.entry;  // SL moved to entry = break-even
+          sig.beMoveDone = true;
+          sig.slMoved    = true;
+          await tgSend(
+            `🔒 *Break-Even SL Moved* — ${sig.dir} ${sig.symbol}
+` +
+            `Old SL: \`${oldSL}\` → New SL: \`${lvls.entry}\` (entry)
+` +
+            `Position is now risk-free. TP2: \`${lvls.tp2 || 'N/A'}\``
+          );
+          console.log(`[BE] ${sig.symbol}: SL moved to entry ${lvls.entry} after TP1 hit`);
+        }
+        continue;
+      }
+    }
+
+    // ── TP2 hit detection ─────────────────────────────────────────────────
+    if (sig.tp1Hit && !sig.tp2Hit && lvls.tp2) {
+      const tp2Hit = isBuy ? price >= lvls.tp2 : price <= lvls.tp2;
+      if (tp2Hit) {
+        sig.tp2Hit = true;
+        state.stats.tp2Hits = (state.stats.tp2Hits || 0) + 1;
+        await tgTPHit(sig, 'TP2');
+        // Move SL to TP1 level (lock in partial profit)
+        if (lvls.tp1) {
+          lvls.sl = lvls.tp1;
+          await tgSend(
+            `🔒 *SL Moved to TP1* — ${sig.dir} ${sig.symbol}
+` +
+            `SL: \`${lvls.tp1}\` | Targeting TP3: \`${lvls.tp3 || 'N/A'}\``
+          );
+        }
+        continue;
+      }
+    }
+
+    // ── TP3 hit detection ─────────────────────────────────────────────────
+    if (sig.tp2Hit && !sig.tp3Hit && lvls.tp3) {
+      const tp3Hit = isBuy ? price >= lvls.tp3 : price <= lvls.tp3;
+      if (tp3Hit) {
+        sig.tp3Hit = true;
+        sig.expired = true; // trade complete
+        state.stats.tp3Hits = (state.stats.tp3Hits || 0) + 1;
+        await tgTPHit(sig, 'TP3');
+        continue;
+      }
+    }
+
+    // ── SL hit detection ──────────────────────────────────────────────────
+    if (lvls.sl) {
+      const slHit = isBuy ? price <= lvls.sl : price >= lvls.sl;
+      if (slHit) {
+        sig.slHit = true;
+        // Distinguish: SL hit before TP1 (full loss) vs after TP1 (break-even or profit)
+        const outcome = sig.tp2Hit ? 'SL_AT_TP1' : sig.tp1Hit ? 'SL_BREAKEVEN' : 'SL_HIT';
+        state.stats.slHits = (state.stats.slHits || 0) + 1;
+        await tgExpiry(sig, outcome);
+        continue;
+      }
+    }
+
+    // ── Time expiry (no TP hit, no SL hit within 20 min) ─────────────────
     if (new Date(sig.expiresAt) < new Date()) {
       sig.expired = true;
       await tgExpiry(sig, 'EXPIRED');
-      continue;
-    }
-    // SL check
-    const mtf = dataFetcher.mtfCache[`${sig.symbol}_mtf`];
-    if (!mtf?.data?.m15?.length || !sig.levels?.sl) continue;
-    const price = mtf.data.m15[mtf.data.m15.length - 1].close;
-    const slHit = sig.dir === 'BUY' ? price <= sig.levels.sl : price >= sig.levels.sl;
-    if (slHit) {
-      sig.slHit = true;
-      await tgExpiry(sig, 'SL_HIT');
     }
   }
 }
@@ -2630,7 +2787,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '10.0.0',
+  version: '10.1.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -2641,7 +2798,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.0.0',
+    status: 'OK', version: '10.1.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -2658,6 +2815,14 @@ app.get('/api/health', (req, res) => {
       twelvedata: CONFIG.TWELVE_DATA_KEY  ? '✅ fallback forex/gold' : '⚠️  key missing',
       delta:     '✅ crypto primary (real M15)',
       coingecko: '✅ crypto fallback (auto if Delta fails)',
+      outcomes: {
+        tp1Hits: state.stats.tp1Hits || 0,
+        tp2Hits: state.stats.tp2Hits || 0,
+        tp3Hits: state.stats.tp3Hits || 0,
+        slHits:  state.stats.slHits  || 0,
+      },
+      accountSize:   `₹${CONFIG.ACCOUNT_SIZE.toLocaleString('en-IN')}`,
+      riskPerTrade:  `₹${(CONFIG.ACCOUNT_SIZE * CONFIG.RISK_PER_TRADE / 100).toLocaleString('en-IN')} (${CONFIG.RISK_PER_TRADE}%)`,
       dhan: dhanToken.accessToken === 'placeholder' ? '⏳ no token — POST /api/dhan/token' :
                dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 86400000 ? '❌ token expired — refresh now' :
                dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 72000000 ? '⚠️  token expiring soon' : '✅ active',
@@ -2716,11 +2881,33 @@ app.get('/api/stats',            (req, res) => {
     byCategory: byCat, byStrategy: byStrat,
     BUY:  state.signals.filter(s => s.dir === 'BUY').length,
     SELL: state.signals.filter(s => s.dir === 'SELL').length,
+    outcomes: {
+      tp1Hits:  state.stats.tp1Hits  || 0,
+      tp2Hits:  state.stats.tp2Hits  || 0,
+      tp3Hits:  state.stats.tp3Hits  || 0,
+      slHits:   state.stats.slHits   || 0,
+      winRate:  (() => {
+        const wins = (state.stats.tp1Hits || 0);
+        const total = wins + (state.stats.slHits || 0);
+        return total > 0 ? `${Math.round(wins/total*100)}%` : 'N/A';
+      })(),
+    },
     lastCycle: state.lastCycle,
   });
 });
 
 // Live Dhan token update — no redeploy needed
+// Update account size for position sizing (no redeploy needed)
+app.post('/api/account', (req, res) => {
+  const { size, riskPct } = req.body;
+  if (!size || isNaN(size)) return res.status(400).json({ error: 'Provide size (number)' });
+  CONFIG.ACCOUNT_SIZE  = parseFloat(size);
+  if (riskPct) CONFIG.RISK_PER_TRADE = parseFloat(riskPct);
+  console.log(`[Account] Updated: ₹${CONFIG.ACCOUNT_SIZE.toLocaleString('en-IN')} | Risk: ${CONFIG.RISK_PER_TRADE}%`);
+  res.json({ ok: true, accountSize: CONFIG.ACCOUNT_SIZE, riskPct: CONFIG.RISK_PER_TRADE,
+    riskPerTrade: `₹${(CONFIG.ACCOUNT_SIZE * CONFIG.RISK_PER_TRADE / 100).toLocaleString('en-IN')}` });
+});
+
 app.post('/api/dhan/token', (req, res) => {
   const { clientId, accessToken } = req.body;
   if (!clientId || !accessToken) return res.status(400).json({ error: 'Provide clientId + accessToken' });
@@ -2760,7 +2947,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v10.0 — ICT/SMC ENGINE     ║
+║   HYBRID TRADING BOT v10.1 — ICT/SMC ENGINE     ║
 ║   14 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -2773,7 +2960,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.0 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.1 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 14 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
