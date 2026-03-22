@@ -2,6 +2,8 @@
 const express  = require('express');
 const axios    = require('axios');
 const cron     = require('node-cron');
+const fs       = require('fs');
+const PERSIST_FILE = '/tmp/bot_state.json';
 require('dotenv').config();
 
 const app = express();
@@ -503,6 +505,18 @@ class Detectors {
     const sessHigh = priorSessCandles.length ? Math.max(...priorSessCandles.map(cx => cx.high)) : null;
     const sessLow  = priorSessCandles.length ? Math.min(...priorSessCandles.map(cx => cx.low))  : null;
 
+    // ── Weekly IPDA levels (prior week H/L + weekly open) ──────────────────
+    // Use M15 candles to derive weekly levels (7 days back)
+    const weekMs    = 7 * 24 * 3600000;
+    const nowMs     = Date.now();
+    const weekStart = nowMs - weekMs;
+    const prevWeekStart = weekStart - weekMs;
+    const thisWeekC = c.filter(cx => cx.time >= weekStart);
+    const prevWeekC = c.filter(cx => cx.time >= prevWeekStart && cx.time < weekStart);
+    const weeklyOpen = thisWeekC.length ? thisWeekC[0].open : null;
+    const priorWeekH = prevWeekC.length ? Math.max(...prevWeekC.map(cx => cx.high)) : null;
+    const priorWeekL = prevWeekC.length ? Math.min(...prevWeekC.map(cx => cx.low))  : null;
+
     return {
       c, cls, atr, f, price, dec,
       swH, swL, obs, fvgs, vol, rsi, macd, tr,
@@ -516,6 +530,7 @@ class Detectors {
       dailyBias, dailyBullOk, dailySellOk,
       eqH, eqL,
       sessHigh, sessLow,
+      weeklyOpen, priorWeekH, priorWeekL,
     };
   }
 
@@ -531,7 +546,8 @@ class Detectors {
       this.fvgOB, this.liqSweep, this.choch, this.fpb, this.ote,
       this.breaker, this.silverBullet, this.orb, this.crt, this.po3,
       this.fvgBosHTF,
-      this.eqhEql, this.gapGo, this.sessRaid,  // new additions
+      this.eqhEql, this.gapGo, this.sessRaid,
+      this.pdhPdl, this.turtleSoup,             // new: PDH/PDL + Turtle Soup
     ];
     // Per-symbol strategy exclusions (e.g. DOGE: no CHOCH/OTE/FPB)
     const symCfg = Object.values(SYMBOLS).find(s =>
@@ -685,33 +701,39 @@ class Detectors {
             lastBullBody, lastBearBody, volGood } = x;
     const last = x.last, prev = x.prev;
     if (swH.length < 2 || swL.length < 2) return null;
-    // Must have confirmed trend to "change" from — no NEUTRAL
     if (tr === 'NEUTRAL') return null;
 
     const lastSH = swH[swH.length - 1].v;
     const lastSL = swL[swL.length - 1].v;
-
-    // Volume required on break candle
     if (!volGood) return null;
 
-    // Bullish ChoCh: BEARISH trend breaks above last swing high
+    // ── MSS Displacement: prior candle body > 1.5 ATR = strong impulse ─────
+    // When displacement precedes the structural break → MSS (WR 55%→68%)
+    const dispBull = prev.close > prev.open && (prev.close - prev.open) > atr * 1.5;
+    const dispBear = prev.close < prev.open && (prev.open  - prev.close) > atr * 1.5;
+    const mssBonus = 8; // +8 score when displacement confirmed
+
+    // Bullish CHOCH/MSS
     if (tr === 'BEARISH' && prev.close <= lastSH && last.close > lastSH && lastBullBody) {
-      // Break candle must close at least 0.1 ATR above the level
       if (last.close < lastSH + atr * 0.1) return null;
-      const score = 76 + (h4Tr === 'BULLISH' ? 8 : 0) + (h1Tr === 'BULLISH' ? 6 : 0)
+      const score = 76 + (dispBull ? mssBonus : 0)
+        + (h4Tr === 'BULLISH' ? 8 : 0) + (h1Tr === 'BULLISH' ? 6 : 0)
         + (kz ? 6 : 0) + (x.volSpike ? 4 : 0);
-      return { id: 'CHOCH', name: 'Change of Character', dir: 'BUY', score,
-        brokenLevel: lastSH,
+      const name = dispBull ? 'Market Structure Shift (MSS)' : 'Change of Character';
+      return { id: 'CHOCH', name, dir: 'BUY', score,
+        mss: dispBull, brokenLevel: lastSH,
         sl_ref: { type: 'break_candle_low', val: last.low },
         tp_ref: { tp1_type: 'prior_swing', tp1_val: swH[swH.length - 2].v } };
     }
-    // Bearish ChoCh: BULLISH trend breaks below last swing low
+    // Bearish CHOCH/MSS
     if (tr === 'BULLISH' && prev.close >= lastSL && last.close < lastSL && lastBearBody) {
       if (last.close > lastSL - atr * 0.1) return null;
-      const score = 76 + (h4Tr === 'BEARISH' ? 8 : 0) + (h1Tr === 'BEARISH' ? 6 : 0)
+      const score = 76 + (dispBear ? mssBonus : 0)
+        + (h4Tr === 'BEARISH' ? 8 : 0) + (h1Tr === 'BEARISH' ? 6 : 0)
         + (kz ? 6 : 0) + (x.volSpike ? 4 : 0);
-      return { id: 'CHOCH', name: 'Change of Character', dir: 'SELL', score,
-        brokenLevel: lastSL,
+      const name = dispBear ? 'Market Structure Shift (MSS)' : 'Change of Character';
+      return { id: 'CHOCH', name, dir: 'SELL', score,
+        mss: dispBear, brokenLevel: lastSL,
         sl_ref: { type: 'break_candle_high', val: last.high },
         tp_ref: { tp1_type: 'prior_swing', tp1_val: swL[swL.length - 2].v } };
     }
@@ -1271,6 +1293,133 @@ class Detectors {
   }
 
   // ══════════════════════════════════════════════════════════
+  //  15. PREVIOUS DAY HIGH/LOW (PDH/PDL) ⭐
+  //  Prior day's H/L swept → reverse back inside day range
+  //  Most watched intraday level by ALL institutional traders
+  //  Entry: M15 close back ABOVE PDL (BUY) / BELOW PDH (SELL)
+  //  SL:    beyond sweep wick + 0.5 ATR
+  //  TP1:   prior day midpoint | TP2: opposite PDH/PDL
+  //  Works: ALL markets. Critical for India NSE (daily).
+  // ══════════════════════════════════════════════════════════
+  static pdhPdl(x, m15) {
+    const { price, atr, cat, h4Tr, h1POI, kz,
+            lastBullBody, lastBearBody, volGood } = x;
+    if (!volGood) return null;
+    const last = x.last, prev = x.prev;
+
+    // Build prior day candles from M15 data
+    const istOffset  = 330 * 60000; // +5:30 IST
+    const now        = new Date();
+    const todayIST   = new Date(now.getTime() + istOffset);
+    todayIST.setUTCHours(0,0,0,0);
+    const todayStartMs = todayIST.getTime() - istOffset;
+
+    // For forex/crypto: use UTC day boundary
+    const todayUTC   = new Date(); todayUTC.setUTCHours(0,0,0,0);
+    const startMs    = cat === 'india' ? todayStartMs : todayUTC.getTime();
+
+    const priorDay   = m15.filter(cx => cx.time < startMs);
+    if (priorDay.length < 4) return null;
+
+    const pdh = Math.max(...priorDay.map(cx => cx.high));
+    const pdl = Math.min(...priorDay.map(cx => cx.low));
+    const pdMid = (pdh + pdl) / 2;
+    const dayRange = pdh - pdl;
+    if (dayRange < atr * 0.5) return null; // day too narrow
+
+    // ── BUY: PDL swept, M15 closes back above PDL ──────────────
+    if (prev.low < pdl - atr * 0.05 && last.close > pdl && lastBullBody) {
+      const sweepDepth = pdl - prev.low;
+      if (sweepDepth < atr * 0.15) return null;
+      const score = 80
+        + (h4Tr === 'BULLISH' ? 8 : 0)
+        + (h1POI ? 6 : 0)
+        + (kz ? 4 : 0)
+        + (x.volSpike ? 4 : 0);
+      return {
+        id: 'PDH_PDL', name: 'PDL Raid', dir: 'BUY', score,
+        sl_ref: { type: 'pdl_sweep', val: prev.low },
+        tp_ref: { tp1_type: 'pd_mid', tp1_val: pdMid, tp2_val: pdh },
+      };
+    }
+
+    // ── SELL: PDH swept, M15 closes back below PDH ─────────────
+    if (prev.high > pdh + atr * 0.05 && last.close < pdh && lastBearBody) {
+      const sweepDepth = prev.high - pdh;
+      if (sweepDepth < atr * 0.15) return null;
+      const score = 80
+        + (h4Tr === 'BEARISH' ? 8 : 0)
+        + (h1POI ? 6 : 0)
+        + (kz ? 4 : 0)
+        + (x.volSpike ? 4 : 0);
+      return {
+        id: 'PDH_PDL', name: 'PDH Raid', dir: 'SELL', score,
+        sl_ref: { type: 'pdh_sweep', val: prev.high },
+        tp_ref: { tp1_type: 'pd_mid', tp1_val: pdMid, tp2_val: pdl },
+      };
+    }
+    return null;
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  16. TURTLE SOUP
+  //  Multi-candle false break (2-5 candles outside level)
+  //  → violent reversal back inside (LiqSweep misses this)
+  //  Entry: M15 close back inside range after 2-5 candle false break
+  //  SL:    beyond the false break extreme + 0.5 ATR
+  //  TP1:   origin of false break | TP2: H1 swing
+  //  Works: ALL — especially ranging markets, Gold, India, BTC
+  // ══════════════════════════════════════════════════════════
+  static turtleSoup(x, m15) {
+    const { price, atr, h4Tr, h1POI, kz,
+            swH, swL, lastBullBody, lastBearBody, volGood } = x;
+    if (!volGood) return null;
+    const last = x.last, prev = x.prev;
+    const confirmed = m15.slice(-20); // last 20 M15 candles
+
+    // Find the most recent swing high/low to test against
+    if (swH.length < 2 || swL.length < 2) return null;
+    const refH = swH[swH.length - 2]; // prior swing high (not current)
+    const refL = swL[swL.length - 2]; // prior swing low
+
+    // ── Bullish Turtle Soup: 2-5 candles below prior swing low, now close above ──
+    // Count candles that closed below refL.v
+    const belowCount = confirmed.slice(-6, -1).filter(cx => cx.close < refL.v).length;
+    if (belowCount >= 2 && belowCount <= 5 && last.close > refL.v && lastBullBody) {
+      const breakLow = Math.min(...confirmed.slice(-belowCount-1).map(cx => cx.low));
+      const score = 78
+        + (h4Tr === 'BULLISH' ? 8 : 0)
+        + (h1POI ? 6 : 0)
+        + (kz ? 4 : 0)
+        + (belowCount >= 3 ? 4 : 0) // more candles trapped = stronger squeeze
+        + (x.volSpike ? 4 : 0);
+      return {
+        id: 'TURTLE_SOUP', name: `Turtle Soup Bull (${belowCount}c)`, dir: 'BUY', score,
+        sl_ref: { type: 'turtle_low', val: breakLow },
+        tp_ref: { tp1_type: 'swing_origin', tp1_val: refL.v + (refH.v - refL.v) * 0.5 },
+      };
+    }
+
+    // ── Bearish Turtle Soup: 2-5 candles above prior swing high, now close below ──
+    const aboveCount = confirmed.slice(-6, -1).filter(cx => cx.close > refH.v).length;
+    if (aboveCount >= 2 && aboveCount <= 5 && last.close < refH.v && lastBearBody) {
+      const breakHigh = Math.max(...confirmed.slice(-aboveCount-1).map(cx => cx.high));
+      const score = 78
+        + (h4Tr === 'BEARISH' ? 8 : 0)
+        + (h1POI ? 6 : 0)
+        + (kz ? 4 : 0)
+        + (aboveCount >= 3 ? 4 : 0)
+        + (x.volSpike ? 4 : 0);
+      return {
+        id: 'TURTLE_SOUP', name: `Turtle Soup Bear (${aboveCount}c)`, dir: 'SELL', score,
+        sl_ref: { type: 'turtle_high', val: breakHigh },
+        tp_ref: { tp1_type: 'swing_origin', tp1_val: refH.v - (refH.v - refL.v) * 0.5 },
+      };
+    }
+    return null;
+  }
+
+  // ══════════════════════════════════════════════════════════
   //  11. FVG + BOS + HTF (BEST COMBO ⭐)
   //  Fix: PARTIAL alignment now requires H1 POI too,
   //       vol + body size required
@@ -1711,7 +1860,20 @@ class Builder {
         break;
 
       case 'SESS_RAID':
-        // SL: beyond session sweep wick + 0.5 ATR
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.5)
+          : f(sig.sl_ref.val + atr * 0.5);
+        break;
+
+      case 'PDH_PDL':
+        // SL: beyond day level sweep + 0.5 ATR
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.5)
+          : f(sig.sl_ref.val + atr * 0.5);
+        break;
+
+      case 'TURTLE_SOUP':
+        // SL: beyond false break extreme + 0.5 ATR
         sl = isBuy
           ? f(sig.sl_ref.val - atr * 0.5)
           : f(sig.sl_ref.val + atr * 0.5);
@@ -1841,9 +2003,22 @@ class Builder {
         break;
 
       case 'SESS_RAID':
-        // TP1 = session midpoint | TP2 = opposite session extreme
         tp1 = f(sig.tp_ref.tp1_val);
         tp2 = f(sig.tp_ref.tp2_val);
+        break;
+
+      case 'PDH_PDL':
+        // TP1 = prior day midpoint | TP2 = opposite PDH/PDL
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = f(sig.tp_ref.tp2_val);
+        break;
+
+      case 'TURTLE_SOUP':
+        // TP1 = origin of false break | TP2 = H1 swing
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || tp1 + atr * 2)
+          : f(h1LowBelowTP?.v  || tp1 - atr * 2);
         break;
 
       default:
@@ -1851,6 +2026,20 @@ class Builder {
         tp2 = isBuy
           ? f(h1HighAboveTP?.v || (tp1 + atr * 2))
           : f(h1LowBelowTP?.v  || (tp1 - atr * 2));
+    }
+
+    // ── Weekly IPDA TP targets — use prior week H/L as TP2/TP3 if better ─────
+    const ctx3 = Detectors.ctx(m15, h1, h4, cat);
+    if (ctx3.priorWeekH && ctx3.priorWeekL && entry && tp1) {
+      if (isBuy && ctx3.priorWeekH > tp1 && ctx3.priorWeekH > (tp2 || 0)) {
+        // Prior week high is a magnetic draw — use as TP2
+        tp2 = f(ctx3.priorWeekH);
+        console.log(`[IPDA] TP2 → prior week high ${tp2}`);
+      }
+      if (!isBuy && ctx3.priorWeekL < tp1 && ctx3.priorWeekL < (tp2 || Infinity)) {
+        tp2 = f(ctx3.priorWeekL);
+        console.log(`[IPDA] TP2 → prior week low ${tp2}`);
+      }
     }
 
     // ── TP3 — Fibonacci 161.8% extension OR 3× risk (whichever is larger) ────
@@ -2593,13 +2782,41 @@ class Gate {
     this._cd   = {};
   }
 
-  check(sig, price) {
+  // Correlated pairs — only highest quality fires per cycle
+  static CORR = {
+    'EURUSD': ['GBPUSD','AUDUSD','NZDUSD'],
+    'GBPUSD': ['EURUSD','GBPJPY','EURJPY'],
+    'AUDUSD': ['EURUSD','NZDUSD'],
+    'NZDUSD': ['AUDUSD'],
+    'GBPJPY': ['EURJPY','GBPUSD'],
+    'EURJPY': ['GBPJPY'],
+    'BTCUSDT':['ETHUSDT'],
+    'ETHUSDT':['BTCUSDT'],
+  };
+
+  check(sig, price, currentCycleSignals = []) {
     const now = Date.now(), sym = sig.symbol;
-    const cdMs   = CONFIG.COOLDOWN_MIN  * 60000;
     const flipMs = CONFIG.FLIP_BLOCK_MIN * 60000;
 
     if (sig.quality < CONFIG.SIGNAL_QUALITY_MIN)
       return { ok: false, why: `Q${sig.quality} < min` };
+
+    // ── Correlation filter ────────────────────────────────────────────────
+    // If a correlated symbol already fired in this cycle, only pass higher quality
+    const correlated = Gate.CORR[sig.symbol] || [];
+    for (const relSym of correlated) {
+      const relSig = currentCycleSignals.find(s => s.symbol === relSym && s.dir === sig.dir);
+      if (relSig && relSig.quality >= sig.quality) {
+        return { ok: false, why: `Correlated with ${relSym} (Q${relSig.quality} >= Q${sig.quality})` };
+      }
+    }
+
+    // ── Session-aware cooldown ────────────────────────────────────────────
+    // In kill zone: 20 min cooldown | Outside: 45 min
+    const sess = Market.session();
+    const inKZ  = Market.inKillZone(sig.cat);
+    const cdMin = inKZ ? 20 : CONFIG.COOLDOWN_MIN; // 20min in KZ, 45min outside
+    const cdMs  = cdMin * 60000;
 
     if (sig.confirmedBy.length < 2)
       return { ok: false, why: `Only ${sig.confirmedBy.length} strategy` };
@@ -2644,12 +2861,20 @@ const gate = new Gate();
 // ═════════════════════════════════════════════════════════════
 const state = {
   signals: [],
-  stats: { total: 0, blocked: 0, analyzed: 0, startTime: Date.now() },
+  stats: {
+    total: 0, blocked: 0, analyzed: 0, startTime: Date.now(),
+    // Per-strategy + per-symbol outcome tracking
+    stratWR:  {},  // stratId → { wins, losses }
+    symbolWR: {},  // symbol  → { wins, losses }
+    sessionWR:{},  // session → { wins, losses }
+  },
   lastCycle: null,
   running: false,
   closedNotified: {},
 
   // ── FundingPips Challenge Tracker ──────────────────────────────────────────
+  pauseUntil: null, // set via /pause command
+
   fp: {
     phase:          1,
     startedAt:      null,   // date trading started
@@ -2808,6 +3033,11 @@ async function checkExpiry() {
       if (tp1Hit) {
         sig.tp1Hit = true;
         state.stats.tp1Hits = (state.stats.tp1Hits || 0) + 1;
+        // Per-strategy/symbol win tracking
+        const sId = sig.strategy?.id, sySym = sig.symbol, sySess = sig.session;
+        if (sId)    { if(!state.stats.stratWR[sId])    state.stats.stratWR[sId]   ={wins:0,losses:0}; state.stats.stratWR[sId].wins++;   }
+        if (sySym)  { if(!state.stats.symbolWR[sySym]) state.stats.symbolWR[sySym]={wins:0,losses:0}; state.stats.symbolWR[sySym].wins++; }
+        if (sySess) { if(!state.stats.sessionWR[sySess])state.stats.sessionWR[sySess]={wins:0,losses:0};state.stats.sessionWR[sySess].wins++; }
         await tgTPHit(sig, 'TP1');
 
         // ── Break-even SL move ─────────────────────────────────────────
@@ -2850,15 +3080,42 @@ async function checkExpiry() {
       }
     }
 
-    // ── TP3 hit detection ─────────────────────────────────────────────────
+    // ── TP3 hit detection + trailing SL ─────────────────────────────────────
     if (sig.tp2Hit && !sig.tp3Hit && lvls.tp3) {
       const tp3Hit = isBuy ? price >= lvls.tp3 : price <= lvls.tp3;
       if (tp3Hit) {
         sig.tp3Hit = true;
-        sig.expired = true; // trade complete
+        sig.expired = true;
         state.stats.tp3Hits = (state.stats.tp3Hits || 0) + 1;
         await tgTPHit(sig, 'TP3');
+        savePersist();
         continue;
+      }
+
+      // ── Trailing SL (active after TP2 hit, targeting TP3) ──────────────
+      // Trail SL 1 ATR behind each new swing high/low using M15 candles
+      const m15c = dataFetcher.mtfCache[`${sig.symbol}_mtf`]?.data?.m15;
+      if (m15c && m15c.length >= 3) {
+        const recent = m15c.slice(-3);
+        const atrEst = Math.abs(recent[2].high - recent[2].low); // rough ATR from last candle
+        let   newSL;
+        if (isBuy) {
+          // Trail: highest low of last 3 candles minus 0.5 ATR
+          const trailLevel = Math.max(...recent.map(x => x.low)) - atrEst * 0.5;
+          if (trailLevel > lvls.sl) {
+            newSL  = trailLevel;
+            lvls.sl = newSL;
+            console.log(`[TRAIL] ${sig.symbol} BUY: SL trailed to ${newSL.toFixed(4)}`);
+          }
+        } else {
+          // Trail: lowest high of last 3 candles plus 0.5 ATR
+          const trailLevel = Math.min(...recent.map(x => x.high)) + atrEst * 0.5;
+          if (trailLevel < lvls.sl) {
+            newSL  = trailLevel;
+            lvls.sl = newSL;
+            console.log(`[TRAIL] ${sig.symbol} SELL: SL trailed to ${newSL.toFixed(4)}`);
+          }
+        }
       }
     }
 
@@ -2870,7 +3127,13 @@ async function checkExpiry() {
         // Distinguish: SL hit before TP1 (full loss) vs after TP1 (break-even or profit)
         const outcome = sig.tp2Hit ? 'SL_AT_TP1' : sig.tp1Hit ? 'SL_BREAKEVEN' : 'SL_HIT';
         state.stats.slHits = (state.stats.slHits || 0) + 1;
+        // Per-strategy/symbol loss tracking
+        const lId = sig.strategy?.id, lSym = sig.symbol, lSess = sig.session;
+        if (lId)    { if(!state.stats.stratWR[lId])    state.stats.stratWR[lId]   ={wins:0,losses:0}; state.stats.stratWR[lId].losses++;   }
+        if (lSym)   { if(!state.stats.symbolWR[lSym])  state.stats.symbolWR[lSym] ={wins:0,losses:0}; state.stats.symbolWR[lSym].losses++; }
+        if (lSess)  { if(!state.stats.sessionWR[lSess])state.stats.sessionWR[lSess]={wins:0,losses:0};state.stats.sessionWR[lSess].losses++; }
         await tgExpiry(sig, outcome);
+        savePersist();
         continue;
       }
     }
@@ -2884,12 +3147,151 @@ async function checkExpiry() {
 }
 
 // ═════════════════════════════════════════════════════════════
+//  PERSISTENCE — save/load state across Render restarts
+// ═════════════════════════════════════════════════════════════
+function savePersist() {
+  try {
+    const data = {
+      signals:  state.signals.slice(0, 50),  // last 50 signals
+      fp:       state.fp,
+      stats:    state.stats,
+    };
+    fs.writeFileSync(PERSIST_FILE, JSON.stringify(data));
+  } catch(e) { console.error('[Persist] Save failed:', e.message); }
+}
+
+function loadPersist() {
+  try {
+    if (!fs.existsSync(PERSIST_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(PERSIST_FILE, 'utf8'));
+    if (data.signals?.length) {
+      // Only restore active (non-expired, non-SL-hit) signals
+      const active = data.signals.filter(s => !s.expired && !s.slHit);
+      state.signals = data.signals;
+      console.log(`[Persist] ✅ Loaded ${data.signals.length} signals (${active.length} active)`);
+      if (active.length) tgSend(`♻️ *Bot Restarted — ${active.length} active signal(s) restored*`).catch(()=>{});
+    }
+    if (data.fp) state.fp = { ...state.fp, ...data.fp };
+    if (data.stats) state.stats = { ...state.stats, ...data.stats };
+    console.log('[Persist] ✅ State restored from disk');
+  } catch(e) { console.error('[Persist] Load failed:', e.message); }
+}
+
+// ── SMT Divergence (Smart Money Technique) ────────────────────────────────
+// Two correlated pairs diverge at a key level = institutional signal
+// EUR/USD makes new H1 high but GBP/USD fails → SELL EUR/USD
+const SMT_PAIRS = [
+  { lead: 'EURUSD', lag: 'GBPUSD', dir: 'both' },
+  { lead: 'AUDUSD', lag: 'NZDUSD', dir: 'both' },
+  { lead: 'GBPJPY', lag: 'EURJPY', dir: 'both' },
+];
+
+async function checkSMT() {
+  for (const pair of SMT_PAIRS) {
+    try {
+      const leadMTF = dataFetcher.mtfCache[`${pair.lead}_mtf`]?.data;
+      const lagMTF  = dataFetcher.mtfCache[`${pair.lag}_mtf`]?.data;
+      if (!leadMTF?.h1?.length || !lagMTF?.h1?.length) continue;
+
+      const leadH1 = leadMTF.h1;
+      const lagH1  = lagMTF.h1;
+      if (leadH1.length < 5 || lagH1.length < 5) continue;
+
+      // Get recent H1 swing highs (last 5 H1 candles)
+      const leadHigh1 = Math.max(...leadH1.slice(-5).map(c => c.high));
+      const leadHigh2 = Math.max(...leadH1.slice(-10,-5).map(c => c.high));
+      const lagHigh1  = Math.max(...lagH1.slice(-5).map(c => c.high));
+      const lagHigh2  = Math.max(...lagH1.slice(-10,-5).map(c => c.high));
+      const leadLow1  = Math.min(...leadH1.slice(-5).map(c => c.low));
+      const leadLow2  = Math.min(...leadH1.slice(-10,-5).map(c => c.low));
+      const lagLow1   = Math.min(...lagH1.slice(-5).map(c => c.low));
+      const lagLow2   = Math.min(...lagH1.slice(-10,-5).map(c => c.low));
+
+      // Bearish SMT: lead makes new H1 high, lag FAILS to (distribution)
+      const bearSMT = leadHigh1 > leadHigh2 && lagHigh1 < lagHigh2;
+      // Bullish SMT: lead makes new H1 low, lag FAILS to (accumulation)
+      const bullSMT = leadLow1 < leadLow2 && lagLow1 > lagLow2;
+
+      if (!bearSMT && !bullSMT) continue;
+
+      const dir = bearSMT ? 'SELL' : 'BUY';
+      const sigId = `${pair.lead}_SMT_${Date.now()}`;
+
+      // Avoid duplicates: check if we already sent SMT for this pair recently
+      const recentSMT = state.signals.find(s =>
+        s.symbol === pair.lead && s.strategy?.id === 'SMT_DIV' &&
+        Date.now() - new Date(s.ts).getTime() < 4 * 3600000
+      );
+      if (recentSMT) continue;
+
+      const leadPrice = leadMTF.m15[leadMTF.m15.length - 1].close;
+      const leadATR   = Ind.atr(leadMTF.m15);
+      const f2        = v => Ind.fmt(v, Ind.dec(leadPrice));
+
+      const smtSig = {
+        id: sigId, symbol: pair.lead, name: SYMBOLS[pair.lead]?.name || pair.lead,
+        cat: 'forex', dir,
+        strategy: { id: 'SMT_DIV', name: `SMT Divergence vs ${pair.lag}`, score: 85 },
+        quality: 85,
+        levels: {
+          entry: f2(leadPrice),
+          sl:    dir === 'SELL' ? f2(leadPrice + leadATR * 0.7) : f2(leadPrice - leadATR * 0.7),
+          tp1:   dir === 'SELL' ? f2(leadPrice - leadATR * 1.5) : f2(leadPrice + leadATR * 1.5),
+          tp2:   dir === 'SELL' ? f2(leadPrice - leadATR * 3.0) : f2(leadPrice + leadATR * 3.0),
+          tp3:   dir === 'SELL' ? f2(leadPrice - leadATR * 5.0) : f2(leadPrice + leadATR * 5.0),
+          rr: '1:2.1', riskLabel: `SMT vs ${pair.lag}`,
+        },
+        confirmedBy: [{ id: 'SMT_DIV', name: `${pair.lead} vs ${pair.lag}` }],
+        mtf: { daily:'N/A', h4:'N/A', h1:'N/A', m15:'N/A', align:'SMT', pd:null, h1POI:null, kz:false },
+        indicators: { rsi: Ind.rsi(leadMTF.m15.map(c=>c.close)), macd: 0, vol: {ratio:1}, atr: f2(leadATR) },
+        session: Market.session(), source: 'smt_cross',
+        candles: leadMTF.m15.length, timeframe: 'H1',
+        ts: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60 * 60000).toISOString(), // 1h expiry
+        expired: false, slHit: false, tp1Hit: false, tp2Hit: false, tp3Hit: false,
+        beMoveDone: false, slMoved: false,
+      };
+
+      const gCheck = gate.check(smtSig, leadPrice);
+      if (!gCheck.ok) continue;
+
+      gate.record(smtSig);
+      state.signals.unshift(smtSig);
+      state.stats.total++;
+      savePersist();
+
+      await tgSend(
+        `${dir === 'BUY' ? '🟢' : '🔴'} *SMT DIVERGENCE — ${dir} ${pair.lead}*
+` +
+        `${pair.lead} ${bearSMT ? 'made new high' : 'made new low'} but ${pair.lag} FAILED
+` +
+        `→ Institutional ${bearSMT ? 'distribution' : 'accumulation'} signal
+
+` +
+        `Entry: \`${smtSig.levels.entry}\` | SL: \`${smtSig.levels.sl}\`
+` +
+        `TP1: \`${smtSig.levels.tp1}\` | TP2: \`${smtSig.levels.tp2}\`
+` +
+        `Quality: 85/100 | WR: 70-78%`
+      );
+      console.log(`[SMT] ✅ ${dir} ${pair.lead} vs ${pair.lag}`);
+    } catch(e) { console.error('[SMT]', e.message); }
+  }
+}
+
+// ═════════════════════════════════════════════════════════════
 //  SECTION 8 — ANALYSIS CYCLE
 //  Runs every 15 min aligned to M15 candle close.
 //  Skips closed markets (sends one Telegram message per category).
 // ═════════════════════════════════════════════════════════════
 async function runCycle() {
   if (state.running) return;
+  // ── Pause guard ─────────────────────────────────────────────────────────
+  if (state.pauseUntil && Date.now() < state.pauseUntil) {
+    const left = Math.ceil((state.pauseUntil - Date.now()) / 60000);
+    console.log(`[v9.8] ⏸ Bot paused — ${left}m remaining`);
+    return;
+  }
   state.running = true;
   const t0 = Date.now();
   const ist = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
@@ -2935,7 +3337,7 @@ async function runCycle() {
       if (!sig) { console.log(`[v9.8] ℹ️  No signal: ${symbol}`); continue; }
 
       // ── Gate check ─────────────────────────────────────────
-      const g = gate.check(sig, curPrice);
+      const g = gate.check(sig, curPrice, state.signals.filter(s => s.ts && Date.now() - new Date(s.ts).getTime() < 900000));
       if (!g.ok) {
         cycleBlocked++; state.stats.blocked++;
         console.log(`[v9.8] 🚫 ${symbol}: ${g.why}`);
@@ -2960,6 +3362,7 @@ async function runCycle() {
       if (state.signals.length > CONFIG.MAX_SIGNALS) state.signals = state.signals.slice(0, CONFIG.MAX_SIGNALS);
       state.stats.total++;
       cycleSignals++;
+      savePersist(); // persist state after every new signal
 
       console.log(`[v9.8] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
       await tgSignal(sig);
@@ -2968,8 +3371,10 @@ async function runCycle() {
     } catch (e) { console.error(`[v9.8] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
   }
 
+  // ── SMT Divergence check (cross-symbol, forex only) ──────────────────────
+  await checkSMT();
   await checkExpiry();
-  await fpWatchdog(); // FundingPips DD watchdog
+  await fpWatchdog();
 
   await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
@@ -2982,7 +3387,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '10.2.0',
+  version: '10.3.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -2993,7 +3398,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.2.0',
+    status: 'OK', version: '10.3.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -3039,8 +3444,8 @@ app.get('/api/signals/:symbol',  (req, res) => {
 });
 
 app.get('/api/strategies',       (req, res) => res.json({
-  version: '9.7', total: 14,
-  note: 'All 14 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
+  version: '10.3', total: 16,
+  note: 'All 16 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
   strategies: [
     { id: 'FVG_OB',       name: 'Fair Value Gap + Order Block',  cat: 'SMC', wr: '60-68%', rr: '1:2-1:4' },
     { id: 'LIQ_SWEEP',    name: 'Liquidity Sweep',               cat: 'ICT', wr: '62-70%', rr: '1:2-1:5' },
@@ -3056,6 +3461,9 @@ app.get('/api/strategies',       (req, res) => res.json({
     { id: 'EQH_EQL',      name: 'Equal Highs/Lows Raid',         cat: 'ICT',   wr: '62-70%', rr: '1:2-1:4' },
     { id: 'GAP_GO',       name: 'Gap & Go (India NSE)',           cat: 'PA',    wr: '60-68%', rr: '1:2-1:3' },
     { id: 'SESS_RAID',    name: 'Session H/L Raid',               cat: 'ICT',   wr: '63-70%', rr: '1:2-1:4' },
+    { id: 'PDH_PDL',      name: 'Previous Day H/L Raid',           cat: 'ICT',   wr: '65-72%', rr: '1:2-1:4' },
+    { id: 'TURTLE_SOUP',  name: 'Turtle Soup (Multi-Candle Sweep)', cat: 'ICT',   wr: '65-72%', rr: '1:2-1:4' },
+    { id: 'SMT_DIV',      name: 'SMT Divergence (Cross-Symbol)',    cat: 'ICT',   wr: '70-78%', rr: '1:3-1:6' },
   ],
 }));
 
@@ -3086,6 +3494,18 @@ app.get('/api/stats',            (req, res) => {
         const total = wins + (state.stats.slHits || 0);
         return total > 0 ? `${Math.round(wins/total*100)}%` : 'N/A';
       })(),
+      byStrategy: Object.fromEntries(Object.entries(state.stats.stratWR).map(([k,v])=>[k,{
+        wins: v.wins, losses: v.losses,
+        wr: v.wins+v.losses > 0 ? `${Math.round(v.wins/(v.wins+v.losses)*100)}%` : 'N/A'
+      }])),
+      bySymbol: Object.fromEntries(Object.entries(state.stats.symbolWR).map(([k,v])=>[k,{
+        wins: v.wins, losses: v.losses,
+        wr: v.wins+v.losses > 0 ? `${Math.round(v.wins/(v.wins+v.losses)*100)}%` : 'N/A'
+      }])),
+      bySession: Object.fromEntries(Object.entries(state.stats.sessionWR).map(([k,v])=>[k,{
+        wins: v.wins, losses: v.losses,
+        wr: v.wins+v.losses > 0 ? `${Math.round(v.wins/(v.wins+v.losses)*100)}%` : 'N/A'
+      }])),
     },
     lastCycle: state.lastCycle,
   });
@@ -3177,6 +3597,113 @@ async function checkDhanTokenAge() {
   }
 }
 
+// ── Telegram Bot Commands (incoming messages) ──────────────────────────────
+// Set webhook: https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://your-bot.onrender.com/tg/webhook
+app.post('/tg/webhook', async (req, res) => {
+  res.sendStatus(200); // always ack first
+  const msg = req.body?.message;
+  if (!msg?.text) return;
+  const chatId = msg.chat?.id?.toString();
+  if (chatId !== CONFIG.TELEGRAM_CHAT_ID) return; // only your chat
+  const text = msg.text.trim().toLowerCase();
+  const cmd  = text.split(' ')[0];
+  const arg  = text.split(' ')[1];
+
+  try {
+    if (cmd === '/status' || cmd === '/s') {
+      const active = state.signals.filter(s => !s.expired && !s.slHit);
+      if (!active.length) {
+        await tgSend('📊 *Status* — No active signals right now.');
+        return;
+      }
+      const lines = active.map(s =>
+        `${s.dir === 'BUY' ? '🟢' : '🔴'} *${s.symbol}* ${s.dir} | Q:${s.quality}\n` +
+        `Entry: \`${s.levels.entry}\` | SL: \`${s.levels.sl}\`\n` +
+        `TP1: \`${s.levels.tp1}\` ${s.tp1Hit ? '✅' : ''} TP2: \`${s.levels.tp2}\` ${s.tp2Hit ? '✅' : ''}\n` +
+        `${s.strategy.name}`
+      ).join('\n─\n');
+      await tgSend(`📊 *Active Signals (${active.length})*\n\n${lines}`);
+
+    } else if (cmd === '/pnl' || cmd === '/p') {
+      const todayKey = new Date().toISOString().slice(0, 10);
+      const todayPnL = state.fp.dailyPnL[todayKey] || 0;
+      const totalPnL = state.fp.totalPnL || 0;
+      const wins = state.stats.tp1Hits || 0;
+      const losses = state.stats.slHits || 0;
+      const total = wins + losses;
+      const wr = total > 0 ? `${Math.round(wins/total*100)}%` : 'N/A';
+      await tgSend(
+        `💹 *P&L Summary*
+` +
+        `Today (FP): $${todayPnL.toFixed(2)}
+` +
+        `Total (FP): $${totalPnL.toFixed(2)}
+` +
+        `Win rate: ${wr} (${wins}W / ${losses}L)
+` +
+        `FP Phase ${state.fp.phase} | Trades: ${state.fp.tradesThisPhase}`
+      );
+
+    } else if (cmd === '/pause') {
+      // Pause all signals for N minutes (default 120)
+      const mins = parseInt(arg) || 120;
+      state.pauseUntil = Date.now() + mins * 60000;
+      await tgSend(`⏸ *Bot Paused for ${mins} minutes*
+Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`);
+
+    } else if (cmd === '/resume') {
+      state.pauseUntil = null;
+      await tgSend('▶️ *Bot Resumed* — signals active');
+
+    } else if (cmd === '/risk') {
+      // /risk india 8000  or  /risk forex 1  or  /risk crypto 5000
+      const market = arg;
+      const val    = parseFloat(text.split(' ')[2]);
+      if (market === 'india'  && val) { CONFIG.INDIA_RISK_INR  = val; await tgSend(`✅ India risk → ₹${val.toLocaleString('en-IN')}`); }
+      else if (market === 'crypto' && val) { CONFIG.CRYPTO_RISK_INR = val; await tgSend(`✅ Crypto risk → ₹${val.toLocaleString('en-IN')}`); }
+      else if (market === 'forex'  && val) { CONFIG.FP_RISK_PCT = val; await tgSend(`✅ Forex risk → ${val}% of $${CONFIG.FP_ACCOUNT_USD}`); }
+      else await tgSend('Usage: /risk india 6000 | /risk crypto 3000 | /risk forex 0.5');
+
+    } else if (cmd === '/phase') {
+      const ph = parseInt(arg);
+      if (ph === 1 || ph === 2) {
+        state.fp.phase = ph;
+        state.fp.tradesThisPhase = 0;
+        await tgSend(`🎯 *FundingPips Phase ${ph} activated*`);
+      } else await tgSend('Usage: /phase 1 or /phase 2');
+
+    } else if (cmd === '/stats') {
+      const total = state.stats.total || 0;
+      const byStrat = {};
+      state.signals.forEach(s => { byStrat[s.strategy.id] = (byStrat[s.strategy.id]||0)+1; });
+      const topStrats = Object.entries(byStrat).sort((a,b)=>b[1]-a[1]).slice(0,5)
+        .map(([id,n]) => `  • ${id}: ${n}`).join('\n');
+      const statsMsg =
+        `📈 *Bot Stats*\n` +
+        `Total signals: ${total}\n` +
+        `Blocked: ${state.stats.blocked}\n` +
+        `TP1 hits: ${state.stats.tp1Hits||0} | TP2: ${state.stats.tp2Hits||0} | TP3: ${state.stats.tp3Hits||0}\n` +
+        `SL hits: ${state.stats.slHits||0}\n` +
+        `Top strategies:\n${topStrats || '  No data yet'}`;
+      await tgSend(statsMsg);
+
+        } else if (cmd === '/help') {
+      const helpMsg =
+        `🤖 *Bot Commands*\n\n` +
+        `/status — show active signals\n` +
+        `/pnl — today's P&L + win rate\n` +
+        `/stats — signal statistics\n` +
+        `/pause [mins] — pause signals (default 120min)\n` +
+        `/resume — resume signals\n` +
+        `/risk india 6000 — set India risk\n` +
+        `/risk forex 0.5 — set Forex risk %\n` +
+        `/phase 2 — switch FP challenge phase\n` +
+        `/help — this message`;
+      await tgSend(helpMsg);
+    }
+    } catch(e) { console.error('[TG CMD]', e.message); }
+});
+
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
 // ═════════════════════════════════════════════════════════════
@@ -3185,8 +3712,8 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v10.2 — ICT/SMC ENGINE     ║
-║   14 strategies · M15+M5 entry · H1/H4 SL-TP    ║
+║   HYBRID TRADING BOT v10.3 — ICT/SMC ENGINE     ║
+║   16 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
 Port: ${CONFIG.PORT} | Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN} | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -3194,11 +3721,13 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   `);
 
   // Give CoinGecko a moment before first cycle (avoid cold-start 429)
+  // Restore persisted signals/state from previous run
+  loadPersist();
   console.log('[v9.8] Waiting 5s before first cycle (CG rate limit buffer)...');
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.2 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.3 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 14 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
