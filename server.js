@@ -63,7 +63,7 @@ const SYMBOLS = {
   ETHUSDT:   { name:'ETH/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ETHUSD',  cgId:'ethereum'      }, // #2
   SOLUSDT:   { name:'SOL/USDT',   cat:'crypto', src:'delta', deltaSymbol:'SOLUSDT', cgId:'solana'        }, // #3 high vol
   XRPUSDT:   { name:'XRP/USDT',   cat:'crypto', src:'delta', deltaSymbol:'XRPUSD',  cgId:'ripple'        }, // #4
-  DOGEUSDT:  { name:'DOGE/USDT',  cat:'crypto', src:'delta', deltaSymbol:'DOGEUSDT',cgId:'dogecoin'      }, // #5 extreme vol
+  DOGEUSDT:  { name:'DOGE/USDT',  cat:'crypto', src:'delta', deltaSymbol:'DOGEUSDT',cgId:'dogecoin',      noStrategies:['CHOCH','OTE','FPB'] }, // tweet-driven — no trend strategies
   ADAUSDT:   { name:'ADA/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ADAUSDT', cgId:'cardano'       }, // #6
   BNBUSDT:   { name:'BNB/USDT',   cat:'crypto', src:'delta', deltaSymbol:'BNBUSD',  cgId:'binancecoin'   }, // #7
   LTCUSDT:   { name:'LTC/USDT',   cat:'crypto', src:'delta', deltaSymbol:'LTCUSD',  cgId:'litecoin'      }, // #8
@@ -500,10 +500,10 @@ class Detectors {
   }
 
   // ─── run all detectors ────────────────────────────────────
-  static runAll(m15, h1, h4, cat, daily = null) {
+  static runAll(m15, h1, h4, cat, daily = null, noStrategies = []) {
     if (!m15 || m15.length < 40) return [];
     let x;
-    try { x = this.ctx(m15, h1, h4, cat, daily); }
+    try { x = this.ctx(m15, h1, h4, cat, daily); x.noStrategies = noStrategies; }
     catch { return []; }
 
     const results = [];
@@ -513,6 +513,12 @@ class Detectors {
       this.fvgBosHTF,
       this.eqhEql, this.gapGo, this.sessRaid,  // new additions
     ];
+    // Per-symbol strategy exclusions (e.g. DOGE: no CHOCH/OTE/FPB)
+    const symCfg = Object.values(SYMBOLS).find(s =>
+      s.deltaSymbol === cat || s.td === cat || s.dhanId === cat
+    );
+    const noStrats = x.noStrategies || [];
+
     for (const fn of runners) {
       try {
         const r = fn.call(this, x, m15, h1, h4);
@@ -520,14 +526,15 @@ class Detectors {
         const arr = Array.isArray(r) ? r : [r];
         for (const sig of arr) {
           if (!sig?.dir || !sig?.id) continue;
+          // Per-symbol strategy block
+          if (noStrats.includes(sig.id)) continue;
           // P/D zone gate
           if (sig.dir === 'BUY'  && !x.buyOk)  continue;
           if (sig.dir === 'SELL' && !x.sellOk) continue;
           // H4 full bias hard block
           if (x.align === 'FULL_BULL' && sig.dir === 'SELL') continue;
           if (x.align === 'FULL_BEAR' && sig.dir === 'BUY')  continue;
-          // Daily bias gate — if 2 consecutive daily candles confirm direction,
-          // block signals in opposite direction (strongest filter)
+          // Daily bias gate
           if (!x.dailyBullOk && sig.dir === 'BUY')  continue;
           if (!x.dailySellOk && sig.dir === 'SELL') continue;
           results.push(sig);
@@ -1307,7 +1314,8 @@ class Builder {
     const h4    = mtfData?.h4    || null;
     const daily = mtfData?.daily || null;
 
-    const fired = Detectors.runAll(m15, h1, h4, cat, daily);
+    const noStrats = cfg.noStrategies || [];
+    const fired = Detectors.runAll(m15, h1, h4, cat, daily, noStrats);
     if (!fired.length) return null;
 
     // Best signal by score
@@ -1317,11 +1325,63 @@ class Builder {
     const conf = fired.filter(s => s.dir === best.dir);
     if (conf.length < 2) return null; // need at least 2 strategies agreeing
 
-    // Quality score
-    const quality = Math.min(100, Math.round(
-      best.score
-      + (conf.length >= 4 ? 8 : conf.length >= 3 ? 5 : 2)
-    ));
+    // ── Quality score — multi-factor scoring ──────────────────────────────
+    const ctx2  = Detectors.ctx(m15, h1, h4, cat, daily);
+    const isBuy = best.dir === 'BUY';
+
+    // 1. Base: best strategy score + confirmation bonus
+    //    Weighted by avg score of confirming strategies (not just count)
+    const avgConfScore = conf.reduce((s, x) => s + x.score, 0) / conf.length;
+    const confBonus = conf.length >= 4 ? 10
+                    : conf.length >= 3 ? 7
+                    : avgConfScore >= 80 ? 4    // 2 strong strategies
+                    : 2;                        // 2 weak strategies
+
+    let q = best.score + confBonus;
+
+    // 2. Full 4-TF alignment bonus (+6)
+    //    Daily + H4 + H1 + M15 all same direction = strongest possible trend
+    const fullAlign4 = (
+      (isBuy  && ctx2.dailyBias === 'BULLISH' && ctx2.align === 'FULL_BULL') ||
+      (!isBuy && ctx2.dailyBias === 'BEARISH' && ctx2.align === 'FULL_BEAR')
+    );
+    if (fullAlign4) q += 6;
+    else if (
+      (isBuy  && ctx2.dailyBias === 'BULLISH' && ctx2.align === 'PARTIAL_BULL') ||
+      (!isBuy && ctx2.dailyBias === 'BEARISH' && ctx2.align === 'PARTIAL_BEAR')
+    ) q += 3; // Partial 4-TF alignment = smaller bonus
+
+    // 3. MACD momentum confirmation (+4)
+    //    MACD histogram > 0 on BUY = momentum is already bullish
+    //    MACD histogram < 0 on SELL = momentum is already bearish
+    const macdHist = ctx2.macd?.hist || 0;
+    if (isBuy  && macdHist > 0) q += 4;
+    if (!isBuy && macdHist < 0) q += 4;
+
+    // 4. RSI extreme confirmation (+4)
+    //    RSI < 35 on BUY = oversold exhaustion — more likely to bounce
+    //    RSI > 65 on SELL = overbought exhaustion — more likely to fall
+    const rsiVal = ctx2.rsi;
+    if (isBuy  && rsiVal < 35) q += 4;
+    if (!isBuy && rsiVal > 65) q += 4;
+
+    // 5. H1 POI type differentiation
+    //    H1 OB (order block) = institutional level = stronger than H1 FVG
+    if (ctx2.h1POI?.type === 'H1_OB')  q += 4;  // extra for OB over FVG
+    else if (ctx2.h1POI?.type === 'H1_FVG') q += 1; // FVG already counted in strategy score
+
+    // 6. Volume spike universal bonus (+3)
+    //    volSpike already gives bonus inside some strategy scores
+    //    Add a small universal bonus here for any spike
+    if (ctx2.volSpike) q += 3;
+
+    // 7. Dead session penalty (-8)
+    //    DEAD session (22:00-00:30 UTC) = no major session active
+    //    Forex signals here are unreliable — wide spreads, thin volume
+    //    Crypto is exempt (24/7), India is exempt (already closed by market hours gate)
+    if (cat !== 'crypto' && cat !== 'india' && Market.session() === 'DEAD') q -= 8;
+
+    const quality = Math.min(100, Math.round(q));
     if (quality < CONFIG.SIGNAL_QUALITY_MIN) return null;
 
     // Build levels from live candle data
@@ -2570,7 +2630,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
-  version: '9.9.0',
+  version: '10.0.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -2581,7 +2641,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '9.9.0',
+    status: 'OK', version: '10.0.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -2700,7 +2760,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v9.9 — ICT/SMC ENGINE      ║
+║   HYBRID TRADING BOT v10.0 — ICT/SMC ENGINE     ║
 ║   14 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -2713,7 +2773,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v9.9 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.0 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 14 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
