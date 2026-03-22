@@ -3,7 +3,7 @@ const express  = require('express');
 const axios    = require('axios');
 const cron     = require('node-cron');
 const fs       = require('fs');
-const PERSIST_FILE = '/tmp/bot_state.json';
+const PERSIST_FILE = '/tmp/bot_state.json'; // fallback if MongoDB unavailable
 require('dotenv').config();
 
 const app = express();
@@ -59,6 +59,9 @@ const CONFIG = {
   FP_DAILY_DD_PCT:    5,    // 5% max daily drawdown
   FP_WARN_DD_PCT:     3,    // warn when daily DD reaches 3% (buffer before 5% limit)
   FP_WARN_MAX_DD:     7,    // warn when total DD reaches 7% (buffer before 10% limit)
+
+  // ── MongoDB (optional — if MONGODB_URI set, persists across deploys) ─────────
+  MONGODB_URI:        process.env.MONGODB_URI || null,
 };
 
 // ── Symbols ───────────────────────────────────────────────────
@@ -1608,6 +1611,10 @@ class Builder {
     lvls.currency     = currency;
     lvls.riskPerUnit  = riskUnit ? Ind.fmt(riskUnit, dec2) : null;
     lvls.lotSize      = riskUnit && riskUnit > 0 ? parseFloat((riskAmt / riskUnit).toFixed(2)) : null;
+    // Partial TP lot sizes
+    lvls.lotsTP1Close = lvls.lotSize ? parseFloat((lvls.lotSize * 0.50).toFixed(2)) : null; // 50% at TP1
+    lvls.lotsTP2Close = lvls.lotSize ? parseFloat((lvls.lotSize * 0.25).toFixed(2)) : null; // 25% at TP2
+    lvls.lotsTP3Close = lvls.lotSize ? parseFloat((lvls.lotSize * 0.25).toFixed(2)) : null; // 25% at TP3
     lvls.profitTP1    = lvls.lotSize && lvls.tp1 && lvls.entry
       ? Math.round(lvls.lotSize * Math.abs(lvls.tp1 - lvls.entry)) : null;
     lvls.profitTP2    = lvls.lotSize && lvls.tp2 && lvls.entry
@@ -2764,8 +2771,9 @@ async function tgSignal(sig) {
 🎯 *TP2:*   ${safeNum(sig.levels.tp2)}
 🎯 *TP3:*   ${safeNum(sig.levels.tp3)}
 📐 *R:R:*   ${sig.levels.rr}
-💼 *Risk:*  ${sig.levels.riskLabel || 'N/A'} | Lots: ${sig.levels.lotSize || 'N/A'}
-💵 *TP1 profit:* ₹${sig.levels.profitTP1?.toLocaleString('en-IN') || 'N/A'} | *TP2:* ₹${sig.levels.profitTP2?.toLocaleString('en-IN') || 'N/A'}
+💼 *Risk:*  ${sig.levels.riskLabel || 'N/A'} | Total lots: ${sig.levels.lotSize || 'N/A'}
+💵 *TP1 profit:* ₹${sig.levels.profitTP1?.toLocaleString('en-IN') || 'N/A'} (close ${sig.levels.lotsTP1Close || 'N/A'} lots)
+💵 *TP2 profit:* ₹${sig.levels.profitTP2?.toLocaleString('en-IN') || 'N/A'} (close ${sig.levels.lotsTP2Close || 'N/A'} lots)
 
 ⏱ *Expires:* ${exp} IST | Setup+Entry: M15 | SL: H1 struct
 📈 RSI: ${sig.indicators.rsi} | Vol: ${sig.indicators.vol.ratio}x | ATR: ${sig.indicators.atr}
@@ -2790,25 +2798,27 @@ async function tgClosed(cat, symbol) {
 }
 
 async function tgTPHit(sig, level) {
-  const lvls   = sig.levels;
-  const price  = lvls[level.toLowerCase()];
-  const profit = level === 'TP1' ? lvls.profitTP1
-               : level === 'TP2' ? lvls.profitTP2
-               : null;
+  const lvls      = sig.levels;
+  const price     = lvls[level.toLowerCase()];
+  const profit    = level === 'TP1' ? lvls.profitTP1 : level === 'TP2' ? lvls.profitTP2 : null;
   const profitStr = profit ? ` | +₹${profit.toLocaleString('en-IN')}` : '';
   const nextTarget = level === 'TP1' ? `TP2: ${lvls.tp2 || 'N/A'}`
-                   : level === 'TP2' ? `TP3: ${lvls.tp3 || 'N/A'}`
-                   : 'Trade complete 🎯';
-  const msg = `✅ *${level} HIT* — ${sig.dir} ${sig.symbol}${profitStr}
-` +
-    `Strategy: ${sig.strategy.name} | Quality: ${sig.quality}
-` +
-    `${level}: ${price} ✅
-` +
-    `${nextTarget}
-` +
-    `${level === 'TP1' ? '🔒 SL moved to break-even (entry)' : ''}`;
-  await tgSend(msg);
+                   : level === 'TP2' ? `TP3: ${lvls.tp3 || 'N/A'}` : 'Trade complete 🎯';
+  // Partial TP action guidance
+  const closeNow  = level === 'TP1' ? lvls.lotsTP1Close
+                  : level === 'TP2' ? lvls.lotsTP2Close : lvls.lotsTP3Close;
+  const partialNote = level === 'TP1'
+    ? `\n💼 Close ${closeNow || '50%'} lots NOW → trail rest to TP2\n🔒 SL → break-even (entry)`
+    : level === 'TP2'
+    ? `\n💼 Close ${closeNow || '25%'} more lots → trail last to TP3`
+    : `\n💼 Close final ${closeNow || '25%'} lots — full exit ✅`;
+  const lines = [
+    `✅ *${level} HIT* — ${sig.dir} ${sig.symbol}${profitStr}`,
+    `Strategy: ${sig.strategy.name} | Q:${sig.quality}`,
+    `${level}: ${price} ✅${partialNote}`,
+    nextTarget,
+  ].join('\n');
+  await tgSend(lines);
   console.log(`[TP] ✅ ${level} hit: ${sig.dir} ${sig.symbol} | ${price}${profitStr}`);
   fpUpdatePnL(sig, level);
 }
@@ -3245,37 +3255,234 @@ async function checkExpiry() {
 // ═════════════════════════════════════════════════════════════
 //  PERSISTENCE — save/load state across Render restarts
 // ═════════════════════════════════════════════════════════════
-function savePersist() {
+// ── MongoDB connection ─────────────────────────────────────────────────────────
+let mongoDb = null;
+async function connectMongo() {
+  if (!CONFIG.MONGODB_URI) return false;
   try {
-    const data = {
-      signals:  state.signals.slice(0, 50),  // last 50 signals
-      fp:       state.fp,
-      stats:    state.stats,
-    };
-    fs.writeFileSync(PERSIST_FILE, JSON.stringify(data));
-  } catch(e) { console.error('[Persist] Save failed:', e.message); }
+    const { MongoClient } = require('mongodb');
+    const client = new MongoClient(CONFIG.MONGODB_URI, { serverSelectionTimeoutMS: 5000 });
+    await client.connect();
+    mongoDb = client.db('tradingbot');
+    console.log('[MongoDB] ✅ Connected — state will persist across deploys');
+    return true;
+  } catch(e) { console.error('[MongoDB] Failed — using /tmp fallback:', e.message); mongoDb = null; return false; }
 }
 
-function loadPersist() {
-  try {
-    if (!fs.existsSync(PERSIST_FILE)) return;
-    const data = JSON.parse(fs.readFileSync(PERSIST_FILE, 'utf8'));
-    if (data.signals?.length) {
-      // Only restore active (non-expired, non-SL-hit) signals
-      const active = data.signals.filter(s => !s.expired && !s.slHit);
-      state.signals = data.signals;
-      console.log(`[Persist] ✅ Loaded ${data.signals.length} signals (${active.length} active)`);
-      if (active.length) tgSend(`♻️ *Bot Restarted — ${active.length} active signal(s) restored*`).catch(()=>{});
+async function savePersist() {
+  const data = { signals: state.signals.slice(0, 100), fp: state.fp, stats: state.stats, savedAt: new Date().toISOString() };
+  if (mongoDb) {
+    try { await mongoDb.collection('state').replaceOne({ _id: 'botstate' }, { _id: 'botstate', ...data }, { upsert: true }); return; }
+    catch(e) { console.error('[MongoDB] Save failed:', e.message); }
+  }
+  try { fs.writeFileSync(PERSIST_FILE, JSON.stringify(data)); }
+  catch(e) { console.error('[Persist] File save failed:', e.message); }
+}
+
+async function loadPersist() {
+  let data = null;
+  if (mongoDb) {
+    try { data = await mongoDb.collection('state').findOne({ _id: 'botstate' }); if (data) console.log('[MongoDB] ✅ State loaded'); }
+    catch(e) { console.error('[MongoDB] Load failed:', e.message); }
+  }
+  if (!data) {
+    try { if (fs.existsSync(PERSIST_FILE)) { data = JSON.parse(fs.readFileSync(PERSIST_FILE, 'utf8')); console.log('[Persist] ✅ State from file'); } }
+    catch(e) { console.error('[Persist] File load failed:', e.message); }
+  }
+  if (!data) return;
+  if (data.signals?.length) {
+    const active = data.signals.filter(s => !s.expired && !s.slHit);
+    state.signals = data.signals;
+    console.log(`[Persist] ✅ ${data.signals.length} signals (${active.length} active)`);
+    if (active.length) tgSend(`♻️ *Bot Restarted — ${active.length} active signal(s) restored*`).catch(()=>{});
+  }
+  if (data.fp)    state.fp    = { ...state.fp,    ...data.fp    };
+  if (data.stats) state.stats = { ...state.stats, ...data.stats };
+}
+
+
+
+// ── Weekly Trade Report ─────────────────────────────────────────────────────
+async function sendWeeklyReport() {
+  const weekAgo = Date.now() - 7 * 24 * 3600000;
+  const weekSigs = state.signals.filter(s => new Date(s.ts).getTime() > weekAgo);
+  if (!weekSigs.length) { await tgSend('📊 *Weekly Report* — No signals this week.'); return; }
+
+  const wins    = weekSigs.filter(s => s.tp1Hit).length;
+  const losses  = weekSigs.filter(s => s.slHit && !s.tp1Hit).length;
+  const pending = weekSigs.filter(s => !s.expired && !s.slHit).length;
+  const wr      = wins + losses > 0 ? Math.round(wins/(wins+losses)*100) : 0;
+
+  // Group by strategy
+  const bySt = {};
+  weekSigs.forEach(s => {
+    const id = s.strategy?.id || 'UNKNOWN';
+    if (!bySt[id]) bySt[id] = { w: 0, l: 0 };
+    if (s.tp1Hit) bySt[id].w++;
+    if (s.slHit && !s.tp1Hit) bySt[id].l++;
+  });
+  const stLines = Object.entries(bySt)
+    .map(([id,v]) => `  ${id}: ${v.w}W/${v.l}L`)
+    .join('\n');
+
+  // FP P&L this week
+  const fpWeek = Object.entries(state.fp.dailyPnL)
+    .filter(([d]) => new Date(d).getTime() > weekAgo)
+    .reduce((sum,[,v]) => sum + v, 0);
+
+  const report = [
+    `📊 *Weekly Trade Report*`,
+    `Week ending: ${new Date().toLocaleDateString('en-IN', {timeZone:'Asia/Kolkata'})}`,
+    ``,
+    `*Results:* ${wins}W / ${losses}L / ${pending} pending`,
+    `*Win Rate:* ${wr}%`,
+    `*Total signals:* ${weekSigs.length}`,
+    ``,
+    `*By Strategy:*
+${stLines || '  No completed trades'}`,
+    ``,
+    `*FundingPips (Forex/Gold):*`,
+    `  Week P&L: $${fpWeek.toFixed(2)}`,
+    `  Total P&L: $${(state.fp.totalPnL||0).toFixed(2)}`,
+    `  Phase ${state.fp.phase} progress: ${Math.min(100,(Math.max(0,state.fp.totalPnL)/(CONFIG.FP_ACCOUNT_USD*(state.fp.phase===1?CONFIG.FP_PHASE1_TARGET:CONFIG.FP_PHASE2_TARGET)/100)*100)).toFixed(1)}%`,
+  ].join('\n');
+
+  await tgSend(report);
+  console.log('[Weekly] ✅ Report sent');
+}
+
+// ── Economic Calendar — pause forex signals 30min before high-impact news ──────
+// Uses free ForexFactory-style approach: maintain a list of known recurring events
+// and add manual pauses via /pause command for one-off news
+const ECO_PAUSE_REASONS = new Set(); // set by /econews command or auto-detected
+
+async function checkEconomicCalendar() {
+  // Only affects forex/commodity (not India/Crypto)
+  // Check if we're within 30 minutes of a known high-impact event
+  const now = new Date();
+  const dayUTC  = now.getUTCDay();  // 0=Sun, 5=Fri
+  const hourUTC = now.getUTCHours();
+  const minUTC  = now.getUTCMinutes();
+  const timeUTC = hourUTC * 60 + minUTC; // minutes since midnight UTC
+
+  // Known recurring HIGH-IMPACT events (UTC times, approximate)
+  // These are the most market-moving events — NFP, CPI, FOMC, RBI
+  const HIGH_IMPACT = [
+    // NFP: First Friday of month 13:30 UTC
+    { day: 5, from: 13*60+0, to: 14*60+30, label: 'NFP window' },
+    // US CPI: ~13:30 UTC usually Tuesday/Wednesday mid-month
+    // FOMC: usually Wed 19:00 UTC (8 times/year)
+    { day: 3, from: 18*60+30, to: 20*60+0, label: 'FOMC window (Wed)' },
+    // RBI Policy: Usually during India market hours — auto-handled by India closed gate
+    // ECB: usually Thu 12:15 UTC
+    { day: 4, from: 12*60+0, to: 13*60+0, label: 'ECB window (Thu)' },
+    // BOE: usually Thu 12:00 UTC
+    { day: 4, from: 11*60+45, to: 12*60+30, label: 'BOE window (Thu)' },
+  ];
+
+  for (const event of HIGH_IMPACT) {
+    if (dayUTC === event.day && timeUTC >= event.from - 30 && timeUTC <= event.to) {
+      // Within 30 min before or during event window
+      if (!ECO_PAUSE_REASONS.has(event.label)) {
+        ECO_PAUSE_REASONS.add(event.label);
+        const now2 = Date.now();
+        const key = `eco_${event.label}`;
+        if (!state.fp.warningsSent[key] || now2 - state.fp.warningsSent[key] > 3600000) {
+          state.fp.warningsSent[key] = now2;
+          await tgSend(`⏸ *Economic Calendar Pause*
+${event.label} — Forex/Gold signals paused for safety.
+Will resume after event window.`);
+        }
+      }
+      return; // signal blocked downstream
+    } else {
+      ECO_PAUSE_REASONS.delete(event.label);
     }
-    if (data.fp) state.fp = { ...state.fp, ...data.fp };
-    if (data.stats) state.stats = { ...state.stats, ...data.stats };
-    console.log('[Persist] ✅ State restored from disk');
-  } catch(e) { console.error('[Persist] Load failed:', e.message); }
+  }
+}
+
+// Helper: check if forex should be paused due to news
+function forexPausedForNews() {
+  return ECO_PAUSE_REASONS.size > 0;
 }
 
 // ── SMT Divergence (Smart Money Technique) ────────────────────────────────
 // Two correlated pairs diverge at a key level = institutional signal
 // EUR/USD makes new H1 high but GBP/USD fails → SELL EUR/USD
+// ── India F&O Options Chain (PCR + Max Pain from NSE) ───────────────────────
+// NSE publishes option chain data publicly — no API key needed
+// PCR < 0.8 = bearish (more puts = market fears downside)
+// PCR > 1.2 = bullish (more calls = market expects upside)
+// PCR between 0.8-1.2 = neutral — signal can go either way
+
+const optionsCache = {};  // symbol → { pcr, maxPain, time }
+
+async function fetchOptionsChain(symbol) {
+  // Only for India NSE indices
+  if (!['NIFTY','BANKNIFTY','FINNIFTY'].includes(symbol)) return null;
+  const cached = optionsCache[symbol];
+  if (cached && Date.now() - cached.time < 15 * 60000) return cached; // 15min cache
+
+  const indexMap = { NIFTY: 'NIFTY', BANKNIFTY: 'BANKNIFTY', FINNIFTY: 'FINNIFTY' };
+  try {
+    const res = await axios.get(`https://www.nseindia.com/api/option-chain-indices?symbol=${indexMap[symbol]}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json',
+        'Referer': 'https://www.nseindia.com',
+      },
+      timeout: 10000,
+    });
+    const data = res.data?.filtered?.data;
+    if (!data?.length) return null;
+
+    let totalCE = 0, totalPE = 0;
+    let maxPainMap = {};
+
+    for (const row of data) {
+      const strike = row.strikePrice;
+      const ceOI   = row.CE?.openInterest || 0;
+      const peOI   = row.PE?.openInterest || 0;
+      totalCE += ceOI;
+      totalPE += peOI;
+      maxPainMap[strike] = (maxPainMap[strike] || 0) + ceOI + peOI;
+    }
+
+    const pcr = totalCE > 0 ? parseFloat((totalPE / totalCE).toFixed(2)) : 1;
+    const maxPain = Object.entries(maxPainMap).sort((a,b) => b[1]-a[1])[0]?.[0];
+
+    const result = { pcr, maxPain: parseFloat(maxPain), time: Date.now() };
+    optionsCache[symbol] = result;
+    console.log(`[Options] ${symbol}: PCR=${pcr} MaxPain=${maxPain}`);
+    return result;
+  } catch(e) {
+    console.error(`[Options] ${symbol}: ${e.message}`);
+    return optionsCache[symbol] || null; // return stale cache
+  }
+}
+
+// Add options data to quality score for India signals
+async function getOptionsBias(symbol, dir) {
+  const opt = await fetchOptionsChain(symbol);
+  if (!opt) return 0;
+  // PCR confirms direction: BUY signal + high PCR (bullish) = +4 bonus
+  if (dir === 'BUY'  && opt.pcr > 1.1) return 4;
+  if (dir === 'SELL' && opt.pcr < 0.9) return 4;
+  // PCR contradicts direction: slight penalty
+  if (dir === 'BUY'  && opt.pcr < 0.8) return -2;
+  if (dir === 'SELL' && opt.pcr > 1.2) return -2;
+  return 0;
+}
+
+// Options chain API endpoint
+app.get('/api/options/:symbol', async (req, res) => {
+  const sym = req.params.symbol.toUpperCase();
+  const opt = await fetchOptionsChain(sym);
+  if (!opt) return res.json({ error: 'No data', symbol: sym });
+  const bias = opt.pcr > 1.2 ? 'BULLISH' : opt.pcr < 0.8 ? 'BEARISH' : 'NEUTRAL';
+  res.json({ symbol: sym, pcr: opt.pcr, maxPain: opt.maxPain, bias, cached: new Date(opt.time).toISOString() });
+});
+
 const SMT_PAIRS = [
   { lead: 'EURUSD', lag: 'GBPUSD', dir: 'both' },
   { lead: 'AUDUSD', lag: 'NZDUSD', dir: 'both' },
@@ -3463,6 +3670,13 @@ async function runCycle() {
         continue;
       }
 
+      // ✅ Economic calendar guard — block forex/gold near high-impact news
+      if ((cfg.cat === 'forex' || cfg.cat === 'commodity') && forexPausedForNews()) {
+        console.log(`[ECO] ⏸ ${symbol}: paused for news event`);
+        cycleBlocked++; state.stats.blocked++;
+        continue;
+      }
+
       // ✅ FundingPips daily DD guard — block forex/gold if at 4.5% daily DD
       if ((cfg.cat === 'forex' || cfg.cat === 'commodity')) {
         const todayKey2  = new Date().toISOString().slice(0, 10);
@@ -3490,7 +3704,113 @@ async function runCycle() {
     } catch (e) { console.error(`[v10.3] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
   }
 
-  // ── SMT Divergence check (cross-symbol, forex only) ──────────────────────
+  // ── Economic calendar check (pause forex before high-impact news) ─────────
+  await checkEconomicCalendar();
+  // ── Weekly Trade Report ─────────────────────────────────────────────────────
+async function sendWeeklyReport() {
+  const weekAgo = Date.now() - 7 * 24 * 3600000;
+  const weekSigs = state.signals.filter(s => new Date(s.ts).getTime() > weekAgo);
+  if (!weekSigs.length) { await tgSend('📊 *Weekly Report* — No signals this week.'); return; }
+
+  const wins    = weekSigs.filter(s => s.tp1Hit).length;
+  const losses  = weekSigs.filter(s => s.slHit && !s.tp1Hit).length;
+  const pending = weekSigs.filter(s => !s.expired && !s.slHit).length;
+  const wr      = wins + losses > 0 ? Math.round(wins/(wins+losses)*100) : 0;
+
+  // Group by strategy
+  const bySt = {};
+  weekSigs.forEach(s => {
+    const id = s.strategy?.id || 'UNKNOWN';
+    if (!bySt[id]) bySt[id] = { w: 0, l: 0 };
+    if (s.tp1Hit) bySt[id].w++;
+    if (s.slHit && !s.tp1Hit) bySt[id].l++;
+  });
+  const stLines = Object.entries(bySt)
+    .map(([id,v]) => `  ${id}: ${v.w}W/${v.l}L`)
+    .join('\n');
+
+  // FP P&L this week
+  const fpWeek = Object.entries(state.fp.dailyPnL)
+    .filter(([d]) => new Date(d).getTime() > weekAgo)
+    .reduce((sum,[,v]) => sum + v, 0);
+
+  const report = [
+    `📊 *Weekly Trade Report*`,
+    `Week ending: ${new Date().toLocaleDateString('en-IN', {timeZone:'Asia/Kolkata'})}`,
+    ``,
+    `*Results:* ${wins}W / ${losses}L / ${pending} pending`,
+    `*Win Rate:* ${wr}%`,
+    `*Total signals:* ${weekSigs.length}`,
+    ``,
+    `*By Strategy:*
+${stLines || '  No completed trades'}`,
+    ``,
+    `*FundingPips (Forex/Gold):*`,
+    `  Week P&L: $${fpWeek.toFixed(2)}`,
+    `  Total P&L: $${(state.fp.totalPnL||0).toFixed(2)}`,
+    `  Phase ${state.fp.phase} progress: ${Math.min(100,(Math.max(0,state.fp.totalPnL)/(CONFIG.FP_ACCOUNT_USD*(state.fp.phase===1?CONFIG.FP_PHASE1_TARGET:CONFIG.FP_PHASE2_TARGET)/100)*100)).toFixed(1)}%`,
+  ].join('\n');
+
+  await tgSend(report);
+  console.log('[Weekly] ✅ Report sent');
+}
+
+// ── Economic Calendar — pause forex signals 30min before high-impact news ──────
+// Uses free ForexFactory-style approach: maintain a list of known recurring events
+// and add manual pauses via /pause command for one-off news
+const ECO_PAUSE_REASONS = new Set(); // set by /econews command or auto-detected
+
+async function checkEconomicCalendar() {
+  // Only affects forex/commodity (not India/Crypto)
+  // Check if we're within 30 minutes of a known high-impact event
+  const now = new Date();
+  const dayUTC  = now.getUTCDay();  // 0=Sun, 5=Fri
+  const hourUTC = now.getUTCHours();
+  const minUTC  = now.getUTCMinutes();
+  const timeUTC = hourUTC * 60 + minUTC; // minutes since midnight UTC
+
+  // Known recurring HIGH-IMPACT events (UTC times, approximate)
+  // These are the most market-moving events — NFP, CPI, FOMC, RBI
+  const HIGH_IMPACT = [
+    // NFP: First Friday of month 13:30 UTC
+    { day: 5, from: 13*60+0, to: 14*60+30, label: 'NFP window' },
+    // US CPI: ~13:30 UTC usually Tuesday/Wednesday mid-month
+    // FOMC: usually Wed 19:00 UTC (8 times/year)
+    { day: 3, from: 18*60+30, to: 20*60+0, label: 'FOMC window (Wed)' },
+    // RBI Policy: Usually during India market hours — auto-handled by India closed gate
+    // ECB: usually Thu 12:15 UTC
+    { day: 4, from: 12*60+0, to: 13*60+0, label: 'ECB window (Thu)' },
+    // BOE: usually Thu 12:00 UTC
+    { day: 4, from: 11*60+45, to: 12*60+30, label: 'BOE window (Thu)' },
+  ];
+
+  for (const event of HIGH_IMPACT) {
+    if (dayUTC === event.day && timeUTC >= event.from - 30 && timeUTC <= event.to) {
+      // Within 30 min before or during event window
+      if (!ECO_PAUSE_REASONS.has(event.label)) {
+        ECO_PAUSE_REASONS.add(event.label);
+        const now2 = Date.now();
+        const key = `eco_${event.label}`;
+        if (!state.fp.warningsSent[key] || now2 - state.fp.warningsSent[key] > 3600000) {
+          state.fp.warningsSent[key] = now2;
+          await tgSend(`⏸ *Economic Calendar Pause*
+${event.label} — Forex/Gold signals paused for safety.
+Will resume after event window.`);
+        }
+      }
+      return; // signal blocked downstream
+    } else {
+      ECO_PAUSE_REASONS.delete(event.label);
+    }
+  }
+}
+
+// Helper: check if forex should be paused due to news
+function forexPausedForNews() {
+  return ECO_PAUSE_REASONS.size > 0;
+}
+
+// ── SMT Divergence check (cross-symbol, forex only) ──────────────────────
   await checkSMT();
   await checkExpiry();
   await fpWatchdog();
@@ -3506,7 +3826,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v10.3 — ICT/SMC Engine',
-  version: '10.3.5',
+  version: '10.4.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -3517,7 +3837,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.3.5',
+    status: 'OK', version: '10.4.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -3590,6 +3910,61 @@ app.get('/api/strategies',       (req, res) => res.json({
     { id: 'SMT_DIV',      name: 'SMT Divergence (Cross-Symbol)',    cat: 'ICT',   wr: '70-78%', rr: '1:3-1:6' },
   ],
 }));
+
+// ── Backtesting endpoint (run strategies on historical data) ─────────────────
+app.get('/api/backtest/:symbol', async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  const cfg    = SYMBOLS[symbol];
+  if (!cfg) return res.status(404).json({ error: 'Symbol not found' });
+  try {
+    const mtf = await dataFetcher.fetchMTF(symbol);
+    if (!mtf?.m15?.length) return res.json({ error: 'No data available', symbol });
+
+    const m15 = mtf.m15, h1 = mtf.h1 || [], h4 = mtf.h4 || [];
+    const results = { symbol, candles: m15.length, signals: [], stratWR: {} };
+
+    // Simulate signals on historical M15 candles (walk-forward)
+    const lookback = 60; // use 60 candles context, test on remaining
+    for (let i = lookback; i < m15.length - 5; i++) {
+      const slice   = m15.slice(0, i);
+      const h1slice = h1.slice(0, Math.floor(i / 4));
+      const h4slice = h4.slice(0, Math.floor(i / 16));
+      try {
+        const fired = Detectors.runAll(slice, h1slice, h4slice, cfg.cat, null, cfg.noStrategies || []);
+        if (!fired.length) continue;
+        const best = fired.reduce((a,b) => a.score > b.score ? a : b);
+        const conf = fired.filter(s => s.dir === best.dir);
+        if (conf.length < 2) continue;
+
+        // Simulate outcome: check next 5 candles for TP/SL
+        const entry    = slice[slice.length-1].close;
+        const atr      = Ind.atr(slice);
+        const sl       = best.dir === 'BUY' ? entry - atr * 1.0 : entry + atr * 1.0;
+        const tp       = best.dir === 'BUY' ? entry + atr * 2.0 : entry - atr * 2.0;
+        let outcome    = 'UNKNOWN';
+        for (let j = i; j < Math.min(i+5, m15.length); j++) {
+          const c = m15[j];
+          if (best.dir === 'BUY'  && c.high  >= tp) { outcome = 'TP'; break; }
+          if (best.dir === 'BUY'  && c.low   <= sl) { outcome = 'SL'; break; }
+          if (best.dir === 'SELL' && c.low   <= tp) { outcome = 'TP'; break; }
+          if (best.dir === 'SELL' && c.high  >= sl) { outcome = 'SL'; break; }
+        }
+        const id = best.id;
+        if (!results.stratWR[id]) results.stratWR[id] = { tp: 0, sl: 0, total: 0 };
+        results.stratWR[id].total++;
+        if (outcome === 'TP') results.stratWR[id].tp++;
+        if (outcome === 'SL') results.stratWR[id].sl++;
+      } catch(e) { /* skip */ }
+    }
+
+    // Calculate WR per strategy
+    Object.keys(results.stratWR).forEach(id => {
+      const s = results.stratWR[id];
+      s.wr = s.total > 0 ? `${Math.round(s.tp/s.total*100)}%` : 'N/A';
+    });
+    res.json(results);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get('/api/symbols',          (req, res) => res.json({ total: Object.keys(SYMBOLS).length, symbols: SYMBOLS }));
 
@@ -3836,6 +4211,19 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
       ).join('\n');
       await tgSend(`📋 *All Symbols*\n${lines}\n\nDisabled: ${disabled.length || 'none'}`);
 
+    } else if (cmd === '/econews') {
+      // Manual news pause: /econews on 60  (pause for 60 min)  /econews off
+      if (arg === 'off') {
+        ECO_PAUSE_REASONS.clear();
+        state.pauseUntil = null;
+        await tgSend('▶️ *Economic pause lifted* — forex signals resumed');
+      } else {
+        const mins = parseInt(arg) || 60;
+        state.pauseUntil = Date.now() + mins * 60000;
+        ECO_PAUSE_REASONS.add('Manual news pause');
+        await tgSend(`⏸ *Manual news pause* — forex signals paused for ${mins}min`);
+      }
+
     } else if (cmd === '/phase') {
       const ph = parseInt(arg);
       if (ph === 1 || ph === 2) {
@@ -3879,6 +4267,95 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
     } catch(e) { console.error('[TG CMD]', e.message); }
 });
 
+// ── Dashboard Web UI ────────────────────────────────────────────────────────
+app.get('/dashboard', (req, res) => {
+  const sigs   = state.signals.slice(0, 20);
+  const active = sigs.filter(s => !s.expired && !s.slHit);
+  const wins   = state.stats.tp1Hits || 0;
+  const losses = state.stats.slHits  || 0;
+  const wr     = wins + losses > 0 ? Math.round(wins/(wins+losses)*100) : 0;
+  const todayKey = new Date().toISOString().slice(0,10);
+  const fpPnL  = (state.fp.dailyPnL[todayKey] || 0).toFixed(2);
+  const fpTotal= (state.fp.totalPnL || 0).toFixed(2);
+  const phase  = state.fp.phase;
+  const phaseTgt = phase === 1 ? CONFIG.FP_PHASE1_TARGET : CONFIG.FP_PHASE2_TARGET;
+  const phaseProg= Math.min(100,(Math.max(0,state.fp.totalPnL)/(CONFIG.FP_ACCOUNT_USD*phaseTgt/100)*100)).toFixed(1);
+
+  const sigRows = sigs.map(s => {
+    const st = s.expired ? '⏱' : s.slHit ? '❌' : s.tp3Hit ? '🏆' : s.tp2Hit ? '✅✅' : s.tp1Hit ? '✅' : '🔵';
+    const tp1 = s.tp1Hit ? '✅' : s.levels.tp1 || '-';
+    return `<tr>
+      <td>${st}</td><td>${s.dir === 'BUY' ? '🟢' : '🔴'} ${s.symbol}</td>
+      <td>${s.strategy?.name?.slice(0,12) || '-'}</td>
+      <td>${s.quality}</td>
+      <td>${s.levels?.entry || '-'}</td>
+      <td>${s.levels?.sl || '-'}</td>
+      <td>${tp1}</td>
+      <td>${s.levels?.rr || '-'}</td>
+      <td>${new Date(s.ts).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit'})}</td>
+    </tr>`;
+  }).join('');
+
+  const stratWR = Object.entries(state.stats.stratWR || {})
+    .map(([id,v]) => `<tr><td>${id}</td><td>${v.wins}</td><td>${v.losses}</td><td>${v.wins+v.losses>0?Math.round(v.wins/(v.wins+v.losses)*100)+'%':'N/A'}</td></tr>`)
+    .join('');
+
+  res.send(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hybrid Trading Bot v10.3</title>
+<meta http-equiv="refresh" content="30">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; background: #0d1117; color: #c9d1d9; padding: 16px; }
+  h1 { color: #58a6ff; font-size: 18px; margin-bottom: 16px; }
+  h2 { color: #8b949e; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 8px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(140px,1fr)); gap: 10px; margin-bottom: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+  .card .val { font-size: 22px; font-weight: 700; color: #58a6ff; }
+  .card .lbl { font-size: 11px; color: #8b949e; margin-top: 2px; }
+  .green { color: #3fb950 !important; }
+  .red   { color: #f85149 !important; }
+  .amber { color: #d29922 !important; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; background: #161b22; border-radius: 8px; overflow: hidden; margin-bottom: 16px; }
+  th { background: #21262d; padding: 8px; text-align: left; color: #8b949e; font-weight: 600; }
+  td { padding: 7px 8px; border-top: 1px solid #21262d; }
+  .bar-bg { background: #21262d; border-radius: 4px; height: 8px; }
+  .bar-fill { background: #3fb950; border-radius: 4px; height: 8px; }
+  .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; background: #21262d; }
+</style></head><body>
+<h1>🚀 Hybrid Trading Bot v10.3 <span class="tag">${Object.keys(SYMBOLS).length} symbols · 16 strategies</span></h1>
+
+<div class="grid">
+  <div class="card"><div class="val ${active.length > 0 ? 'green' : ''}">${active.length}</div><div class="lbl">Active Signals</div></div>
+  <div class="card"><div class="val ${wr >= 60 ? 'green' : wr >= 40 ? 'amber' : 'red'}">${wr}%</div><div class="lbl">Win Rate (${wins}W/${losses}L)</div></div>
+  <div class="card"><div class="val ${parseFloat(fpPnL) >= 0 ? 'green' : 'red'}">$${fpPnL}</div><div class="lbl">FP Today P&L</div></div>
+  <div class="card"><div class="val ${parseFloat(fpTotal) >= 0 ? 'green' : 'red'}">$${fpTotal}</div><div class="lbl">FP Total P&L (Phase ${phase})</div></div>
+  <div class="card"><div class="val">${state.stats.total || 0}</div><div class="lbl">Total Signals</div></div>
+  <div class="card"><div class="val">${state.stats.tp1Hits||0}/${state.stats.tp2Hits||0}/${state.stats.tp3Hits||0}</div><div class="lbl">TP1/TP2/TP3 Hits</div></div>
+</div>
+
+<h2>FundingPips Phase ${phase} Progress</h2>
+<div class="card" style="margin-bottom:16px">
+  <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+    <span>Phase ${phase} target: ${phaseTgt}% = $${(CONFIG.FP_ACCOUNT_USD*phaseTgt/100).toFixed(0)}</span>
+    <span class="green">${phaseProg}%</span>
+  </div>
+  <div class="bar-bg"><div class="bar-fill" style="width:${phaseProg}%"></div></div>
+  <div style="margin-top:6px;font-size:11px;color:#8b949e">Risk: $${(CONFIG.FP_ACCOUNT_USD*CONFIG.FP_RISK_PCT/100).toFixed(0)}/trade · Disabled: ${CONFIG.DISABLED_SYMBOLS.join(', ')||'none'}</div>
+</div>
+
+<h2>Recent Signals</h2>
+<table><thead><tr><th>Status</th><th>Symbol</th><th>Strategy</th><th>Q</th><th>Entry</th><th>SL</th><th>TP1</th><th>R:R</th><th>Time IST</th></tr></thead>
+<tbody>${sigRows || '<tr><td colspan="9" style="text-align:center;color:#8b949e;padding:20px">No signals yet</td></tr>'}</tbody></table>
+
+<h2>Strategy Win Rates</h2>
+<table><thead><tr><th>Strategy</th><th>Wins</th><th>Losses</th><th>WR%</th></tr></thead>
+<tbody>${stratWR || '<tr><td colspan="4" style="text-align:center;color:#8b949e;padding:12px">No data yet — win rates build up after live signals</td></tr>'}</tbody></table>
+
+<div style="font-size:11px;color:#8b949e;text-align:center;margin-top:8px">Auto-refreshes every 30 seconds · ${new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST</div>
+</body></html>`);
+});
+
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
 // ═════════════════════════════════════════════════════════════
@@ -3887,7 +4364,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v10.3.5 — ICT/SMC ENGINE   ║
+║  HYBRID TRADING BOT v10.4.0 — ICT/SMC ENGINE   ║
 ║   16 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -3896,13 +4373,14 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Forex:9 · Commodity:2 · Cr
   `);
 
   // Give CoinGecko a moment before first cycle (avoid cold-start 429)
-  // Restore persisted signals/state from previous run
-  loadPersist();
+  // Connect MongoDB and restore state
+  await connectMongo();
+  await loadPersist();
   console.log('[v10.3] Waiting 5s before first cycle (CG rate limit buffer)...');
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.3.5 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.4.0 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 16 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -3914,6 +4392,8 @@ ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activat
   // Offset cron by 2 min to avoid clash with startup cycle
   // Fires at :02, :17, :32, :47 of every hour
   cron.schedule('2,17,32,47 * * * *', runCycle);
+  // Weekly trade report — every Sunday at 20:00 IST (14:30 UTC)
+  cron.schedule('30 14 * * 0', sendWeeklyReport);
   // Separate 1-min cron for TP/SL tracking — catches intra-candle TP hits
   cron.schedule('* * * * *', async () => {
     if (!state.running) await checkExpiry();
