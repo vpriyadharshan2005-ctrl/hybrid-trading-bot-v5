@@ -3831,7 +3831,7 @@ function forexPausedForNews() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v10.3 — ICT/SMC Engine',
-  version: '10.4.4',
+  version: '10.4.5',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -3842,7 +3842,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.4.4',
+    status: 'OK', version: '10.4.5',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -4369,7 +4369,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v10.4.4 — ICT/SMC ENGINE   ║
+║  HYBRID TRADING BOT v10.4.5 — ICT/SMC ENGINE   ║
 ║   16 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -4385,7 +4385,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Forex:9 · Commodity:2 · Cr
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.4.4 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.4.5 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 16 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -4405,5 +4405,5 @@ ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activat
   cron.schedule('* * * * *', async () => {
     if (!state.running) await checkExpiry();
   });
-  console.log('[v10.4] Cron scheduled: M15 every :02 offset + TP/SL check every 1min. Bot running.\n');
+  console.log('[v10.4] Cron scheduled: every 15min at :00/:15/:30/:45 + TP/SL every 1min. Bot running.\n');
 });
