@@ -2137,15 +2137,33 @@ class Builder {
       // Entry price NEVER modified — always M15 candle close
     }
 
-    // ── Minimum RR check: reject if RR < 1:1.5 ───────────────────────────────
+    // ── TP ordering enforcement — TP2 must be beyond TP1, TP3 beyond TP2 ─────────
+    if (tp1 && tp2 && entry) {
+      if (isBuy) {
+        // BUY: TP1 < TP2 < TP3 (all above entry)
+        if (tp2 <= tp1) tp2 = f(tp1 + Math.abs(tp1 - entry) * 0.5);
+        if (tp3 && tp3 <= tp2) tp3 = f(tp2 + Math.abs(tp2 - entry) * 0.5);
+      } else {
+        // SELL: TP1 > TP2 > TP3 (all below entry)
+        if (tp2 >= tp1) tp2 = f(tp1 - Math.abs(entry - tp1) * 0.5);
+        if (tp3 && tp3 >= tp2) tp3 = f(tp2 - Math.abs(entry - tp2) * 0.5);
+      }
+    }
+
+    // ── Minimum RR check: enforce TP1 ≥ 1:1.5 RR ──────────────────────────────
     if (sl && tp1 && entry) {
       const risk   = Math.abs(entry - sl);
       const reward = Math.abs(tp1   - entry);
       if (risk > 0 && reward / risk < 1.5) {
-        tp1 = isBuy
-          ? f((entry || price) + risk * 1.5)
-          : f((entry || price) - risk * 1.5);
+        // Extend TP1 to minimum 1:1.5 RR
+        tp1 = isBuy ? f(entry + risk * 1.5) : f(entry - risk * 1.5);
+        console.log(`[Levels] TP1 extended to min 1:1.5 RR: ${tp1}`);
       }
+    }
+    // After TP1 fix, ensure TP2 and TP3 are still beyond TP1
+    if (tp1 && tp2) {
+      if (isBuy  && tp2 <= tp1) tp2 = f(tp1 + Math.abs(tp1 - entry) * 0.5);
+      if (!isBuy && tp2 >= tp1) tp2 = f(tp1 - Math.abs(entry - tp1) * 0.5);
     }
 
     return { entry, sl, tp1, tp2, tp3, m5Entry, m5Confirmation, m5EntryNote };
@@ -2720,30 +2738,18 @@ const dataFetcher = new DataFetcher();
 //  SECTION 5 — TELEGRAM
 // ═════════════════════════════════════════════════════════════
 
-async function tgSend(text, parseMode = 'Markdown') {
+async function tgSend(text) {
   if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) return;
+  // Send as plain text — reliable, no Markdown parsing errors
+  const plain = text.replace(/[*_`]/g, '').replace(/<[^>]+>/g, '');
   try {
     await axios.post(
       `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
-      { chat_id: CONFIG.TELEGRAM_CHAT_ID, text, parse_mode: parseMode, disable_web_page_preview: true },
+      { chat_id: CONFIG.TELEGRAM_CHAT_ID, text: plain, disable_web_page_preview: true },
       { timeout: 10000 }
     );
   } catch (e) {
     console.error('[TG] Send error:', e.message);
-    // Retry as plain text (strips all formatting — always works)
-    if (parseMode !== 'none') {
-      try {
-        const plain = text
-          .replace(/[*_`]/g, '')       // strip Markdown chars
-          .replace(/<[^>]+>/g, '');    // strip HTML tags
-        await axios.post(
-          `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
-          { chat_id: CONFIG.TELEGRAM_CHAT_ID, text: plain, disable_web_page_preview: true },
-          { timeout: 10000 }
-        );
-        console.log('[TG] ✅ Sent (plain text fallback):', plain.slice(0, 60));
-      } catch (e2) { console.error('[TG] Plain text also failed:', e2.message); }
-    }
   }
 }
 
@@ -3825,7 +3831,7 @@ function forexPausedForNews() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v10.3 — ICT/SMC Engine',
-  version: '10.4.3',
+  version: '10.4.4',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -3836,7 +3842,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.4.3',
+    status: 'OK', version: '10.4.4',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -4363,7 +4369,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v10.4.3 — ICT/SMC ENGINE   ║
+║  HYBRID TRADING BOT v10.4.4 — ICT/SMC ENGINE   ║
 ║   16 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -4379,7 +4385,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Forex:9 · Commodity:2 · Cr
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.4.3 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.4.4 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 16 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
