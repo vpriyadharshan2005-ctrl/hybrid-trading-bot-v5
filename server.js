@@ -29,20 +29,27 @@ const CONFIG = {
   SIGNAL_QUALITY_MIN: 80,
   CANDLE_LIMIT:       130,   // M15 candles to fetch
   MAX_SIGNALS:        150,
+  MAX_OPEN_TRADES:    4,    // max simultaneous active signals (prevents overtrading)
+  MAX_DAILY_SIGNALS:  8,    // max signals per day across all symbols
   COOLDOWN_MIN:       45,    // minutes between signals per symbol
   FLIP_BLOCK_MIN:     120,   // minutes before direction can flip
-  EXPIRY_MIN:         20,    // signal expires after 20 min (next M15 candle)
+  EXPIRY_MIN:         240,   // signal expires after 4 hours (gives TP time to hit)
   // ── Per-market risk configuration ─────────────────────────────────────────
-  // India NSE — fixed ₹ risk per trade (self-funded)
-  INDIA_RISK_INR:     parseFloat(process.env.INDIA_RISK_INR  || '6000'),  // ₹6,000 per trade
+  // India NSE — fixed ₹ risk per trade (self-funded, ₹5,000 account)
+  INDIA_RISK_INR:     parseFloat(process.env.INDIA_RISK_INR  || '5000'),  // ₹5,000 account → default ₹500/trade (10%)
 
-  // Crypto — fixed ₹ risk per trade (Delta Exchange, self-funded)
-  CRYPTO_RISK_INR:    parseFloat(process.env.CRYPTO_RISK_INR || '3000'),  // ₹3,000 per trade
+  // Crypto — fixed ₹ risk per trade (Delta Exchange, ₹1,700 account)
+  CRYPTO_RISK_INR:    parseFloat(process.env.CRYPTO_RISK_INR || '1700'),  // ₹1,700 account → default ₹170/trade (10%)
 
-  // Forex + Commodity — FundingPips 5K account (% based, must respect DD rules)
+  // Forex + Commodity — FundingPips ONLY (% based, must respect DD rules)
+  // India and Crypto are self-funded — NOT under FundingPips rules
   FP_ACCOUNT_USD:     parseFloat(process.env.FP_ACCOUNT_USD  || '5000'),  // $5,000 FP account
   FP_RISK_PCT:        parseFloat(process.env.FP_RISK_PCT      || '0.5'),  // 0.5% = $25/trade (conservative for challenge)
   USD_TO_INR:         parseFloat(process.env.USD_TO_INR        || '83'),  // approx rate for display
+
+  // ── Per-symbol enable/disable (set to false to skip a symbol) ──────────────
+  // Control from env vars: SYMBOL_EURUSD=false to disable, default all enabled
+  DISABLED_SYMBOLS:   (process.env.DISABLED_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
 
   // ── FundingPips Challenge Tracker ───────────────────────────────────────────
   FP_PHASE:           parseInt(process.env.FP_PHASE           || '1'),    // current phase (1 or 2)
@@ -60,8 +67,8 @@ const SYMBOLS = {
   NIFTY:      { name:'NIFTY 50',      cat:'india',     src:'dhan', dhanId:'13',  seg:'IDX_I' },
   BANKNIFTY:  { name:'Bank NIFTY',    cat:'india',     src:'dhan', dhanId:'25',  seg:'IDX_I' },
   FINNIFTY:   { name:'Fin NIFTY',     cat:'india',     src:'dhan', dhanId:'27',  seg:'IDX_I' },
-  SENSEX:     { name:'BSE SENSEX',    cat:'india',     src:'dhan', dhanId:'51',  seg:'IDX_I' },
-  MIDCPNIFTY: { name:'Midcap NIFTY',  cat:'india',     src:'dhan', dhanId:'11915', seg:'IDX_I' },
+  SENSEX:     { name:'BSE SENSEX',    cat:'india',     src:'dhan', dhanId:'51',  seg:'IDX_I' }, // BSE index — signals only, limited F&O access
+  MIDCPNIFTY: { name:'Midcap NIFTY',  cat:'india',     src:'dhan', dhanId:'11915', seg:'IDX_I' }, // ⚠️ verify dhanId at web.dhan.co
 
   // ── Forex — Finnhub primary | TwelveData fallback ──────────────────────
   // Majors (highest volume globally)
@@ -1571,15 +1578,17 @@ class Builder {
     let   riskAmt, currency, riskLabel;
 
     if (cat === 'india') {
-      // India NSE — fixed ₹6,000 risk per trade
+      // India NSE — ₹5,000 account, default 10% risk = ₹500/trade
+      // Configurable via INDIA_RISK_INR env var
       riskAmt   = CONFIG.INDIA_RISK_INR;
       currency  = '₹';
-      riskLabel = `₹${riskAmt.toLocaleString('en-IN')} (India fixed)`;
+      riskLabel = `₹${riskAmt.toLocaleString('en-IN')} (India — ₹5K acct)`;
     } else if (cat === 'crypto') {
-      // Crypto — fixed ₹3,000 risk per trade
+      // Crypto — ₹1,700 account, default 10% risk = ₹170/trade
+      // Configurable via CRYPTO_RISK_INR env var
       riskAmt   = CONFIG.CRYPTO_RISK_INR;
       currency  = '₹';
-      riskLabel = `₹${riskAmt.toLocaleString('en-IN')} (Crypto fixed)`;
+      riskLabel = `₹${riskAmt.toLocaleString('en-IN')} (Crypto — ₹1.7K acct)`;
     } else {
       // Forex + Commodity — FundingPips 0.5% of $5,000
       const fpRiskUSD = CONFIG.FP_ACCOUNT_USD * (CONFIG.FP_RISK_PCT / 100);
@@ -1591,7 +1600,7 @@ class Builder {
       const effectiveRisk = halfRisk ? fpRiskUSD / 2 : fpRiskUSD;
       riskAmt   = Math.round(effectiveRisk * CONFIG.USD_TO_INR); // convert to ₹ for display
       currency  = '$';
-      riskLabel = `$${effectiveRisk.toFixed(0)} (${CONFIG.FP_RISK_PCT}% of $${CONFIG.FP_ACCOUNT_USD} FP${halfRisk ? ' ⚠️ halved' : ''})`;
+      riskLabel = `$${effectiveRisk.toFixed(0)} (${CONFIG.FP_RISK_PCT}% of $${CONFIG.FP_ACCOUNT_USD} FundingPips${halfRisk ? ' ⚠️ halved' : ''})`;
     }
 
     lvls.riskAmount   = riskAmt;
@@ -1635,7 +1644,7 @@ class Builder {
       candles:   m15.length,
       m5candles: m5?.length || 0,
       timeframe:  'M15',
-      entryTF:    lvls.m5Confirmation ? 'M5' : 'M15',
+      entryTF:    'M15', // All entries on M15 close (M5 used for confirmation note only)
       m5Confirmed: lvls.m5Confirmation || false,
       m5EntryNote: lvls.m5EntryNote || null,
       ts:        new Date().toISOString(),
@@ -2094,38 +2103,31 @@ class Builder {
     let m5Confirmation = false;
     let m5EntryNote = null;
 
+    // M5 used for confirmation context ONLY — entry price is always M15 close
     if (M5_STRATEGIES.includes(sig.id) && m5 && m5.length >= 5) {
-      const m5conf = Ind.confirmed(m5);
-      const m5last = m5conf[m5conf.length - 1];
-      const m5prev = m5conf[m5conf.length - 2];
-      const m5atr  = Ind.atr(m5conf);
-      const m5body = Math.abs(m5last.close - m5last.open);
-      const m5minBody = m5atr * 0.25; // M5 body must be meaningful
+      const m5conf    = Ind.confirmed(m5);
+      const m5last    = m5conf[m5conf.length - 1];
+      const m5prev    = m5conf[m5conf.length - 2];
+      const m5atr     = Ind.atr(m5conf);
+      const m5body    = Math.abs(m5last.close - m5last.open);
+      const m5minBody = m5atr * 0.25;
 
       if (isBuy) {
-        // M5 bullish confirmation: last M5 candle bullish body above M5 prev close
         if (m5last.close > m5last.open && m5body >= m5minBody && m5last.close > m5prev.close) {
-          // Refined entry: M5 candle close (tighter than M15 close)
-          m5Entry = f(m5last.close);
           m5Confirmation = true;
-          m5EntryNote = `M5 bullish body confirmed at ${m5Entry}`;
-          // Tighten entry if M5 close is INSIDE the M15 zone (closer to zone edge)
-          if (entry && m5Entry < entry) entry = m5Entry;
+          m5EntryNote = `M5 momentum ✅ confirmed — Enter at M15 close: \`${entry}\``;
         } else {
-          // M5 not confirmed yet — signal fires but note to wait for M5 confirmation
-          m5EntryNote = `Wait for M5 bull body close above ${f(m5last.close)} before entering`;
+          m5EntryNote = `M5 not yet confirmed — still enter at M15 close: \`${entry}\``;
         }
       } else {
-        // M5 bearish confirmation
         if (m5last.close < m5last.open && m5body >= m5minBody && m5last.close < m5prev.close) {
-          m5Entry = f(m5last.close);
           m5Confirmation = true;
-          m5EntryNote = `M5 bearish body confirmed at ${m5Entry}`;
-          if (entry && m5Entry > entry) entry = m5Entry;
+          m5EntryNote = `M5 momentum ✅ confirmed — Enter at M15 close: \`${entry}\``;
         } else {
-          m5EntryNote = `Wait for M5 bear body close below ${f(m5last.close)} before entering`;
+          m5EntryNote = `M5 not yet confirmed — still enter at M15 close: \`${entry}\``;
         }
       }
+      // Entry price NEVER modified — always M15 candle close
     }
 
     // ── Minimum RR check: reject if RR < 1:1.5 ───────────────────────────────
@@ -2399,6 +2401,57 @@ class BinanceFallback {
   }
 }
 
+// ── KuCoin Fallback — real M15 OHLC, no geo-restriction, no API key ────────────
+// Used for SOL/DOGE/ADA when Binance returns 451 (geo-blocked from Render)
+class KuCoinFallback {
+  constructor() {
+    this.baseUrl  = 'https://api.kucoin.com';
+    this.cache    = {};
+    this.ttl      = 12 * 60000;
+    this.lastCall = 0;
+    this.symMap   = {
+      'SOLUSD':  'SOL-USDT', 'DOGEUSD':  'DOGE-USDT',
+      'ADAUSD':  'ADA-USDT', 'LTCUSD':   'LTC-USDT',
+      'BTCUSD':  'BTC-USDT', 'ETHUSD':   'ETH-USDT',
+      'XRPUSD':  'XRP-USDT', 'BNBUSD':   'BNB-USDT',
+    };
+  }
+
+  async fetch(deltaSymbol, interval = '15min', limit = 200) {
+    const kSym = this.symMap[deltaSymbol];
+    if (!kSym) return null;
+    const cached = this.cache[kSym];
+    if (cached && Date.now() - cached.time < this.ttl) return cached.candles;
+    const gap = 400 - (Date.now() - this.lastCall);
+    if (gap > 0) await new Promise(r => setTimeout(r, gap));
+    this.lastCall = Date.now();
+    // KuCoin interval: 1min=1min, 5min=5min, 15min=15min, 1hour=1hour, 4hour=4hour
+    const kInterval = interval === '15m' ? '15min' : interval === '5m' ? '5min'
+                    : interval === '1h'  ? '1hour' : interval === '4h' ? '4hour' : '15min';
+    try {
+      const res = await axios.get(`${this.baseUrl}/api/v1/market/candles`, {
+        params: { symbol: kSym, type: kInterval },
+        headers: { 'User-Agent': 'HybridTradingBot/10.3' },
+        timeout: 15000,
+      });
+      if (!res.data?.data?.length) return null;
+      // KuCoin returns newest first: [time, open, close, high, low, volume, turnover]
+      const candles = res.data.data.reverse().slice(-limit).map(k => ({
+        time:   parseInt(k[0]) * 1000,
+        open:   parseFloat(k[1]), close: parseFloat(k[2]),
+        high:   parseFloat(k[3]), low:   parseFloat(k[4]),
+        volume: parseFloat(k[5]),
+      }));
+      console.log(`[KuCoin-FB] ✅ ${kSym} [${kInterval}]: ${candles.length} candles`);
+      this.cache[kSym] = { candles, time: Date.now() };
+      return candles;
+    } catch (e) {
+      console.error(`[KuCoin-FB] ${kSym}: ${e.response?.status || e.message}`);
+      return this.cache[kSym]?.candles || null;
+    }
+  }
+}
+
 // ── CoinGecko Fallback — only used when Delta Exchange fails ─────────────────
 // Simpler than the old CGFetcher: no prefetch, just fetch on demand.
 // Returns 30-min candles (best CG free tier offers) as M15 proxy.
@@ -2502,6 +2555,7 @@ class DataFetcher {
     this.delta   = new DeltaFetcher();
     this.binFb   = new BinanceFallback(); // Binance fallback (real M15, no key)
     this.cgFb    = new CGFallback();      // CoinGecko last resort (30-min proxy)
+    this.kcFb    = new KuCoinFallback();  // KuCoin fallback (no geo-restriction)
     this.dhan    = new DhanFetcher();
     this.cache = {};     // symbol → last known M15 candles
     this.mtfCache = {}; // symbol_mtf → { data, time }
@@ -2594,9 +2648,25 @@ class DataFetcher {
             console.log(`[Binance-FB] ✅ ${symbol}: M15(${m15.length})`);
           }
         }
-        // ── Fallback 2: CoinGecko (30-min proxy — last resort) ─────────
+        // ── Fallback 2: KuCoin (real M15, no geo-restriction) ────────────
         if (!m15 || m15.length < 10) {
-          console.log(`[CG-FB] Binance also failed — trying CoinGecko`);
+          console.log(`[KuCoin-FB] Binance failed — trying KuCoin for ${symbol}`);
+          const kcM15 = await this.kcFb.fetch(cfg.deltaSymbol, '15m', 200);
+          if (kcM15?.length >= 10) {
+            const kcM5 = await this.kcFb.fetch(cfg.deltaSymbol, '5m', 288);
+            const kcH1 = await this.kcFb.fetch(cfg.deltaSymbol, '1h', 168);
+            const kcH4 = await this.kcFb.fetch(cfg.deltaSymbol, '4h', 180);
+            m5  = kcM5  || null;
+            m15 = kcM15;
+            h1  = kcH1  || this.resample(kcM15, 4);
+            h4  = kcH4  || this.resample(kcM15, 16);
+            source = 'kucoin_fallback';
+            console.log(`[KuCoin-FB] ✅ ${symbol}: M15(${m15.length})`);
+          }
+        }
+        // ── Fallback 3: CoinGecko (30-min proxy — last resort) ─────────
+        if (!m15 || m15.length < 10) {
+          console.log(`[CG-FB] KuCoin also failed — trying CoinGecko`);
           const cgCandles = await this.cgFb.fetch(cfg.cgId);
           if (cgCandles?.length >= 10) {
             m15    = cgCandles;
@@ -2821,10 +2891,14 @@ class Gate {
     if (sig.confirmedBy.length < 2)
       return { ok: false, why: `Only ${sig.confirmedBy.length} strategy` };
 
-    // Price drift: entry must be within 0.5% of live price
+    // Price drift — per-category thresholds
     if (sig.levels?.entry) {
       const drift = Math.abs(sig.levels.entry - price) / price;
-      if (drift > 0.005) return { ok: false, why: `Price drifted ${(drift*100).toFixed(2)}%` };
+      const driftLimit = sig.cat === 'india'  ? 0.002  // 0.2% for NSE
+                       : sig.cat === 'forex' || sig.cat === 'commodity' ? 0.003  // 0.3% forex
+                       : 0.01;  // 1% for crypto (volatile)
+      if (drift > driftLimit)
+        return { ok: false, why: `Price drifted ${(drift*100).toFixed(2)}% > ${(driftLimit*100)}% limit` };
     }
 
     if (this._cd[sym] && now - this._cd[sym] < cdMs) {
@@ -2887,8 +2961,9 @@ const state = {
 
 // ── FundingPips P&L tracker ──────────────────────────────────────────────────
 // Called after TP/SL events to update challenge progress
+// FundingPips P&L — FOREX + COMMODITY ONLY (India/Crypto are separate self-funded accounts)
 function fpUpdatePnL(sig, outcome) {
-  if (sig.cat !== 'forex' && sig.cat !== 'commodity') return; // only forex/gold
+  if (sig.cat !== 'forex' && sig.cat !== 'commodity') return; // FP = forex/gold only, NOT india/crypto
   const todayKey = new Date().toISOString().slice(0, 10);
   if (!state.fp.dailyPnL[todayKey]) state.fp.dailyPnL[todayKey] = 0;
   if (!state.fp.startedAt) state.fp.startedAt = todayKey;
@@ -3119,9 +3194,15 @@ async function checkExpiry() {
       }
     }
 
-    // ── SL hit detection ──────────────────────────────────────────────────
+    // ── SL hit detection — use candle LOW/HIGH not close ────────────────────
+    // Real brokers fill SL orders when price WICKS to SL level, not just close
     if (lvls.sl) {
-      const slHit = isBuy ? price <= lvls.sl : price >= lvls.sl;
+      const m15c2  = dataFetcher.mtfCache[`${sig.symbol}_mtf`]?.data?.m15;
+      const lastC  = m15c2 ? m15c2[m15c2.length - 1] : null;
+      const slCheckPrice = lastC
+        ? (isBuy ? lastC.low : lastC.high)  // use candle low for BUY, high for SELL
+        : price;
+      const slHit = isBuy ? slCheckPrice <= lvls.sl : slCheckPrice >= lvls.sl;
       if (slHit) {
         sig.slHit = true;
         // Distinguish: SL hit before TP1 (full loss) vs after TP1 (break-even or profit)
@@ -3272,7 +3353,7 @@ async function checkSMT() {
 ` +
         `TP1: \`${smtSig.levels.tp1}\` | TP2: \`${smtSig.levels.tp2}\`
 ` +
-        `Quality: 85/100 | WR: 70-78%`
+        `Quality: 85/100 | WR: 70-78% | Single-strategy signal`
       );
       console.log(`[SMT] ✅ ${dir} ${pair.lead} vs ${pair.lag}`);
     } catch(e) { console.error('[SMT]', e.message); }
@@ -3309,6 +3390,12 @@ async function runCycle() {
     try {
       state.stats.analyzed++;
 
+      // ── Disabled symbol check ──────────────────────────────────
+      if (CONFIG.DISABLED_SYMBOLS.includes(symbol)) {
+        console.log(`[v10.3] ⏭ ${symbol}: disabled via DISABLED_SYMBOLS`);
+        continue;
+      }
+
       // ── Market hours check ─────────────────────────────────
       if (!Market.isOpen(cfg.cat)) {
         if (!closedSent.has(cfg.cat)) {
@@ -3341,6 +3428,23 @@ async function runCycle() {
       if (!g.ok) {
         cycleBlocked++; state.stats.blocked++;
         console.log(`[v10.3] 🚫 ${symbol}: ${g.why}`);
+        continue;
+      }
+
+      // ✅ Max open trades guard
+      const openTrades = state.signals.filter(s => !s.expired && !s.slHit).length;
+      if (openTrades >= CONFIG.MAX_OPEN_TRADES) {
+        console.log(`[v10.3] ⏸ ${symbol}: max open trades (${openTrades}/${CONFIG.MAX_OPEN_TRADES}) reached`);
+        cycleBlocked++; state.stats.blocked++;
+        continue;
+      }
+
+      // ✅ Max daily signals guard
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayCount = state.signals.filter(s => s.ts?.slice(0,10) === todayStr).length;
+      if (todayCount >= CONFIG.MAX_DAILY_SIGNALS) {
+        console.log(`[v10.3] ⏸ ${symbol}: max daily signals (${todayCount}/${CONFIG.MAX_DAILY_SIGNALS}) reached`);
+        cycleBlocked++; state.stats.blocked++;
         continue;
       }
 
@@ -3387,7 +3491,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v10.3 — ICT/SMC Engine',
-  version: '10.3.2',
+  version: '10.3.4',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -3398,11 +3502,15 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.3.2',
+    status: 'OK', version: '10.3.4',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
     analyzed: state.stats.analyzed,
+    openTrades: state.signals.filter(s => !s.expired && !s.slHit).length,
+    maxOpenTrades: CONFIG.MAX_OPEN_TRADES,
+    todaySignals: state.signals.filter(s => s.ts?.slice(0,10) === new Date().toISOString().slice(0,10)).length,
+    maxDailySignals: CONFIG.MAX_DAILY_SIGNALS,
     activeCooldowns: gate.cooldowns().filter(c => c.left > 0).length,
     lastCycle: state.lastCycle,
     marketStatus: {
@@ -3524,10 +3632,11 @@ app.get('/api/fp', (req, res) => {
   const todayPnL = state.fp.dailyPnL[todayKey] || 0;
   res.json({
     phase,
+    disabledSymbols: CONFIG.DISABLED_SYMBOLS,
     accountSize:     `$${acct.toLocaleString()}`,
     riskPerTrade:    `$${(acct * CONFIG.FP_RISK_PCT / 100).toFixed(2)} (${CONFIG.FP_RISK_PCT}%)`,
     phase_target:    `${target}% = $${tgtUSD.toFixed(0)}`,
-    current_profit:  `$${state.fp.totalPnL.toFixed(2)}`,
+    current_profit:  `$${state.fp.totalPnL.toFixed(2)} (estimated from signals)`,
     progress:        `${Math.min(100,(progress/tgtUSD*100)).toFixed(1)}%`,
     today_pnl:       `$${todayPnL.toFixed(2)}`,
     daily_dd_used:   `${(Math.abs(Math.min(todayPnL,0))/acct*100).toFixed(2)}% of ${CONFIG.FP_DAILY_DD_PCT}%`,
@@ -3553,7 +3662,24 @@ Risk: $${(CONFIG.FP_ACCOUNT_USD * CONFIG.FP_RISK_PCT / 100).toFixed(0)} per trad
   if (riskPct)    CONFIG.FP_RISK_PCT    = parseFloat(riskPct);
   if (accountUsd) CONFIG.FP_ACCOUNT_USD = parseFloat(accountUsd);
   if (usdToInr)   CONFIG.USD_TO_INR     = parseFloat(usdToInr);
-  res.json({ ok: true, phase: state.fp.phase, riskPct: CONFIG.FP_RISK_PCT, accountUsd: CONFIG.FP_ACCOUNT_USD });
+  if (req.body.maxOpenTrades)  CONFIG.MAX_OPEN_TRADES   = parseInt(req.body.maxOpenTrades);
+  if (req.body.maxDailySignals) CONFIG.MAX_DAILY_SIGNALS = parseInt(req.body.maxDailySignals);
+  // Enable/disable symbols: { "disable": "DOGEUSDT,SOLUSDT" } or { "enable": "DOGEUSDT" }
+  if (req.body.disable) {
+    const syms = req.body.disable.split(',').map(s => s.trim().toUpperCase());
+    syms.forEach(s => { if (!CONFIG.DISABLED_SYMBOLS.includes(s)) CONFIG.DISABLED_SYMBOLS.push(s); });
+    console.log(`[Config] Disabled: ${syms.join(',')}`);
+    tgSend(`⏭ Symbols disabled: ${syms.join(', ')}`).catch(()=>{});
+  }
+  if (req.body.enable) {
+    const syms = req.body.enable.split(',').map(s => s.trim().toUpperCase());
+    CONFIG.DISABLED_SYMBOLS = CONFIG.DISABLED_SYMBOLS.filter(s => !syms.includes(s));
+    console.log(`[Config] Enabled: ${syms.join(',')}`);
+    tgSend(`✅ Symbols enabled: ${syms.join(', ')}`).catch(()=>{});
+  }
+  res.json({ ok: true, phase: state.fp.phase, riskPct: CONFIG.FP_RISK_PCT,
+    accountUsd: CONFIG.FP_ACCOUNT_USD, maxOpenTrades: CONFIG.MAX_OPEN_TRADES,
+    maxDailySignals: CONFIG.MAX_DAILY_SIGNALS });
 });
 
 // Update account size for position sizing (no redeploy needed)
@@ -3667,8 +3793,33 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
       const val    = parseFloat(text.split(' ')[2]);
       if (market === 'india'  && val) { CONFIG.INDIA_RISK_INR  = val; await tgSend(`✅ India risk → ₹${val.toLocaleString('en-IN')}`); }
       else if (market === 'crypto' && val) { CONFIG.CRYPTO_RISK_INR = val; await tgSend(`✅ Crypto risk → ₹${val.toLocaleString('en-IN')}`); }
-      else if (market === 'forex'  && val) { CONFIG.FP_RISK_PCT = val; await tgSend(`✅ Forex risk → ${val}% of $${CONFIG.FP_ACCOUNT_USD}`); }
-      else await tgSend('Usage: /risk india 6000 | /risk crypto 3000 | /risk forex 0.5');
+      else if (market === 'forex'  && val) { CONFIG.FP_RISK_PCT = val; await tgSend(`✅ Forex/Gold risk → ${val}% of $${CONFIG.FP_ACCOUNT_USD} (FundingPips)`); }
+      else await tgSend('Usage: /risk india 5000 | /risk crypto 1700 | /risk forex 0.5');
+
+    } else if (cmd === '/disable') {
+      // /disable DOGEUSDT  or  /disable DOGEUSDT,SOLUSDT
+      const syms2 = (arg || '').toUpperCase().split(',').map(s=>s.trim()).filter(Boolean);
+      if (!syms2.length) { await tgSend('Usage: /disable DOGEUSDT or /disable DOGEUSDT,SOLUSDT'); }
+      else {
+        syms2.forEach(s => { if (!CONFIG.DISABLED_SYMBOLS.includes(s)) CONFIG.DISABLED_SYMBOLS.push(s); });
+        await tgSend(`⏭ Disabled: ${syms2.join(', ')}`);
+      }
+
+    } else if (cmd === '/enable') {
+      const syms3 = (arg || '').toUpperCase().split(',').map(s=>s.trim()).filter(Boolean);
+      if (!syms3.length) { await tgSend('Usage: /enable DOGEUSDT'); }
+      else {
+        CONFIG.DISABLED_SYMBOLS = CONFIG.DISABLED_SYMBOLS.filter(s => !syms3.includes(s));
+        await tgSend(`✅ Enabled: ${syms3.join(', ')}`);
+      }
+
+    } else if (cmd === '/symbols') {
+      const allSyms = Object.keys(SYMBOLS);
+      const disabled = CONFIG.DISABLED_SYMBOLS;
+      const lines = allSyms.map(s =>
+        `${disabled.includes(s) ? '⏭' : '✅'} ${s}`
+      ).join('\n');
+      await tgSend(`📋 *All Symbols*\n${lines}\n\nDisabled: ${disabled.length || 'none'}`);
 
     } else if (cmd === '/phase') {
       const ph = parseInt(arg);
@@ -3704,6 +3855,9 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
         `/risk india 6000 — set India risk\n` +
         `/risk forex 0.5 — set Forex risk %\n` +
         `/phase 2 — switch FP challenge phase\n` +
+        `/disable DOGEUSDT — disable a symbol\n` +
+        `/enable DOGEUSDT — enable a symbol\n` +
+        `/symbols — list all symbols + status\n` +
         `/help — this message`;
       await tgSend(helpMsg);
     }
@@ -3718,7 +3872,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v10.3.2 — ICT/SMC ENGINE   ║
+║  HYBRID TRADING BOT v10.3.4 — ICT/SMC ENGINE   ║
 ║   16 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -3733,7 +3887,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Forex:9 · Commodity:2 · Cr
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.3.2 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.3.4 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 16 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -3745,5 +3899,9 @@ ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activat
   // Offset cron by 2 min to avoid clash with startup cycle
   // Fires at :02, :17, :32, :47 of every hour
   cron.schedule('2,17,32,47 * * * *', runCycle);
-  console.log('[v10.3] Cron scheduled: every 15 min (offset :02). Bot running.\n');
+  // Separate 1-min cron for TP/SL tracking — catches intra-candle TP hits
+  cron.schedule('* * * * *', async () => {
+    if (!state.running) await checkExpiry();
+  });
+  console.log('[v10.3] Cron scheduled: M15 every :02 offset + TP/SL check every 1min. Bot running.\n');
 });
