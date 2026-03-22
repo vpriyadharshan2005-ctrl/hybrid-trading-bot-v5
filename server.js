@@ -3289,13 +3289,13 @@ async function runCycle() {
   // ── Pause guard ─────────────────────────────────────────────────────────
   if (state.pauseUntil && Date.now() < state.pauseUntil) {
     const left = Math.ceil((state.pauseUntil - Date.now()) / 60000);
-    console.log(`[v9.8] ⏸ Bot paused — ${left}m remaining`);
+    console.log(`[v10.3] ⏸ Bot paused — ${left}m remaining`);
     return;
   }
   state.running = true;
   const t0 = Date.now();
   const ist = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  console.log(`\n[v9.8] ⚡ M15 Cycle — ${ist}`);
+  console.log(`\n[v10.3] ⚡ M15 Cycle — ${ist}`);
 
   // Prefetch all Delta crypto symbols
   const deltaSyms = Object.values(SYMBOLS).filter(s => s.src === 'delta').map(s => s.deltaSymbol);
@@ -3322,25 +3322,25 @@ async function runCycle() {
             await tgSend(`🔴 *${catLabel[cfg.cat] || cfg.cat.charAt(0).toUpperCase()+cfg.cat.slice(1)} Market Closed*\n${Market.closedMessage(cfg.cat, symbol)}`);
           }
         }
-        console.log(`[v9.8] 🔴 ${symbol}: ${cfg.cat} market closed`);
+        console.log(`[v10.3] 🔴 ${symbol}: ${cfg.cat} market closed`);
         continue;
       }
 
       // ── Fetch candles ──────────────────────────────────────
       const mtf = await dataFetcher.fetchMTF(symbol);
-      if (!mtf?.m15?.length) { console.log(`[v9.8] ⚠️  No data: ${symbol}`); continue; }
+      if (!mtf?.m15?.length) { console.log(`[v10.3] ⚠️  No data: ${symbol}`); continue; }
 
       // ── Build signal ───────────────────────────────────────
       const sig      = Builder.build(symbol, mtf.m15, mtf.source, mtf);
       const curPrice = mtf.m15[mtf.m15.length - 1].close;
 
-      if (!sig) { console.log(`[v9.8] ℹ️  No signal: ${symbol}`); continue; }
+      if (!sig) { console.log(`[v10.3] ℹ️  No signal: ${symbol}`); continue; }
 
       // ── Gate check ─────────────────────────────────────────
       const g = gate.check(sig, curPrice, state.signals.filter(s => s.ts && Date.now() - new Date(s.ts).getTime() < 900000));
       if (!g.ok) {
         cycleBlocked++; state.stats.blocked++;
-        console.log(`[v9.8] 🚫 ${symbol}: ${g.why}`);
+        console.log(`[v10.3] 🚫 ${symbol}: ${g.why}`);
         continue;
       }
 
@@ -3364,11 +3364,11 @@ async function runCycle() {
       cycleSignals++;
       savePersist(); // persist state after every new signal
 
-      console.log(`[v9.8] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
+      console.log(`[v10.3] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
       await tgSignal(sig);
       await new Promise(r => setTimeout(r, 500));
 
-    } catch (e) { console.error(`[v9.8] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
+    } catch (e) { console.error(`[v10.3] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
   }
 
   // ── SMT Divergence check (cross-symbol, forex only) ──────────────────────
@@ -3378,7 +3378,7 @@ async function runCycle() {
 
   await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
-  console.log(`[v9.8] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
+  console.log(`[v10.3] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
   state.running = false;
 }
 
@@ -3386,7 +3386,7 @@ async function runCycle() {
 //  SECTION 9 — API ENDPOINTS
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  bot: 'Hybrid Trading Bot v9.1 — ICT/SMC Engine',
+  bot: 'Hybrid Trading Bot v10.3 — ICT/SMC Engine',
   version: '10.3.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
@@ -3421,8 +3421,9 @@ app.get('/api/health', (req, res) => {
         tp3Hits: state.stats.tp3Hits || 0,
         slHits:  state.stats.slHits  || 0,
       },
-      accountSize:   `₹${CONFIG.ACCOUNT_SIZE.toLocaleString('en-IN')}`,
-      riskPerTrade:  `₹${(CONFIG.ACCOUNT_SIZE * CONFIG.RISK_PER_TRADE / 100).toLocaleString('en-IN')} (${CONFIG.RISK_PER_TRADE}%)`,
+      india_risk:    `₹${CONFIG.INDIA_RISK_INR.toLocaleString('en-IN')} per trade`,
+      crypto_risk:   `₹${CONFIG.CRYPTO_RISK_INR.toLocaleString('en-IN')} per trade`,
+      forex_risk:    `$${(CONFIG.FP_ACCOUNT_USD * CONFIG.FP_RISK_PCT / 100).toFixed(0)} (${CONFIG.FP_RISK_PCT}% of $${CONFIG.FP_ACCOUNT_USD} FP)`,
       dhan: dhanToken.accessToken === 'placeholder' ? '⏳ no token — POST /api/dhan/token' :
                dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 86400000 ? '❌ token expired — refresh now' :
                dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 72000000 ? '⚠️  token expiring soon' : '✅ active',
@@ -3559,11 +3560,16 @@ Risk: $${(CONFIG.FP_ACCOUNT_USD * CONFIG.FP_RISK_PCT / 100).toFixed(0)} per trad
 app.post('/api/account', (req, res) => {
   const { size, riskPct } = req.body;
   if (!size || isNaN(size)) return res.status(400).json({ error: 'Provide size (number)' });
-  CONFIG.ACCOUNT_SIZE  = parseFloat(size);
-  if (riskPct) CONFIG.RISK_PER_TRADE = parseFloat(riskPct);
-  console.log(`[Account] Updated: ₹${CONFIG.ACCOUNT_SIZE.toLocaleString('en-IN')} | Risk: ${CONFIG.RISK_PER_TRADE}%`);
-  res.json({ ok: true, accountSize: CONFIG.ACCOUNT_SIZE, riskPct: CONFIG.RISK_PER_TRADE,
-    riskPerTrade: `₹${(CONFIG.ACCOUNT_SIZE * CONFIG.RISK_PER_TRADE / 100).toLocaleString('en-IN')}` });
+  // Update per-market risks based on category
+  const cat2 = req.body.cat || 'india';
+  if (cat2 === 'india')   CONFIG.INDIA_RISK_INR  = parseFloat(size);
+  if (cat2 === 'crypto')  CONFIG.CRYPTO_RISK_INR = parseFloat(size);
+  if (cat2 === 'forex')   { CONFIG.FP_RISK_PCT = parseFloat(riskPct || CONFIG.FP_RISK_PCT); }
+  console.log(`[Account] Updated ${cat2}: ₹${parseFloat(size).toLocaleString('en-IN')}`);
+  res.json({ ok: true,
+    india_risk:  `₹${CONFIG.INDIA_RISK_INR}`,
+    crypto_risk: `₹${CONFIG.CRYPTO_RISK_INR}`,
+    forex_risk:  `$${(CONFIG.FP_ACCOUNT_USD * CONFIG.FP_RISK_PCT/100).toFixed(0)}` });
 });
 
 app.post('/api/dhan/token', (req, res) => {
@@ -3723,7 +3729,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   // Give CoinGecko a moment before first cycle (avoid cold-start 429)
   // Restore persisted signals/state from previous run
   loadPersist();
-  console.log('[v9.8] Waiting 5s before first cycle (CG rate limit buffer)...');
+  console.log('[v10.3] Waiting 5s before first cycle (CG rate limit buffer)...');
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
@@ -3737,5 +3743,5 @@ ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activat
   // Schedule every 15 min aligned to clock (09:15, 09:30, 09:45...)
   // */15 fires at :00, :15, :30, :45 of every hour — perfect M15 alignment
   cron.schedule('*/15 * * * *', runCycle);
-  console.log('[v9.8] Cron scheduled: every 15 min. Bot running.\n');
+  console.log('[v10.3] Cron scheduled: every 15 min. Bot running.\n');
 });
