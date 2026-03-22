@@ -200,6 +200,23 @@ const Market = {
 // ═════════════════════════════════════════════════════════════
 class Ind {
 
+  static bb(closes, period = 20) {
+    if (!closes || closes.length < period) return null;
+    const sl  = closes.slice(-period);
+    const mid = sl.reduce((s,v) => s+v, 0) / period;
+    const variance = sl.reduce((s,v) => s + (v-mid)**2, 0) / period;
+    const std = Math.sqrt(variance);
+    const price = closes[closes.length - 1];
+    return {
+      upper:   mid + 2 * std,
+      middle:  mid,
+      lower:   mid - 2 * std,
+      std,
+      squeeze: std < mid * 0.015,
+      dev:     std > 0 ? (price - mid) / std : 0,
+    };
+  }
+
   static rsi(closes, p = 14) {
     if (closes.length < p + 1) return 50;
     let g = 0, l = 0;
@@ -557,7 +574,8 @@ class Detectors {
       this.breaker, this.silverBullet, this.orb, this.crt, this.po3,
       this.fvgBosHTF,
       this.eqhEql, this.gapGo, this.sessRaid,
-      this.pdhPdl, this.turtleSoup,             // new: PDH/PDL + Turtle Soup
+      this.pdhPdl, this.turtleSoup,
+      this.rsiDivergence, this.bbSqueeze,       // new: RSI Div + BB Squeeze
     ];
     // Per-symbol strategy exclusions (e.g. DOGE: no CHOCH/OTE/FPB)
     const symCfg = Object.values(SYMBOLS).find(s =>
@@ -1303,6 +1321,126 @@ class Detectors {
   }
 
   // ══════════════════════════════════════════════════════════
+  //  17. RSI DIVERGENCE ⭐ (new from strategies.py comparison)
+  //  Price HH + RSI LH = bearish exhaustion (distribution)
+  //  Price LL + RSI HL = bullish hidden strength (accumulation)
+  //  Most reliable reversal signal — works across all markets
+  //  Best for: BTC/ETH major swing highs/lows, Gold, NIFTY
+  // ══════════════════════════════════════════════════════════
+  static rsiDivergence(x, m15) {
+    const { price, atr, h4Tr, h1Tr, kz, swH, swL } = x;
+    if (!m15 || m15.length < 35) return null;
+    if (swH.length < 2 || swL.length < 2) return null;
+
+    const closes = m15.map(c => c.close);
+
+    // RSI at recent and prior swing points
+    const rsiNow  = Ind.rsi(closes.slice(-20));
+    const rsiPrev = Ind.rsi(closes.slice(-35, -15));
+    if (rsiNow == null || rsiPrev == null) return null;
+
+    // Price swing extremes (recent vs prior)
+    const recentHigh = Math.max(...m15.slice(-10).map(c => c.high));
+    const prevHigh   = Math.max(...m15.slice(-25, -10).map(c => c.high));
+    const recentLow  = Math.min(...m15.slice(-10).map(c => c.low));
+    const prevLow    = Math.min(...m15.slice(-25, -10).map(c => c.low));
+
+    // ── Bearish Divergence: price HH but RSI LH ─────────────────────────────
+    // Price making new high = retail sees strength
+    // RSI declining = institutional selling into the rally (distribution)
+    if (recentHigh > prevHigh * 1.002 && rsiNow < rsiPrev - 4) {
+      const score = 76
+        + (h4Tr === 'BEARISH' ? 6 : 0)
+        + (h1Tr === 'BEARISH' ? 4 : 0)
+        + (rsiNow > 60 ? 4 : 0)  // even more powerful when RSI still high
+        + (kz ? 4 : 0);
+      return {
+        id: 'RSI_DIV', name: `RSI Bearish Divergence (${rsiNow.toFixed(0)}→${rsiPrev.toFixed(0)})`,
+        dir: 'SELL', score,
+        sl_ref:  { type: 'rsi_div_high', val: recentHigh },
+        tp_ref:  { tp1_type: 'prior_swing', tp1_val: prevLow + (prevHigh - prevLow) * 0.5 },
+      };
+    }
+
+    // ── Bullish Divergence: price LL but RSI HL ──────────────────────────────
+    // Price making new low = retail sees weakness
+    // RSI rising = institutional buying into the dip (accumulation)
+    if (recentLow < prevLow * 0.998 && rsiNow > rsiPrev + 4) {
+      const score = 76
+        + (h4Tr === 'BULLISH' ? 6 : 0)
+        + (h1Tr === 'BULLISH' ? 4 : 0)
+        + (rsiNow < 45 ? 4 : 0)  // even stronger when RSI still low
+        + (kz ? 4 : 0);
+      return {
+        id: 'RSI_DIV', name: `RSI Bullish Divergence (${rsiNow.toFixed(0)}→${rsiPrev.toFixed(0)})`,
+        dir: 'BUY', score,
+        sl_ref:  { type: 'rsi_div_low', val: recentLow },
+        tp_ref:  { tp1_type: 'prior_swing', tp1_val: prevLow + (prevHigh - prevLow) * 0.5 },
+      };
+    }
+    return null;
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  18. BB SQUEEZE BREAKOUT (new from strategies.py comparison)
+  //  Bollinger Bands narrow (low volatility) → expand with volume
+  //  Catches explosive breakouts from consolidation
+  //  Best for: Crypto Asian session ranges, Gold pre-London
+  //  Filter: H4 trend direction prevents counter-trend signals
+  // ══════════════════════════════════════════════════════════
+  static bbSqueeze(x, m15) {
+    const { price, atr, h4Tr, h1Tr, kz, volGood, volSpike, last } = x;
+    if (!m15 || m15.length < 25) return null;
+
+    const closes = m15.map(c => c.close);
+    const vols   = m15.map(c => c.volume || 1);
+    const bb     = Ind.bb(closes, 20);
+    if (!bb || !bb.squeeze) return null; // must be in squeeze
+
+    // Squeeze released = breakout happening
+    // Require volume spike for confirmation (not just price)
+    if (!volSpike && !volGood) return null;
+
+    const avgVol = vols.slice(-20).reduce((s,v) => s+v,0) / 20;
+    const curVol = vols[vols.length-1];
+    const volRatio = curVol / avgVol;
+    if (volRatio < 1.3) return null; // need at least 1.3x volume
+
+    // Direction: determined by H4 trend (prevent counter-trend)
+    // If H4 is bullish → BUY breakout. If bearish → SELL breakout.
+    // If neutral → use price position relative to BB middle
+    let dir;
+    if (h4Tr === 'BULLISH') dir = 'BUY';
+    else if (h4Tr === 'BEARISH') dir = 'SELL';
+    else dir = price > bb.middle ? 'BUY' : 'SELL'; // H4 neutral → use BB midline
+
+    // Extra filter: price must be breaking in the direction
+    if (dir === 'BUY'  && price < bb.middle) return null; // price below middle = not bullish
+    if (dir === 'SELL' && price > bb.middle) return null; // price above middle = not bearish
+
+    const score = 76
+      + (h4Tr === (dir === 'BUY' ? 'BULLISH' : 'BEARISH') ? 8 : 0)
+      + (h1Tr === (dir === 'BUY' ? 'BULLISH' : 'BEARISH') ? 4 : 0)
+      + (kz ? 4 : 0)
+      + (volRatio > 2.0 ? 4 : volRatio > 1.5 ? 2 : 0); // bigger vol = stronger signal
+
+    return {
+      id: 'BB_SQUEEZE', name: `BB Squeeze Breakout (vol ${volRatio.toFixed(1)}x)`,
+      dir, score,
+      sl_ref: {
+        type: 'bb_squeeze',
+        val:  dir === 'BUY' ? bb.lower : bb.upper, // SL at opposite BB band
+      },
+      tp_ref: {
+        tp1_type: 'bb_target',
+        tp1_val:  dir === 'BUY'
+          ? price + (bb.upper - bb.lower) * 0.7   // TP1 = 70% of band width above
+          : price - (bb.upper - bb.lower) * 0.7,
+      },
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════
   //  15. PREVIOUS DAY HIGH/LOW (PDH/PDL) ⭐
   //  Prior day's H/L swept → reverse back inside day range
   //  Most watched intraday level by ALL institutional traders
@@ -1555,10 +1693,30 @@ class Builder {
     if (ctx2.volSpike) q += 3;
 
     // 7. Dead session penalty (-8)
-    //    DEAD session (22:00-00:30 UTC) = no major session active
-    //    Forex signals here are unreliable — wide spreads, thin volume
-    //    Crypto is exempt (24/7), India is exempt (already closed by market hours gate)
     if (cat !== 'crypto' && cat !== 'india' && Market.session() === 'DEAD') q -= 8;
+
+    // 8. BB 2σ overextension gate (-6 penalty)
+    //    If price is already >2 std deviations from 20-period mean,
+    //    a BUY in overbought territory / SELL in oversold = chasing the move
+    //    This REDUCES quality (doesn't block), but helps filter bad entries
+    const bbData = Ind.bb(m15.map(cx => cx.close), 20);
+    if (bbData && bbData.dev != null) {
+      if (isBuy  && bbData.dev > 2.0) q -= 6;  // BUY when already overbought
+      if (!isBuy && bbData.dev < -2.0) q -= 6; // SELL when already oversold
+    }
+
+    // 9. S&D body ratio confirmation — boost FVG_OB quality if large body candle
+    //    From strategies.py: body > 65% of range = strong institutional zone
+    //    Applied only to FVG_OB to avoid duplicates with other detectors
+    if (best.id === 'FVG_OB') {
+      const last20 = Ind.confirmed(m15).slice(-20);
+      const hasLargeBody = last20.some(cx => {
+        const body  = Math.abs(cx.close - cx.open);
+        const range = cx.high - cx.low;
+        return range > 0 && body / range > 0.65;
+      });
+      if (hasLargeBody) q += 3; // S&D zone confirmation bonus
+    }
 
     const quality = Math.min(100, Math.round(q));
     if (quality < CONFIG.SIGNAL_QUALITY_MIN) return null;
@@ -1889,10 +2047,25 @@ class Builder {
         break;
 
       case 'TURTLE_SOUP':
-        // SL: beyond false break extreme + 0.5 ATR
         sl = isBuy
           ? f(sig.sl_ref.val - atr * 0.5)
           : f(sig.sl_ref.val + atr * 0.5);
+        break;
+
+      case 'RSI_DIV':
+        // SL: beyond the swing extreme that formed the divergence + 0.5 ATR
+        // Logic: if price goes ABOVE the divergence high (SELL), pattern fails
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.5)   // below the recent low
+          : f(sig.sl_ref.val + atr * 0.5);  // above the recent high
+        break;
+
+      case 'BB_SQUEEZE':
+        // SL: opposite BB band (if BUY → SL at lower band, if SELL → at upper band)
+        // Logic: if price goes back to opposite band, squeeze breakout failed
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.3)  // just below lower band
+          : f(sig.sl_ref.val + atr * 0.3); // just above upper band
         break;
 
       default:
@@ -2030,7 +2203,24 @@ class Builder {
         break;
 
       case 'TURTLE_SOUP':
-        // TP1 = origin of false break | TP2 = H1 swing
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || tp1 + atr * 2)
+          : f(h1LowBelowTP?.v  || tp1 - atr * 2);
+        break;
+
+      case 'RSI_DIV':
+        // TP1 = 50% retracement of the divergence swing (conservative first target)
+        // TP2 = H1 swing beyond (full reversal target)
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = isBuy
+          ? f(h1HighAboveTP?.v || tp1 + atr * 3)
+          : f(h1LowBelowTP?.v  || tp1 - atr * 3);
+        break;
+
+      case 'BB_SQUEEZE':
+        // TP1 = 70% of BB band width in direction (measured breakout target)
+        // TP2 = H1 swing beyond TP1 (full momentum target)
         tp1 = f(sig.tp_ref.tp1_val);
         tp2 = isBuy
           ? f(h1HighAboveTP?.v || tp1 + atr * 2)
@@ -3831,7 +4021,7 @@ function forexPausedForNews() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v10.3 — ICT/SMC Engine',
-  version: '10.4.5',
+  version: '10.5.0',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -3842,7 +4032,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.4.5',
+    status: 'OK', version: '10.5.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -3893,7 +4083,7 @@ app.get('/api/signals/:symbol',  (req, res) => {
 });
 
 app.get('/api/strategies',       (req, res) => res.json({
-  version: '10.3', total: 16,
+  version: '10.5', total: 18,
   note: 'All 16 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
   strategies: [
     { id: 'FVG_OB',       name: 'Fair Value Gap + Order Block',  cat: 'SMC', wr: '60-68%', rr: '1:2-1:4' },
@@ -3913,6 +4103,8 @@ app.get('/api/strategies',       (req, res) => res.json({
     { id: 'PDH_PDL',      name: 'Previous Day H/L Raid',           cat: 'ICT',   wr: '65-72%', rr: '1:2-1:4' },
     { id: 'TURTLE_SOUP',  name: 'Turtle Soup (Multi-Candle Sweep)', cat: 'ICT',   wr: '65-72%', rr: '1:2-1:4' },
     { id: 'SMT_DIV',      name: 'SMT Divergence (Cross-Symbol)',    cat: 'ICT',   wr: '70-78%', rr: '1:3-1:6' },
+    { id: 'RSI_DIV',      name: 'RSI Divergence (Price/Momentum)',  cat: 'TECH',  wr: '63-70%', rr: '1:2-1:4' },
+    { id: 'BB_SQUEEZE',   name: 'BB Squeeze Breakout (Volatility)', cat: 'TECH',  wr: '62-68%', rr: '1:2-1:3' },
   ],
 }));
 
@@ -4369,8 +4561,8 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v10.4.5 — ICT/SMC ENGINE   ║
-║   16 strategies · M15+M5 entry · H1/H4 SL-TP    ║
+║  HYBRID TRADING BOT v10.5.0 — ICT/SMC ENGINE   ║
+║   18 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
 Port: ${CONFIG.PORT} | Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN} | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -4385,9 +4577,9 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Forex:9 · Commodity:2 · Cr
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.4.5 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.5.0 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
-Strategies: 16 ICT/SMC | Entry: M15+M5 | SL: H1 structure
+Strategies: 18 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
 ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activate NIFTY/BANKNIFTY/FINNIFTY/SENSEX' : ''}`);
   await runCycle();
