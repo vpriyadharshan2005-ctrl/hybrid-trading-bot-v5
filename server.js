@@ -91,14 +91,14 @@ const SYMBOLS = {
   XAGUSD:    { name:'Silver/USD',  cat:'commodity', src:'td', td:'XAG/USD',  fh:'OANDA:XAG_USD'  }, // #2 commodity high vol
 
   // ── Crypto — Delta Exchange India primary | Binance fallback | CoinGecko last ──
-  BTCUSDT:   { name:'BTC/USDT',   cat:'crypto', src:'delta', deltaSymbol:'BTCUSD',  cgId:'bitcoin'       }, // #1
-  ETHUSDT:   { name:'ETH/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ETHUSD',  cgId:'ethereum'      }, // #2
-  SOLUSDT:   { name:'SOL/USDT',   cat:'crypto', src:'delta', deltaSymbol:'SOLUSD',  cgId:'solana'        }, // Delta India: SOLUSD
-  XRPUSDT:   { name:'XRP/USDT',   cat:'crypto', src:'delta', deltaSymbol:'XRPUSD',  cgId:'ripple'        }, // #4
-  DOGEUSDT:  { name:'DOGE/USDT',  cat:'crypto', src:'delta', deltaSymbol:'DOGEUSD', cgId:'dogecoin',      noStrategies:['CHOCH','OTE','FPB'] }, // Delta India: DOGEUSD
-  ADAUSDT:   { name:'ADA/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ADAUSD',  cgId:'cardano'       }, // Delta India: ADAUSD
-  BNBUSDT:   { name:'BNB/USDT',   cat:'crypto', src:'delta', deltaSymbol:'BNBUSD',  cgId:'binancecoin'   }, // #7
-  LTCUSDT:   { name:'LTC/USDT',   cat:'crypto', src:'delta', deltaSymbol:'LTCUSD',  cgId:'litecoin'      }, // #8
+  BTCUSDT:   { name:'BTC/USDT',   cat:'crypto', src:'delta', deltaSymbol:'BTCUSD',  cgId:'bitcoin',       maxLev:100, lotSize:0.001, lotUnit:'BTC'  }, // max 100x
+  ETHUSDT:   { name:'ETH/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ETHUSD',  cgId:'ethereum',      maxLev:100, lotSize:0.01,  lotUnit:'ETH'  }, // max 100x
+  SOLUSDT:   { name:'SOL/USDT',   cat:'crypto', src:'delta', deltaSymbol:'SOLUSD',  cgId:'solana',        maxLev:50,  lotSize:1,     lotUnit:'SOL'  }, // max 50x
+  XRPUSDT:   { name:'XRP/USDT',   cat:'crypto', src:'delta', deltaSymbol:'XRPUSD',  cgId:'ripple',        maxLev:50,  lotSize:10,    lotUnit:'XRP'  }, // max 50x
+  DOGEUSDT:  { name:'DOGE/USDT',  cat:'crypto', src:'delta', deltaSymbol:'DOGEUSD', cgId:'dogecoin',      maxLev:50,  lotSize:100,   lotUnit:'DOGE', noStrategies:['CHOCH','OTE','FPB'] }, // max 50x
+  ADAUSDT:   { name:'ADA/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ADAUSD',  cgId:'cardano',       maxLev:50,  lotSize:100,   lotUnit:'ADA'  }, // max 50x
+  BNBUSDT:   { name:'BNB/USDT',   cat:'crypto', src:'delta', deltaSymbol:'BNBUSD',  cgId:'binancecoin',   maxLev:50,  lotSize:0.01,  lotUnit:'BNB'  }, // max 50x
+  LTCUSDT:   { name:'LTC/USDT',   cat:'crypto', src:'delta', deltaSymbol:'LTCUSD',  cgId:'litecoin',      maxLev:50,  lotSize:0.1,   lotUnit:'LTC'  }, // max 50x
 };
 
 // ── Live Dhan token (updated at runtime, no redeploy) ─────────
@@ -1588,10 +1588,41 @@ class Builder {
       riskLabel = `₹${riskAmt.toLocaleString('en-IN')} (India — ₹5K acct)`;
     } else if (cat === 'crypto') {
       // Crypto — ₹1,700 account, default 10% risk = ₹170/trade
-      // Configurable via CRYPTO_RISK_INR env var
       riskAmt   = CONFIG.CRYPTO_RISK_INR;
       currency  = '₹';
       riskLabel = `₹${riskAmt.toLocaleString('en-IN')} (Crypto — ₹1.7K acct)`;
+
+      // ── Delta Exchange leverage + lot calculation ───────────────────────────
+      const symCfgD  = SYMBOLS[symbol] || {};
+      const maxLev   = symCfgD.maxLev  || 50;
+      const lotSzD   = symCfgD.lotSize || 1;
+      const lotUnitD = symCfgD.lotUnit || 'units';
+
+      if (riskUnit && riskUnit > 0 && lvls.entry) {
+        // SL% = riskUnit / entry_price
+        const slPct     = riskUnit / lvls.entry;
+        // Safe leverage = 40% of liquidation leverage, capped at maxLev
+        const liqLev    = 1 / slPct;
+        const safeLev   = Math.min(maxLev, Math.max(2, Math.floor(liqLev * 0.4)));
+
+        // Lots = how many lots to risk exactly riskAmt ₹
+        // Risk per lot = SL_distance_in_asset × lotSize × USD_to_INR
+        const riskPerLot = riskUnit * lotSzD * CONFIG.USD_TO_INR;
+        const deltaLots  = riskPerLot > 0 ? Math.max(1, Math.floor(riskAmt / riskPerLot)) : null;
+
+        // Margin needed = (deltaLots × lotSize × entry_price × USD_to_INR) / safeLev
+        const marginINR  = deltaLots && safeLev
+          ? Math.round((deltaLots * lotSzD * lvls.entry * CONFIG.USD_TO_INR) / safeLev)
+          : null;
+
+        lvls.deltaLev   = safeLev;
+        lvls.maxLev     = maxLev;
+        lvls.deltaLots  = deltaLots;
+        lvls.lotUnit    = lotUnitD;
+        lvls.lotSzD     = lotSzD;
+        lvls.marginINR  = marginINR;
+        lvls.slPct      = (slPct * 100).toFixed(2);
+      }
     } else {
       // Forex + Commodity — FundingPips 0.5% of $5,000
       const fpRiskUSD = CONFIG.FP_ACCOUNT_USD * (CONFIG.FP_RISK_PCT / 100);
@@ -2771,7 +2802,9 @@ async function tgSignal(sig) {
 🎯 *TP2:*   ${safeNum(sig.levels.tp2)}
 🎯 *TP3:*   ${safeNum(sig.levels.tp3)}
 📐 *R:R:*   ${sig.levels.rr}
-💼 *Risk:*  ${sig.levels.riskLabel || 'N/A'} | Total lots: ${sig.levels.lotSize || 'N/A'}
+💼 *Risk:*  ${sig.levels.riskLabel || 'N/A'} | Total lots: ${sig.levels.lotSize || 'N/A'}${sig.cat === 'crypto' && sig.levels.deltaLev ? `
+⚡ *Leverage:* ${sig.levels.deltaLev}x (max ${sig.levels.maxLev}x) | SL: ${sig.levels.slPct}% away
+📦 *Delta Lots:* ${sig.levels.deltaLots} lots (${sig.levels.lotSzD} ${sig.levels.lotUnit}/lot) | Margin: ₹${sig.levels.marginINR?.toLocaleString('en-IN') || 'N/A'}` : ''}
 💵 *TP1 profit:* ₹${sig.levels.profitTP1?.toLocaleString('en-IN') || 'N/A'} (close ${sig.levels.lotsTP1Close || 'N/A'} lots)
 💵 *TP2 profit:* ₹${sig.levels.profitTP2?.toLocaleString('en-IN') || 'N/A'} (close ${sig.levels.lotsTP2Close || 'N/A'} lots)
 
@@ -3825,7 +3858,7 @@ function forexPausedForNews() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v10.3 — ICT/SMC Engine',
-  version: '10.4.1',
+  version: '10.4.2',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -3836,7 +3869,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.4.1',
+    status: 'OK', version: '10.4.2',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -4363,7 +4396,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v10.4.1 — ICT/SMC ENGINE   ║
+║  HYBRID TRADING BOT v10.4.2 — ICT/SMC ENGINE   ║
 ║   16 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -4379,7 +4412,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Forex:9 · Commodity:2 · Cr
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.4.1 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.4.2 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 16 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
