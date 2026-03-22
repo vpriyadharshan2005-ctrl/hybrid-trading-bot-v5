@@ -83,10 +83,10 @@ const SYMBOLS = {
   // ── Crypto — Delta Exchange India primary | Binance fallback | CoinGecko last ──
   BTCUSDT:   { name:'BTC/USDT',   cat:'crypto', src:'delta', deltaSymbol:'BTCUSD',  cgId:'bitcoin'       }, // #1
   ETHUSDT:   { name:'ETH/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ETHUSD',  cgId:'ethereum'      }, // #2
-  SOLUSDT:   { name:'SOL/USDT',   cat:'crypto', src:'delta', deltaSymbol:'SOLUSDT', cgId:'solana'        }, // #3 high vol
+  SOLUSDT:   { name:'SOL/USDT',   cat:'crypto', src:'delta', deltaSymbol:'SOLUSD',  cgId:'solana'        }, // Delta India: SOLUSD
   XRPUSDT:   { name:'XRP/USDT',   cat:'crypto', src:'delta', deltaSymbol:'XRPUSD',  cgId:'ripple'        }, // #4
-  DOGEUSDT:  { name:'DOGE/USDT',  cat:'crypto', src:'delta', deltaSymbol:'DOGEUSDT',cgId:'dogecoin',      noStrategies:['CHOCH','OTE','FPB'] }, // tweet-driven — no trend strategies
-  ADAUSDT:   { name:'ADA/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ADAUSDT', cgId:'cardano'       }, // #6
+  DOGEUSDT:  { name:'DOGE/USDT',  cat:'crypto', src:'delta', deltaSymbol:'DOGEUSD', cgId:'dogecoin',      noStrategies:['CHOCH','OTE','FPB'] }, // Delta India: DOGEUSD
+  ADAUSDT:   { name:'ADA/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ADAUSD',  cgId:'cardano'       }, // Delta India: ADAUSD
   BNBUSDT:   { name:'BNB/USDT',   cat:'crypto', src:'delta', deltaSymbol:'BNBUSD',  cgId:'binancecoin'   }, // #7
   LTCUSDT:   { name:'LTC/USDT',   cat:'crypto', src:'delta', deltaSymbol:'LTCUSD',  cgId:'litecoin'      }, // #8
 };
@@ -2361,8 +2361,8 @@ class BinanceFallback {
     this.symMap   = {
       'BTCUSD':  'BTCUSDT', 'ETHUSD':   'ETHUSDT',
       'XRPUSD':  'XRPUSDT', 'BNBUSD':   'BNBUSDT',
-      'SOLUSDT': 'SOLUSDT', 'DOGEUSDT': 'DOGEUSDT',
-      'ADAUSDT': 'ADAUSDT', 'LTCUSD':   'LTCUSDT',
+      'SOLUSD':  'SOLUSDT', 'DOGEUSD':  'DOGEUSDT',
+      'ADAUSD':  'ADAUSDT', 'LTCUSD':   'LTCUSDT',
     };
   }
 
@@ -3387,7 +3387,7 @@ async function runCycle() {
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v10.3 — ICT/SMC Engine',
-  version: '10.3.0',
+  version: '10.3.2',
   strategies: 10,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -3398,7 +3398,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.3.0',
+    status: 'OK', version: '10.3.2',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -3718,12 +3718,12 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║   HYBRID TRADING BOT v10.3 — ICT/SMC ENGINE     ║
+║  HYBRID TRADING BOT v10.3.2 — ICT/SMC ENGINE   ║
 ║   16 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
 Port: ${CONFIG.PORT} | Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN} | Cooldown: ${CONFIG.COOLDOWN_MIN}min
-Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:4) | Auto market hours
+Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Forex:9 · Commodity:2 · Crypto:8) | Auto market hours
   `);
 
   // Give CoinGecko a moment before first cycle (avoid cold-start 429)
@@ -3733,15 +3733,17 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:4 · Forex:4 · Gold:1 · Crypto:
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.3 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.3.2 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
-Strategies: 14 ICT/SMC | Entry: M15+M5 | SL: H1 structure
+Strategies: 16 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
 ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activate NIFTY/BANKNIFTY/FINNIFTY/SENSEX' : ''}`);
   await runCycle();
 
   // Schedule every 15 min aligned to clock (09:15, 09:30, 09:45...)
   // */15 fires at :00, :15, :30, :45 of every hour — perfect M15 alignment
-  cron.schedule('*/15 * * * *', runCycle);
-  console.log('[v10.3] Cron scheduled: every 15 min. Bot running.\n');
+  // Offset cron by 2 min to avoid clash with startup cycle
+  // Fires at :02, :17, :32, :47 of every hour
+  cron.schedule('2,17,32,47 * * * *', runCycle);
+  console.log('[v10.3] Cron scheduled: every 15 min (offset :02). Bot running.\n');
 });
