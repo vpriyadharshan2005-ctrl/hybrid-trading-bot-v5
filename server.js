@@ -2166,6 +2166,12 @@ class Builder {
       tp3Hit:    false,
       beMoveDone:false,   // break-even SL move done
       slMoved:   false,   // SL has been moved to break-even
+      // Live price fields — populated in runCycle after signal is built
+      livePrice:       null,
+      entryValidLow:   null,
+      entryValidHigh:  null,
+      driftPct:        null,
+      entryStillValid: true,
     };
   }
 
@@ -2961,6 +2967,36 @@ class DeltaFetcher {
     }
     console.log('[Delta] Prefetch done');
   }
+
+  // ── Live ticker price — Delta /v2/tickers endpoint ───────────────────────
+  // Uses READ-ONLY market data (no API key required for public tickers).
+  // If DELTA_API_KEY is set in env vars, it is sent as a header for higher
+  // rate limits and authenticated access — but the endpoint works without it.
+  // Returns the last traded price (mark price fallback) or null.
+  async fetchLivePrice(symbol) {
+    await this._wait();
+    try {
+      const headers = { 'Accept': 'application/json', 'User-Agent': 'HybridTradingBot/10.7' };
+      // If a read-only API key is provided, attach it for higher rate limits
+      if (process.env.DELTA_API_KEY) headers['api-key'] = process.env.DELTA_API_KEY;
+
+      const res = await axios.get(`${this.baseUrl}/v2/tickers`, {
+        params: { contract_types: 'perpetual_futures', underlying_asset_symbols: symbol.replace('USD','') },
+        headers,
+        timeout: 8000,
+      });
+      // Find the perpetual contract for this symbol (e.g. BTCUSD)
+      const products = res.data?.result;
+      if (!products?.length) return null;
+      const ticker = products.find(p => p.symbol === symbol) || products[0];
+      const price  = parseFloat(ticker?.close || ticker?.mark_price || ticker?.last_trade_price);
+      if (!price || isNaN(price)) return null;
+      return price;
+    } catch (e) {
+      // Silently fail — live price is enhancement only, not critical
+      return null;
+    }
+  }
 }
 
 
@@ -3353,6 +3389,18 @@ async function tgSignal(sig) {
   const exp = sig.expiresAt ? new Date(sig.expiresAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' }) : 'N/A';
 
   const safeNum = v => v != null ? String(v).replace(/[_*`]/g,'') : 'N/A';
+
+  // ── Live price & entry validity block ─────────────────────────────────────
+  const livePxLine = sig.livePrice
+    ? `📍 Live Price NOW: ${safeNum(sig.livePrice)}${sig.driftPct ? ` (${sig.driftPct}% from entry)` : ''}`
+    : '';
+  const validityLine = sig.entryValidLow && sig.entryValidHigh
+    ? `✅ Entry valid if price is between ${safeNum(sig.entryValidLow)} – ${safeNum(sig.entryValidHigh)}`
+    : '';
+  const skipWarning = sig.livePrice && sig.entryStillValid === false
+    ? `⛔ PRICE MOVED TOO FAR — SKIP THIS SIGNAL`
+    : '';
+
   const msg = `${em} *${sig.dir} — ${sig.symbol}*
 ━━━━━━━━━━━━━━━━━━━━
 📊 *${sig.name}* | ${sig.cat.toUpperCase()}
@@ -3363,7 +3411,7 @@ async function tgSignal(sig) {
 🌍 *Session:* ${sig.session} | KZ: ${sig.mtf.kz ? '✅' : '❌'}
 📍 *Zone:* ${pd} | H1 POI: ${sig.mtf.h1POI || 'none'}
 
-💰 *Entry:* ${safeNum(sig.levels.entry)} (M15${sig.m5Confirmed ? ' | M5 ✅' : ''})
+💰 *Entry:* ${safeNum(sig.levels.entry)} (M15 close${sig.m5Confirmed ? ' | M5 ✅' : ''})
 🛑 *SL:*    ${safeNum(sig.levels.sl)}
 🎯 *TP1:*   ${safeNum(sig.levels.tp1)}
 🎯 *TP2:*   ${safeNum(sig.levels.tp2)}
@@ -3373,6 +3421,10 @@ async function tgSignal(sig) {
 💵 *TP1 profit:* ₹${sig.levels.profitTP1?.toLocaleString('en-IN') || 'N/A'} (close ${sig.levels.lotsTP1Close || 'N/A'} lots)
 💵 *TP2 profit:* ₹${sig.levels.profitTP2?.toLocaleString('en-IN') || 'N/A'} (close ${sig.levels.lotsTP2Close || 'N/A'} lots)
 
+━━━━━━━━━━━━━━━━━━━━
+${livePxLine}
+${validityLine}
+${skipWarning}
 ⏱ *Expires:* ${exp} IST | Setup+Entry: M15 | SL: H1 struct
 📈 RSI: ${sig.indicators.rsi} | Vol: ${sig.indicators.vol.ratio}x | ATR: ${sig.indicators.atr}
 
@@ -4292,6 +4344,38 @@ async function runCycle() {
 
       // ✅ Signal passes all checks
       gate.record(sig);
+
+      // ── Enrich with live price (RIGHT before Telegram send) ───────────────
+      // For crypto: fetch real-time ticker from Delta Exchange /v2/tickers
+      // For forex/India: use last confirmed M15 candle close (already fresh)
+      try {
+        let livePx = null;
+        if (cfg.cat === 'crypto' && cfg.deltaSymbol) {
+          livePx = await delta.fetchLivePrice(cfg.deltaSymbol);
+        }
+        if (!livePx) {
+          // Fallback: last M15 close (already in signal as entry for most strategies)
+          const lastM15 = mtf.m15[mtf.m15.length - 1];
+          livePx = lastM15?.close || null;
+        }
+        if (livePx) {
+          const entryNum = parseFloat(sig.levels.entry);
+          const atrNum   = parseFloat(sig.indicators.atr);  // ATR is already in the signal
+          const dec      = entryNum > 10000 ? 2 : entryNum > 100 ? 3 : entryNum > 1 ? 5 : 6;
+          const isBuyS   = sig.dir === 'BUY';
+          const drift    = Math.abs(livePx - entryNum);
+          const driftPct = entryNum > 0 ? (drift / entryNum * 100).toFixed(2) : null;
+          // Zone strategies have wider valid entry range (price may wander inside zone)
+          const zoneStrategies = ['FVG_OB','BREAKER','SILVER_BULLET','OTE','FPB','CHOCH'];
+          const tolerance      = zoneStrategies.includes(sig.strategy.id) ? atrNum * 1.0 : atrNum * 0.5;
+          sig.livePrice       = Ind.fmt(livePx, dec);
+          sig.entryValidLow   = Ind.fmt(entryNum - (isBuyS ? tolerance : atrNum * 0.3), dec);
+          sig.entryValidHigh  = Ind.fmt(entryNum + (isBuyS ? atrNum * 0.3 : tolerance), dec);
+          sig.driftPct        = driftPct;
+          sig.entryStillValid = drift <= tolerance;
+        }
+      } catch (_) { /* live price enrichment is non-critical */ }
+
       state.signals.unshift(sig);
       if (state.signals.length > CONFIG.MAX_SIGNALS) state.signals = state.signals.slice(0, CONFIG.MAX_SIGNALS);
       state.stats.total++;
@@ -4424,8 +4508,8 @@ function forexPausedForNews() {
 //  SECTION 9 — API ENDPOINTS
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  bot: 'Hybrid Trading Bot v10.6.0 — ICT/SMC Engine',
-  version: '10.7.0',
+  bot: 'Hybrid Trading Bot v10.8.0 — ICT/SMC Engine',
+  version: '10.8.0',
   strategies: 22,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -4436,7 +4520,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.7.0',
+    status: 'OK', version: '10.8.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -4969,7 +5053,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v10.7.0 — ICT/SMC ENGINE   ║
+║  HYBRID TRADING BOT v10.8.0 — ICT/SMC ENGINE   ║
 ║   22 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE · Crypto · Forex · Commodity    ║
 ╚══════════════════════════════════════════════════╝
@@ -4985,7 +5069,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Forex:9 · Commodity:2 · Cr
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.7.0 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v10.8.0 Online*
 Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
 Strategies: 22 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
