@@ -12,17 +12,13 @@ app.use(express.json());
 // ─────────────────────────────────────────────────────────────
 //  HYBRID TRADING BOT v9.1 — ICT/SMC PRECISION ENGINE
 //  10 strategies · M15 entry · H1/H4 structure SL/TP
-//  Markets: India NSE/BSE · Crypto · Forex · Commodity
+//  Markets: India NSE/BSE (Dhan) | Crypto (Delta Exchange + fallbacks)
 // ─────────────────────────────────────────────────────────────
 
 const CONFIG = {
   PORT:               process.env.PORT || 5000,
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID:   process.env.TELEGRAM_CHAT_ID,
-  FINNHUB_KEY:        process.env.FINNHUB_API_KEY,
-  FINNHUB_URL:        'https://finnhub.io/api/v1',
-  TWELVE_DATA_KEY:    process.env.TWELVE_DATA_API_KEY,
-  TWELVE_DATA_URL:    'https://api.twelvedata.com',
   DELTA_URL:          'https://api.india.delta.exchange', // No API key needed
   CG_URL:             'https://api.coingecko.com/api/v3',  // Fallback for crypto
   DHAN_URL:           'https://api.dhan.co',
@@ -36,69 +32,41 @@ const CONFIG = {
   EXPIRY_MIN:         240,   // signal expires after 4 hours (gives TP time to hit)
   // ── Per-market risk configuration ─────────────────────────────────────────
   // India NSE — fixed ₹ risk per trade (self-funded, ₹5,000 account)
-  INDIA_RISK_INR:     parseFloat(process.env.INDIA_RISK_INR  || '5000'),  // ₹5,000 account → default ₹500/trade (10%)
+  INDIA_RISK_INR:     parseFloat(process.env.INDIA_RISK_INR  || '5000'),
 
   // Crypto — fixed ₹ risk per trade (Delta Exchange, ₹1,700 account)
-  CRYPTO_RISK_INR:    parseFloat(process.env.CRYPTO_RISK_INR || '1700'),  // ₹1,700 account → default ₹170/trade (10%)
+  CRYPTO_RISK_INR:    parseFloat(process.env.CRYPTO_RISK_INR || '1700'),
 
-  // Forex + Commodity — FundingPips ONLY (% based, must respect DD rules)
-  // India and Crypto are self-funded — NOT under FundingPips rules
-  FP_ACCOUNT_USD:     parseFloat(process.env.FP_ACCOUNT_USD  || '5000'),  // $5,000 FP account
-  FP_RISK_PCT:        parseFloat(process.env.FP_RISK_PCT      || '0.5'),  // 0.5% = $25/trade (conservative for challenge)
-  USD_TO_INR:         parseFloat(process.env.USD_TO_INR        || '83'),  // approx rate for display
-
-  // ── Per-symbol enable/disable (set to false to skip a symbol) ──────────────
-  // Control from env vars: SYMBOL_EURUSD=false to disable, default all enabled
+  // ── Per-symbol enable/disable ────────────────────────────────────────────
   DISABLED_SYMBOLS:   (process.env.DISABLED_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
-
-  // ── FundingPips Challenge Tracker ───────────────────────────────────────────
-  FP_PHASE:           parseInt(process.env.FP_PHASE           || '1'),    // current phase (1 or 2)
-  FP_PHASE1_TARGET:   8,    // 8% profit target for Phase 1 (2-Step Standard)
-  FP_PHASE2_TARGET:   5,    // 5% profit target for Phase 2
-  FP_MAX_DD_PCT:      10,   // 10% max drawdown (static from initial balance)
-  FP_DAILY_DD_PCT:    5,    // 5% max daily drawdown
-  FP_WARN_DD_PCT:     3,    // warn when daily DD reaches 3% (buffer before 5% limit)
-  FP_WARN_MAX_DD:     7,    // warn when total DD reaches 7% (buffer before 10% limit)
-
-  // ── MongoDB (optional — if MONGODB_URI set, persists across deploys) ─────────
-  MONGODB_URI:        process.env.MONGODB_URI || null,
 };
 
-// ── Symbols ───────────────────────────────────────────────────
+// ── Symbols — India NSE + Crypto ONLY ─────────────────────────────────────
+// Forex and Commodity removed — Finnhub/TwelveData API limits exceeded.
+// All crypto data via Delta Exchange India (read-only, no API key needed).
+// All India data via Dhan API (30-day token).
 const SYMBOLS = {
-  // ── India NSE/BSE (Dhan) ────────────────────────────────────────────────
-  NIFTY:      { name:'NIFTY 50',      cat:'india',     src:'dhan', dhanId:'13',  seg:'IDX_I' },
-  BANKNIFTY:  { name:'Bank NIFTY',    cat:'india',     src:'dhan', dhanId:'25',  seg:'IDX_I' },
-  FINNIFTY:   { name:'Fin NIFTY',     cat:'india',     src:'dhan', dhanId:'27',  seg:'IDX_I' },
-  SENSEX:     { name:'BSE SENSEX',    cat:'india',     src:'dhan', dhanId:'51',  seg:'IDX_I' }, // BSE index — signals only, limited F&O access
-  MIDCPNIFTY: { name:'Nifty Midcap Select', cat:'india', src:'dhan', dhanId:'11915', seg:'IDX_I' }, // ✅ verified — Nifty Midcap Select F&O
+  // ── India NSE/BSE (Dhan) ─────────────────────────────────────────────────
+  NIFTY:      { name:'NIFTY 50',           cat:'india',  src:'dhan', dhanId:'13',    seg:'IDX_I' },
+  BANKNIFTY:  { name:'Bank NIFTY',         cat:'india',  src:'dhan', dhanId:'25',    seg:'IDX_I' },
+  FINNIFTY:   { name:'Fin NIFTY',          cat:'india',  src:'dhan', dhanId:'27',    seg:'IDX_I' },
+  SENSEX:     { name:'BSE SENSEX',         cat:'india',  src:'dhan', dhanId:'51',    seg:'IDX_I' },
+  MIDCPNIFTY: { name:'Nifty Midcap Select',cat:'india',  src:'dhan', dhanId:'11915', seg:'IDX_I' },
 
-  // ── Forex — Finnhub primary | TwelveData fallback ──────────────────────
-  // Majors (highest volume globally)
-  EURUSD:    { name:'EUR/USD',     cat:'forex',     src:'td', td:'EUR/USD',  fh:'OANDA:EUR_USD'  }, // #1 ~$1.5T/day
-  USDJPY:    { name:'USD/JPY',     cat:'forex',     src:'td', td:'USD/JPY',  fh:'OANDA:USD_JPY'  }, // #2 ~$950B/day
-  GBPUSD:    { name:'GBP/USD',     cat:'forex',     src:'td', td:'GBP/USD',  fh:'OANDA:GBP_USD'  }, // #3 ~$630B/day
-  AUDUSD:    { name:'AUD/USD',     cat:'forex',     src:'td', td:'AUD/USD',  fh:'OANDA:AUD_USD'  }, // #5 ~$350B/day
-  USDCAD:    { name:'USD/CAD',     cat:'forex',     src:'td', td:'USD/CAD',  fh:'OANDA:USD_CAD'  }, // #6 ~$250B/day oil pair
-  USDCHF:    { name:'USD/CHF',     cat:'forex',     src:'td', td:'USD/CHF',  fh:'OANDA:USD_CHF'  }, // #7 safe haven
-  NZDUSD:    { name:'NZD/USD',     cat:'forex',     src:'td', td:'NZD/USD',  fh:'OANDA:NZD_USD'  }, // #8 commodity
-  // High-volatility crosses (best for ICT/SMC — large intraday ranges)
-  GBPJPY:    { name:'GBP/JPY',     cat:'forex',     src:'td', td:'GBP/JPY',  fh:'OANDA:GBP_JPY'  }, // 100+ pips/day "The Dragon"
-  EURJPY:    { name:'EUR/JPY',     cat:'forex',     src:'td', td:'EUR/JPY',  fh:'OANDA:EUR_JPY'  }, // 3rd most traded cross
-
-  // ── Commodity — Finnhub primary | TwelveData fallback ──────────────────
-  XAUUSD:    { name:'Gold/USD',    cat:'commodity', src:'td', td:'XAU/USD',  fh:'OANDA:XAU_USD'  }, // #1 commodity
-  XAGUSD:    { name:'Silver/USD',  cat:'commodity', src:'td', td:'XAG/USD',  fh:'OANDA:XAG_USD'  }, // #2 commodity high vol
-
-  // ── Crypto — Delta Exchange India primary | Binance fallback | CoinGecko last ──
-  BTCUSDT:   { name:'BTC/USDT',   cat:'crypto', src:'delta', deltaSymbol:'BTCUSD',  cgId:'bitcoin'  }, // max 100x
-  ETHUSDT:   { name:'ETH/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ETHUSD',  cgId:'ethereum'  }, // max 100x
-  SOLUSDT:   { name:'SOL/USDT',   cat:'crypto', src:'delta', deltaSymbol:'SOLUSD',  cgId:'solana'  }, // max 50x
-  XRPUSDT:   { name:'XRP/USDT',   cat:'crypto', src:'delta', deltaSymbol:'XRPUSD',  cgId:'ripple'  }, // max 50x
-  DOGEUSDT:  { name:'DOGE/USDT',  cat:'crypto', src:'delta', deltaSymbol:'DOGEUSD', cgId:'dogecoin', noStrategies:['CHOCH','OTE','FPB'] }, // max 50x
-  ADAUSDT:   { name:'ADA/USDT',   cat:'crypto', src:'delta', deltaSymbol:'ADAUSD',  cgId:'cardano'  }, // max 50x
-  BNBUSDT:   { name:'BNB/USDT',   cat:'crypto', src:'delta', deltaSymbol:'BNBUSD',  cgId:'binancecoin'  }, // max 50x
-  LTCUSDT:   { name:'LTC/USDT',   cat:'crypto', src:'delta', deltaSymbol:'LTCUSD',  cgId:'litecoin'  }, // max 50x
+  // ── Crypto — Delta Exchange India (real M15, no key) ─────────────────────
+  BTCUSDT:   { name:'BTC/USDT',  cat:'crypto', src:'delta', deltaSymbol:'BTCUSD',  cgId:'bitcoin'     },
+  ETHUSDT:   { name:'ETH/USDT',  cat:'crypto', src:'delta', deltaSymbol:'ETHUSD',  cgId:'ethereum'    },
+  SOLUSDT:   { name:'SOL/USDT',  cat:'crypto', src:'delta', deltaSymbol:'SOLUSD',  cgId:'solana'      },
+  XRPUSDT:   { name:'XRP/USDT',  cat:'crypto', src:'delta', deltaSymbol:'XRPUSD',  cgId:'ripple'      },
+  BNBUSDT:   { name:'BNB/USDT',  cat:'crypto', src:'delta', deltaSymbol:'BNBUSD',  cgId:'binancecoin' },
+  ADAUSDT:   { name:'ADA/USDT',  cat:'crypto', src:'delta', deltaSymbol:'ADAUSD',  cgId:'cardano'     },
+  DOGEUSDT:  { name:'DOGE/USDT', cat:'crypto', src:'delta', deltaSymbol:'DOGEUSD', cgId:'dogecoin',   noStrategies:['CHOCH','OTE','FPB'] },
+  LTCUSDT:   { name:'LTC/USDT',  cat:'crypto', src:'delta', deltaSymbol:'LTCUSD',  cgId:'litecoin'    },
+  // PAXG — Gold-backed token on Delta Exchange.
+  // NOTE: Lower liquidity than BTC/ETH. Candle data available via Delta API.
+  // Advisable only after bot is consistently profitable on BTC/ETH/India.
+  // Enable by removing the comment below:
+  // PAXGUSDT: { name:'PAXG/USDT', cat:'crypto', src:'delta', deltaSymbol:'PAXGUSD', cgId:'pax-gold' },
 };
 
 // ── Live Dhan token (updated at runtime, no redeploy) ─────────
@@ -133,8 +101,6 @@ const Market = {
 
   isOpen(cat) {
     if (cat === 'india')     return this.indiaOpen();
-    if (cat === 'forex')     return this.forexOpen();
-    if (cat === 'commodity') return this.forexOpen();
     if (cat === 'crypto')    return true;
     return false;
   },
@@ -145,9 +111,6 @@ const Market = {
       const day = now.getDay();
       if (day === 0 || day === 6) return `🔴 ${symbol}: Market closed (weekend)`;
       return `🔴 ${symbol}: NSE/BSE closed — opens 09:15 IST`;
-    }
-    if (cat === 'forex' || cat === 'commodity') {
-      return `🔴 ${symbol}: Forex/Commodity market closed (weekend)`;
     }
     return `🔴 ${symbol}: Market closed`;
   },
@@ -300,7 +263,7 @@ class Ind {
   }
 
   // Volume: real for crypto, range-proxy for others
-  static vol(candles, cat = 'forex') {
+  static vol(candles, cat = 'crypto') {
     let vals;
     if (cat === 'crypto') {
       vals = candles.map(c => c.volume || 1);
@@ -2094,19 +2057,6 @@ class Builder {
       riskAmt   = CONFIG.CRYPTO_RISK_INR;
       currency  = '₹';
       riskLabel = `₹${riskAmt.toLocaleString('en-IN')} (Crypto — ₹1.7K acct)`;
-
-    } else {
-      // Forex + Commodity — FundingPips 0.5% of $5,000
-      const fpRiskUSD = CONFIG.FP_ACCOUNT_USD * (CONFIG.FP_RISK_PCT / 100);
-      // Check if daily DD protection should halve risk
-      const todayKey  = new Date().toISOString().slice(0, 10);
-      const todayPnL  = state.fp.dailyPnL[todayKey] || 0;
-      const dailyDDpct = Math.abs(Math.min(todayPnL, 0)) / CONFIG.FP_ACCOUNT_USD * 100;
-      const halfRisk   = dailyDDpct >= CONFIG.FP_WARN_DD_PCT; // halve if >3% daily used
-      const effectiveRisk = halfRisk ? fpRiskUSD / 2 : fpRiskUSD;
-      riskAmt   = Math.round(effectiveRisk * CONFIG.USD_TO_INR); // convert to ₹ for display
-      currency  = '$';
-      riskLabel = `$${effectiveRisk.toFixed(0)} (${CONFIG.FP_RISK_PCT}% of $${CONFIG.FP_ACCOUNT_USD} FundingPips${halfRisk ? ' ⚠️ halved' : ''})`;
     }
 
     lvls.riskAmount   = riskAmt;
@@ -2772,114 +2722,8 @@ class Builder {
 //  SECTION 4 — DATA FETCHERS
 // ═════════════════════════════════════════════════════════════
 
-class TDFetcher {
-  constructor() { this.lastCall = 0; }
-
-  async fetch(symbol, interval, size = 130) {
-    if (!CONFIG.TWELVE_DATA_KEY) return null;
-    const wait = 8000 - (Date.now() - this.lastCall);
-    if (wait > 0) await new Promise(r => setTimeout(r, wait));
-    this.lastCall = Date.now();
-    try {
-      const res = await axios.get(`${CONFIG.TWELVE_DATA_URL}/time_series`, {
-        params: { symbol, interval, outputsize: size, apikey: CONFIG.TWELVE_DATA_KEY },
-        timeout: 15000,
-      });
-      const d = res.data;
-      if (d.status === 'error' || !d.values?.length) { console.error(`[TD] ${symbol}/${interval}: ${d.message}`); return null; }
-      return d.values.reverse().map(b => ({
-        time: new Date(b.datetime).getTime(),
-        open: +b.open, high: +b.high, low: +b.low, close: +b.close,
-        volume: +(b.volume || 0) || 1,
-      }));
-    } catch (e) { console.error(`[TD] ${symbol}/${interval}: ${e.message}`); return null; }
-  }
-}
-
-// ── Finnhub Fetcher — primary for Forex + Gold ───────────────────────────────
-// Free tier: 60 calls/min. Real M15 OHLC from institutional brokers.
-// Docs: https://finnhub.io/docs/api/forex-candles
-class FinnhubFetcher {
-  constructor() {
-    this.key     = CONFIG.FINNHUB_KEY;
-    this.baseUrl = CONFIG.FINNHUB_URL;
-    this.cache   = {};           // symbol → { m15, h1, h4, time }
-    this.ttlM15  = 12 * 60000;  // 12 min
-    this.ttlH1   = 25 * 60000;  // 25 min
-    this.lastCall = 0;
-    this.minGap  = 200;          // ms between calls (well under 60/min)
-  }
-
-  get available() { return !!this.key; }
-
-  async _wait() {
-    const gap = this.minGap - (Date.now() - this.lastCall);
-    if (gap > 0) await new Promise(r => setTimeout(r, gap));
-    this.lastCall = Date.now();
-  }
-
-  // resolution: '15' (15min) | '60' (1h) | '240' (4h)
-  // Returns candles oldest→newest, or null on failure
-  async fetchCandles(fhSymbol, resolution = '15', days = 3) {
-    if (!this.available) return null;
-    await this._wait();
-    const to   = Math.floor(Date.now() / 1000);
-    const from = to - days * 86400;
-    try {
-      const res = await axios.get(`${this.baseUrl}/forex/candle`, {
-        params: { symbol: fhSymbol, resolution, from, to, token: this.key },
-        timeout: 15000,
-      });
-      const d = res.data;
-      if (d.s !== 'ok' || !d.t?.length) {
-        // 'no_data' means market closed or no candles in range — not an error
-        if (d.s !== 'no_data') console.warn(`[FH] ${fhSymbol}/${resolution}: status=${d.s}`);
-        return null;
-      }
-      const candles = d.t.map((ts, i) => ({
-        time:   ts * 1000,
-        open:   d.o[i], high: d.h[i],
-        low:    d.l[i], close: d.c[i],
-        volume: d.v?.[i] || 1,
-      }));
-      console.log(`[FH] ✅ ${fhSymbol} [${resolution}m]: ${candles.length} candles`);
-      return candles;
-    } catch (e) {
-      const status = e.response?.status;
-      if (status === 429) console.warn('[FH] Rate limited — slow down');
-      else console.error(`[FH] ${fhSymbol}/${resolution}: ${status || e.message}`);
-      return null;
-    }
-  }
-
-  // Fetch M5 + M15 + H1 + H4 + Daily for a symbol, with cache
-  async fetchMTF(fhSymbol) {
-    const cached = this.cache[fhSymbol];
-    if (cached && Date.now() - cached.time < this.ttlM15) return cached;
-
-    const m15 = await this.fetchCandles(fhSymbol, '15', 3);
-    if (!m15 || m15.length < 10) return cached || null;
-    // M5 — 1 day = 288 candles. Cached separately at ttlM15.
-    const m5 = await this.fetchCandles(fhSymbol, '5', 1);
-
-    let h1 = cached?.h1 || null;
-    if (!h1 || Date.now() - (cached?.h1Time || 0) > this.ttlH1) {
-      h1 = await this.fetchCandles(fhSymbol, '60', 7);
-    }
-    const h4    = await this.fetchCandles(fhSymbol, '240', 30);
-    // Daily candle (resolution 'D') — 60 days. Cached 6 hours.
-    let daily = cached?.daily || null;
-    if (!daily || Date.now() - (cached?.dailyTime || 0) > 6 * 3600000) {
-      daily = await this.fetchCandles(fhSymbol, 'D', 60);
-    }
-    const result = {
-      m5: m5 || [], m15, h1: h1 || [], h4: h4 || [], daily: daily || [],
-      time: Date.now(), h1Time: Date.now(), dailyTime: Date.now(),
-    };
-    this.cache[fhSymbol] = result;
-    return result;
-  }
-}
+// TDFetcher and FinnhubFetcher removed — Forex/Commodity dropped.
+// Bot now uses Delta Exchange (Crypto) and Dhan (India) only.
 
 class DeltaFetcher {
   // Delta Exchange India — https://api.india.delta.exchange
@@ -3200,8 +3044,6 @@ class DhanFetcher {
 
 class DataFetcher {
   constructor() {
-    this.td      = new TDFetcher();
-    this.fh      = new FinnhubFetcher();
     this.delta   = new DeltaFetcher();
     this.binFb   = new BinanceFallback(); // Binance fallback (real M15, no key)
     this.cgFb    = new CGFallback();      // CoinGecko last resort (30-min proxy)
@@ -3238,39 +3080,7 @@ class DataFetcher {
     let m5 = null, m15 = null, h1 = null, h4 = null, daily = null, source = 'unknown';
 
     try {
-      if (cfg.src === 'td') {
-        // ── Primary: Finnhub (60 req/min, fast) ─────────────────────
-        if (this.fh.available && cfg.fh) {
-          const fhData = await this.fh.fetchMTF(cfg.fh);
-          if (fhData?.m15?.length >= 10) {
-            m15 = fhData.m15;
-            m5  = fhData.m5?.length  ? fhData.m5  : null;
-            h1  = fhData.h1?.length  ? fhData.h1  : null;
-            h4  = fhData.h4?.length  ? fhData.h4  : null;
-            source = 'finnhub';
-            console.log(`[FH] ✅ ${symbol}: M5(${m5?.length||0}) M15(${m15.length}) H1(${h1?.length||0}) H4(${h4?.length||0})`);
-          }
-        }
-        // ── Fallback: TwelveData (8 req/min) ────────────────────────
-        if (!m15 || m15.length < 10) {
-          console.log(`[TD] ${source === 'finnhub' ? '' : 'Finnhub unavailable — '}using TwelveData for ${symbol}`);
-          m15 = await this.td.fetch(cfg.td, '15min', 130);
-          m5  = m15 ? await this.td.fetch(cfg.td, '5min', 288) : null;
-          h1  = m15 ? await this.td.fetch(cfg.td, '1h', 100) : null;
-          h4  = m15 ? await this.td.fetch(cfg.td, '4h', 60)  : null;
-          source = m15 ? 'twelvedata' : 'failed';
-        }
-        // Daily candle — try Finnhub first, fallback TwelveData
-        if (!daily && this.fh.available && cfg.fh) {
-          const fhD = await this.fh.fetchCandles(cfg.fh, 'D', 60);
-          if (fhD?.length) daily = fhD;
-        }
-        if (!daily && m15) {
-          // Resample daily from available H4 candles (6 × H4 = 1 day)
-          daily = h4 ? this.resample(h4, 6) : null;
-        }
-
-      } else if (cfg.src === 'delta') {
+      if (cfg.src === 'delta') {
         // ── Primary: Delta Exchange India (real M15, no API key) ────
         const dtf = await this.delta.fetchMTF(cfg.deltaSymbol);
         if (dtf?.m15?.length >= 10) {
@@ -3279,10 +3089,9 @@ class DataFetcher {
           h1  = dtf.h1?.length  ? dtf.h1  : null;
           h4  = dtf.h4?.length  ? dtf.h4  : null;
           source = 'delta';
-        // Daily from H4 (6 × 4h = 1 day)
-        if (m15 && h4?.length >= 6) daily = this.resample(h4, 6);
+          if (m15 && h4?.length >= 6) daily = this.resample(h4, 6);
         }
-        // ── Fallback 1: Binance (real M15, no key, no rate limit issues) ──
+        // ── Fallback 1: Binance (real M15, no key) ──────────────────
         if (!m15 || m15.length < 10) {
           console.log(`[Binance-FB] Delta failed for ${symbol} — trying Binance`);
           const binM15 = await this.binFb.fetch(cfg.deltaSymbol, '15m', 200);
@@ -3290,15 +3099,14 @@ class DataFetcher {
             const binH1 = await this.binFb.fetch(cfg.deltaSymbol, '1h', 100);
             const binH4 = await this.binFb.fetch(cfg.deltaSymbol, '4h', 60);
             const binM5 = await this.binFb.fetch(cfg.deltaSymbol, '5m', 288);
-            m5     = binM5 || null;
-            m15    = binM15;
-            h1     = binH1 || this.resample(binM15, 4);
-            h4     = binH4 || this.resample(binM15, 16);
+            m5 = binM5 || null; m15 = binM15;
+            h1 = binH1 || this.resample(binM15, 4);
+            h4 = binH4 || this.resample(binM15, 16);
             source = 'binance_fallback';
             console.log(`[Binance-FB] ✅ ${symbol}: M15(${m15.length})`);
           }
         }
-        // ── Fallback 2: KuCoin (real M15, no geo-restriction) ────────────
+        // ── Fallback 2: KuCoin (no geo-restriction) ──────────────────
         if (!m15 || m15.length < 10) {
           console.log(`[KuCoin-FB] Binance failed — trying KuCoin for ${symbol}`);
           const kcM15 = await this.kcFb.fetch(cfg.deltaSymbol, '15m', 200);
@@ -3306,29 +3114,28 @@ class DataFetcher {
             const kcM5 = await this.kcFb.fetch(cfg.deltaSymbol, '5m', 288);
             const kcH1 = await this.kcFb.fetch(cfg.deltaSymbol, '1h', 168);
             const kcH4 = await this.kcFb.fetch(cfg.deltaSymbol, '4h', 180);
-            m5  = kcM5  || null;
-            m15 = kcM15;
-            h1  = kcH1  || this.resample(kcM15, 4);
-            h4  = kcH4  || this.resample(kcM15, 16);
+            m5 = kcM5 || null; m15 = kcM15;
+            h1 = kcH1 || this.resample(kcM15, 4);
+            h4 = kcH4 || this.resample(kcM15, 16);
             source = 'kucoin_fallback';
             console.log(`[KuCoin-FB] ✅ ${symbol}: M15(${m15.length})`);
           }
         }
-        // ── Fallback 3: CoinGecko (30-min proxy — last resort) ─────────
+        // ── Fallback 3: CoinGecko (30-min proxy — last resort) ───────
         if (!m15 || m15.length < 10) {
-          console.log(`[CG-FB] KuCoin also failed — trying CoinGecko`);
+          console.log(`[CG-FB] All sources failed — trying CoinGecko`);
           const cgCandles = await this.cgFb.fetch(cfg.cgId);
           if (cgCandles?.length >= 10) {
-            m15    = cgCandles;
-            h1     = this.resample(cgCandles, 2);
-            h4     = this.resample(cgCandles, 8);
+            m15 = cgCandles;
+            h1  = this.resample(cgCandles, 2);
+            h4  = this.resample(cgCandles, 8);
             source = 'coingecko_fallback';
             console.log(`[CG-FB] ✅ ${symbol}: ${cgCandles.length} candles (30-min proxy)`);
           }
         }
 
       } else if (cfg.src === 'dhan') {
-        // Dhan: fetch M15 directly, resample for H1 and H4
+        // ── Dhan: M15 directly, resample H1/H4 ──────────────────────
         m15 = await this.dhan.fetch(symbol, 'FIFTEEN_MINUTE');
         m5  = await this.dhan.fetch(symbol, 'FIVE_MINUTE');
         if (m15 && m15.length >= 20) {
@@ -3336,7 +3143,6 @@ class DataFetcher {
           h4 = this.resample(m15, 16);  // 16 × 15min = 4h
         }
         source = 'dhan';
-        // Daily from H4 (6 × 4h = 1 day)
         if (m15 && h4?.length >= 6) daily = this.resample(h4, 6);
       }
     } catch (e) { console.error(`[DataFetcher] ${symbol}:`, e.message); }
@@ -3529,7 +3335,7 @@ class Gate {
 
   // Correlated pairs — only highest quality fires per cycle
   static CORR = {
-    'EURUSD': ['GBPUSD','AUDUSD','NZDUSD'],
+    // Forex correlation removed
     'GBPUSD': ['EURUSD','GBPJPY','EURJPY'],
     'AUDUSD': ['EURUSD','NZDUSD'],
     'NZDUSD': ['AUDUSD'],
@@ -3569,9 +3375,8 @@ class Gate {
     // Price drift — per-category thresholds
     if (sig.levels?.entry) {
       const drift = Math.abs(sig.levels.entry - price) / price;
-      const driftLimit = sig.cat === 'india'  ? 0.002  // 0.2% for NSE
-                       : sig.cat === 'forex' || sig.cat === 'commodity' ? 0.003  // 0.3% forex
-                       : 0.01;  // 1% for crypto (volatile)
+      const driftLimit = sig.cat === 'india' ? 0.002  // 0.2% for NSE
+                       : 0.01;                         // 1% for crypto (volatile)
       if (drift > driftLimit)
         return { ok: false, why: `Price drifted ${(drift*100).toFixed(2)}% > ${(driftLimit*100)}% limit` };
     }
@@ -3606,7 +3411,7 @@ class Gate {
 const gate = new Gate();
 
 // Global sets for runtime state (must be declared before any function that uses them)
-const ECO_PAUSE_REASONS = new Set(); // forex news pause — populated by checkEconomicCalendar
+const ECO_PAUSE_REASONS = new Set(); // kept for /econews Telegram command compatibility
 
 // ═════════════════════════════════════════════════════════════
 //  SECTION 7 — BOT STATE & EXPIRY CHECKER
@@ -3615,152 +3420,21 @@ const state = {
   signals: [],
   stats: {
     total: 0, blocked: 0, analyzed: 0, startTime: Date.now(),
-    // Per-strategy + per-symbol outcome tracking
-    stratWR:  {},  // stratId → { wins, losses }
-    symbolWR: {},  // symbol  → { wins, losses }
-    sessionWR:{},  // session → { wins, losses }
+    stratWR:  {},
+    symbolWR: {},
+    sessionWR:{},
   },
   lastCycle: null,
   running: false,
   closedNotified: {},
-
-  // ── FundingPips Challenge Tracker ──────────────────────────────────────────
+  // fp stub — FundingPips removed, kept as empty object so old references don't crash
+  fp: { phase:1, dailyPnL:{}, totalPnL:0, tradesThisPhase:0, warningsSent:{} },
   pauseUntil: null, // set via /pause command
-
-  fp: {
-    phase:          1,
-    startedAt:      null,   // date trading started
-    dailyPnL:       {},     // date → estimated P&L in USD
-    totalPnL:       0,      // cumulative USD P&L estimate
-    tradesThisPhase: 0,
-    warningsSent:   {},     // track warnings to avoid spam (key → lastSentTime)
-  },
 };
 
-// ── FundingPips P&L tracker ──────────────────────────────────────────────────
-// Called after TP/SL events to update challenge progress
-// FundingPips P&L — FOREX + COMMODITY ONLY (India/Crypto are separate self-funded accounts)
-function fpUpdatePnL(sig, outcome) {
-  if (sig.cat !== 'forex' && sig.cat !== 'commodity') return; // FP = forex/gold only, NOT india/crypto
-  const todayKey = new Date().toISOString().slice(0, 10);
-  if (!state.fp.dailyPnL[todayKey]) state.fp.dailyPnL[todayKey] = 0;
-  if (!state.fp.startedAt) state.fp.startedAt = todayKey;
 
-  const riskUSD = CONFIG.FP_ACCOUNT_USD * (CONFIG.FP_RISK_PCT / 100);
-  let pnlUSD = 0;
-
-  if (outcome === 'TP1') {
-    // TP1 hit: estimate 1× risk profit (conservative — actual depends on RR)
-    const rr = sig.levels?.rr ? parseFloat(sig.levels.rr.split(':')[1] || '1.5') : 1.5;
-    pnlUSD = riskUSD * Math.min(rr, 1.5); // cap at 1.5× for conservative tracking
-  } else if (outcome === 'TP2') {
-    const rr = sig.levels?.rr ? parseFloat(sig.levels.rr.split(':')[1] || '2') : 2;
-    pnlUSD = riskUSD * Math.min(rr, 2.5);
-  } else if (outcome === 'TP3') {
-    pnlUSD = riskUSD * 3;
-  } else if (outcome === 'SL_HIT') {
-    pnlUSD = -riskUSD; // full loss
-  } else if (outcome === 'SL_BREAKEVEN') {
-    pnlUSD = 0; // no loss/gain
-  }
-
-  state.fp.dailyPnL[todayKey] = (state.fp.dailyPnL[todayKey] || 0) + pnlUSD;
-  state.fp.totalPnL            = (state.fp.totalPnL || 0) + pnlUSD;
-  state.fp.tradesThisPhase     = (state.fp.tradesThisPhase || 0) + 1;
-  console.log(`[FP] P&L updated: today $${state.fp.dailyPnL[todayKey].toFixed(2)} | total $${state.fp.totalPnL.toFixed(2)}`);
-}
-
-// FundingPips watchdog — called every cycle
-async function fpWatchdog() {
-  const todayKey    = new Date().toISOString().slice(0, 10);
-  const todayPnL    = state.fp.dailyPnL[todayKey] || 0;
-  const totalPnL    = state.fp.totalPnL || 0;
-  const acct        = CONFIG.FP_ACCOUNT_USD;
-  const now         = Date.now();
-  const spamGuard   = 3 * 3600000; // max 1 warning per type per 3h
-
-  // ── Daily DD watchdog ─────────────────────────────────────────────────────
-  const dailyDDpct = Math.abs(Math.min(todayPnL, 0)) / acct * 100;
-  if (dailyDDpct >= CONFIG.FP_WARN_DD_PCT) { // 3% daily used
-    const key = 'daily_dd_warn';
-    if (!state.fp.warningsSent[key] || now - state.fp.warningsSent[key] > spamGuard) {
-      state.fp.warningsSent[key] = now;
-      await tgSend(
-        `⚠️ *FundingPips Daily DD Warning*
-` +
-        `Used: ${dailyDDpct.toFixed(1)}% of ${CONFIG.FP_DAILY_DD_PCT}% daily limit
-` +
-        `Today P&L: $${todayPnL.toFixed(2)}
-` +
-        `Risk is now HALVED for remaining signals today.
-` +
-        `Stop trading if daily loss reaches $${(acct * 0.045).toFixed(0)} (4.5%).`
-      );
-    }
-  }
-
-  // ── Hard daily DD brake — stop all forex/gold signals if at 4.5% ─────────
-  if (dailyDDpct >= 4.5) {
-    const key = 'daily_hard_brake';
-    if (!state.fp.warningsSent[key] || now - state.fp.warningsSent[key] > spamGuard) {
-      state.fp.warningsSent[key] = now;
-      await tgSend(
-        `🛑 *FundingPips STOP TRADING*
-` +
-        `Daily DD at ${dailyDDpct.toFixed(1)}% — approaching 5% hard limit.
-` +
-        `NO MORE Forex/Gold signals today. Resumes tomorrow.`
-      );
-    }
-  }
-
-  // ── Max total DD watchdog ─────────────────────────────────────────────────
-  const totalDDpct = Math.abs(Math.min(totalPnL, 0)) / acct * 100;
-  if (totalDDpct >= CONFIG.FP_WARN_MAX_DD) { // 7% total used
-    const key = 'total_dd_warn';
-    if (!state.fp.warningsSent[key] || now - state.fp.warningsSent[key] > spamGuard) {
-      state.fp.warningsSent[key] = now;
-      await tgSend(
-        `🚨 *FundingPips Max DD Warning*
-` +
-        `Total DD: ${totalDDpct.toFixed(1)}% of ${CONFIG.FP_MAX_DD_PCT}% allowed.
-` +
-        `Remaining room: $${(acct * (CONFIG.FP_MAX_DD_PCT/100) - Math.abs(Math.min(totalPnL,0))).toFixed(0)}
-` +
-        `⚠️ SLOW DOWN — you are near account breach.`
-      );
-    }
-  }
-
-  // ── Phase progress message (once per day at 09:00 IST) ───────────────────
-  const istHour = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })).getHours();
-  const istMin  = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })).getMinutes();
-  if (istHour === 9 && istMin < 15) {
-    const key = 'daily_summary';
-    if (!state.fp.warningsSent[key] || now - state.fp.warningsSent[key] > 23 * 3600000) {
-      state.fp.warningsSent[key] = now;
-      const phase       = state.fp.phase;
-      const target      = phase === 1 ? CONFIG.FP_PHASE1_TARGET : CONFIG.FP_PHASE2_TARGET;
-      const targetUSD   = acct * target / 100;
-      const progress    = Math.max(0, totalPnL);
-      const progressPct = Math.min(100, (progress / targetUSD * 100)).toFixed(1);
-      const tradingDays = Object.keys(state.fp.dailyPnL).length;
-      await tgSend(
-        `📊 *FundingPips Phase ${phase} Progress*
-` +
-        `${'█'.repeat(Math.floor(parseFloat(progressPct)/10))}${'░'.repeat(10-Math.floor(parseFloat(progressPct)/10))} ${progressPct}%
-` +
-        `Profit: $${progress.toFixed(2)} / $${targetUSD.toFixed(0)} target
-` +
-        `Trading days: ${tradingDays} | Trades: ${state.fp.tradesThisPhase}
-` +
-        `Daily limit: $${((acct * CONFIG.FP_DAILY_DD_PCT/100) - Math.abs(Math.min(todayPnL,0))).toFixed(0)} remaining today
-` +
-        `Risk per trade: $${(acct * CONFIG.FP_RISK_PCT/100).toFixed(0)} (${CONFIG.FP_RISK_PCT}%)`
-      );
-    }
-  }
-}
+// FundingPips removed — bot focuses on India NSE + Crypto only.
+function fpUpdatePnL() {} // no-op stub
 
 async function checkExpiry() {
   const active = state.signals.filter(s => !s.expired && !s.slHit);
@@ -3925,7 +3599,7 @@ async function connectMongo() {
 }
 
 async function savePersist() {
-  const data = { signals: state.signals.slice(0, 100), fp: state.fp, stats: state.stats, savedAt: new Date().toISOString() };
+  const data = { signals: state.signals.slice(0, 100), stats: state.stats, savedAt: new Date().toISOString() };
   if (mongoDb) {
     try { await mongoDb.collection('state').replaceOne({ _id: 'botstate' }, { _id: 'botstate', ...data }, { upsert: true }); return; }
     catch(e) { console.error('[MongoDB] Save failed:', e.message); }
@@ -3951,7 +3625,7 @@ async function loadPersist() {
     console.log(`[Persist] ✅ ${data.signals.length} signals (${active.length} active)`);
     if (active.length) tgSend(`♻️ *Bot Restarted — ${active.length} active signal(s) restored*`).catch(()=>{});
   }
-  if (data.fp)    state.fp    = { ...state.fp,    ...data.fp    };
+  // fp removed
   if (data.stats) state.stats = { ...state.stats, ...data.stats };
 }
 
@@ -3980,10 +3654,6 @@ async function sendWeeklyReport() {
     .map(([id,v]) => `  ${id}: ${v.w}W/${v.l}L`)
     .join('\n');
 
-  // FP P&L this week
-  const fpWeek = Object.entries(state.fp.dailyPnL)
-    .filter(([d]) => new Date(d).getTime() > weekAgo)
-    .reduce((sum,[,v]) => sum + v, 0);
 
   const report = [
     `📊 *Weekly Trade Report*`,
@@ -3993,71 +3663,19 @@ async function sendWeeklyReport() {
     `*Win Rate:* ${wr}%`,
     `*Total signals:* ${weekSigs.length}`,
     ``,
-    `*By Strategy:*
-${stLines || '  No completed trades'}`,
+    `*By Strategy:*\n${stLines || '  No completed trades'}`,
     ``,
-    `*FundingPips (Forex/Gold):*`,
-    `  Week P&L: $${fpWeek.toFixed(2)}`,
-    `  Total P&L: $${(state.fp.totalPnL||0).toFixed(2)}`,
-    `  Phase ${state.fp.phase} progress: ${Math.min(100,(Math.max(0,state.fp.totalPnL)/(CONFIG.FP_ACCOUNT_USD*(state.fp.phase===1?CONFIG.FP_PHASE1_TARGET:CONFIG.FP_PHASE2_TARGET)/100)*100)).toFixed(1)}%`,
+    `*Win Rate by Symbol:*`,
+    ...Object.entries(state.stats.symbolWR).map(([s,v]) => `  ${s}: ${v.wins}W/${v.losses}L`),
   ].join('\n');
 
   await tgSend(report);
   console.log('[Weekly] ✅ Report sent');
 }
 
+
 // ── Economic Calendar — pause forex signals 30min before high-impact news ──────
-// Uses free ForexFactory-style approach: maintain a list of known recurring events
-// and add manual pauses via /pause command for one-off news
-async function checkEconomicCalendar() {
-  // Only affects forex/commodity (not India/Crypto)
-  // Check if we're within 30 minutes of a known high-impact event
-  const now = new Date();
-  const dayUTC  = now.getUTCDay();  // 0=Sun, 5=Fri
-  const hourUTC = now.getUTCHours();
-  const minUTC  = now.getUTCMinutes();
-  const timeUTC = hourUTC * 60 + minUTC; // minutes since midnight UTC
 
-  // Known recurring HIGH-IMPACT events (UTC times, approximate)
-  // These are the most market-moving events — NFP, CPI, FOMC, RBI
-  const HIGH_IMPACT = [
-    // NFP: First Friday of month 13:30 UTC
-    { day: 5, from: 13*60+0, to: 14*60+30, label: 'NFP window' },
-    // US CPI: ~13:30 UTC usually Tuesday/Wednesday mid-month
-    // FOMC: usually Wed 19:00 UTC (8 times/year)
-    { day: 3, from: 18*60+30, to: 20*60+0, label: 'FOMC window (Wed)' },
-    // RBI Policy: Usually during India market hours — auto-handled by India closed gate
-    // ECB: usually Thu 12:15 UTC
-    { day: 4, from: 12*60+0, to: 13*60+0, label: 'ECB window (Thu)' },
-    // BOE: usually Thu 12:00 UTC
-    { day: 4, from: 11*60+45, to: 12*60+30, label: 'BOE window (Thu)' },
-  ];
-
-  for (const event of HIGH_IMPACT) {
-    if (dayUTC === event.day && timeUTC >= event.from - 30 && timeUTC <= event.to) {
-      // Within 30 min before or during event window
-      if (!ECO_PAUSE_REASONS.has(event.label)) {
-        ECO_PAUSE_REASONS.add(event.label);
-        const now2 = Date.now();
-        const key = `eco_${event.label}`;
-        if (!state.fp.warningsSent[key] || now2 - state.fp.warningsSent[key] > 3600000) {
-          state.fp.warningsSent[key] = now2;
-          await tgSend(`⏸ *Economic Calendar Pause*
-${event.label} — Forex/Gold signals paused for safety.
-Will resume after event window.`);
-        }
-      }
-      return; // signal blocked downstream
-    } else {
-      ECO_PAUSE_REASONS.delete(event.label);
-    }
-  }
-}
-
-// Helper: check if forex should be paused due to news
-function forexPausedForNews() {
-  return ECO_PAUSE_REASONS.size > 0;
-}
 
 // ── SMT Divergence (Smart Money Technique) ────────────────────────────────
 // Two correlated pairs diverge at a key level = institutional signal
@@ -4136,10 +3754,12 @@ app.get('/api/options/:symbol', async (req, res) => {
   res.json({ symbol: sym, pcr: opt.pcr, maxPain: opt.maxPain, bias, cached: new Date(opt.time).toISOString() });
 });
 
+// SMT Divergence pairs — India + Crypto correlations
+// (Forex pairs removed — no forex data sources)
 const SMT_PAIRS = [
-  { lead: 'EURUSD', lag: 'GBPUSD', dir: 'both' },
-  { lead: 'AUDUSD', lag: 'NZDUSD', dir: 'both' },
-  { lead: 'GBPJPY', lag: 'EURJPY', dir: 'both' },
+  { lead: 'BTCUSDT', lag: 'ETHUSDT', dir: 'both' },   // BTC leads ETH
+  { lead: 'BTCUSDT', lag: 'SOLUSDT', dir: 'both' },   // BTC leads altcoins
+  { lead: 'NIFTY',   lag: 'BANKNIFTY', dir: 'both' }, // NIFTY leads Bank NIFTY
 ];
 
 async function checkSMT() {
@@ -4186,7 +3806,7 @@ async function checkSMT() {
 
       const smtSig = {
         id: sigId, symbol: pair.lead, name: SYMBOLS[pair.lead]?.name || pair.lead,
-        cat: 'forex', dir,
+        cat: cfg?.cat || 'crypto', dir,
         strategy: { id: 'SMT_DIV', name: `SMT Divergence vs ${pair.lag}`, score: 85 },
         quality: 85,
         levels: {
@@ -4245,13 +3865,13 @@ async function runCycle() {
   // ── Pause guard ─────────────────────────────────────────────────────────
   if (state.pauseUntil && Date.now() < state.pauseUntil) {
     const left = Math.ceil((state.pauseUntil - Date.now()) / 60000);
-    console.log(`[v10.4] ⏸ Bot paused — ${left}m remaining`);
+    console.log(`[v11.0] ⏸ Bot paused — ${left}m remaining`);
     return;
   }
   state.running = true;
   const t0 = Date.now();
   const ist = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  console.log(`\n[v10.4] ⚡ M15 Cycle — ${ist}`);
+  console.log(`\n[v11.0] ⚡ M15 Cycle — ${ist}`);
 
   // Prefetch all Delta crypto symbols
   const deltaSyms = Object.values(SYMBOLS).filter(s => s.src === 'delta').map(s => s.deltaSymbol);
@@ -4267,7 +3887,7 @@ async function runCycle() {
 
       // ── Disabled symbol check ──────────────────────────────────
       if (CONFIG.DISABLED_SYMBOLS.includes(symbol)) {
-        console.log(`[v10.4] ⏭ ${symbol}: disabled via DISABLED_SYMBOLS`);
+        console.log(`[v11.0] ⏭ ${symbol}: disabled via DISABLED_SYMBOLS`);
         continue;
       }
 
@@ -4280,36 +3900,36 @@ async function runCycle() {
           // Send closed message at most once per hour per category
           if (now - lastNotif > 3600000) {
             state.closedNotified[cfg.cat] = now;
-            const catLabel = { india: 'India NSE/BSE', forex: 'Forex', commodity: 'Commodity', crypto: 'Crypto' };
+            const catLabel = { india: 'India NSE/BSE', crypto: 'Crypto' };
             await tgSend(`🔴 *${catLabel[cfg.cat] || cfg.cat.charAt(0).toUpperCase()+cfg.cat.slice(1)} Market Closed*\n${Market.closedMessage(cfg.cat, symbol)}`);
           }
         }
-        console.log(`[v10.4] 🔴 ${symbol}: ${cfg.cat} market closed`);
+        console.log(`[v11.0] 🔴 ${symbol}: ${cfg.cat} market closed`);
         continue;
       }
 
       // ── Fetch candles ──────────────────────────────────────
       const mtf = await dataFetcher.fetchMTF(symbol);
-      if (!mtf?.m15?.length) { console.log(`[v10.4] ⚠️  No data: ${symbol}`); continue; }
+      if (!mtf?.m15?.length) { console.log(`[v11.0] ⚠️  No data: ${symbol}`); continue; }
 
       // ── Build signal ───────────────────────────────────────
       const sig      = Builder.build(symbol, mtf.m15, mtf.source, mtf);
       const curPrice = mtf.m15[mtf.m15.length - 1].close;
 
-      if (!sig) { console.log(`[v10.4] ℹ️  No signal: ${symbol}`); continue; }
+      if (!sig) { console.log(`[v11.0] ℹ️  No signal: ${symbol}`); continue; }
 
       // ── Gate check ─────────────────────────────────────────
       const g = gate.check(sig, curPrice, state.signals.filter(s => s.ts && Date.now() - new Date(s.ts).getTime() < 900000));
       if (!g.ok) {
         cycleBlocked++; state.stats.blocked++;
-        console.log(`[v10.4] 🚫 ${symbol}: ${g.why}`);
+        console.log(`[v11.0] 🚫 ${symbol}: ${g.why}`);
         continue;
       }
 
       // ✅ Max open trades guard
       const openTrades = state.signals.filter(s => !s.expired && !s.slHit).length;
       if (openTrades >= CONFIG.MAX_OPEN_TRADES) {
-        console.log(`[v10.4] ⏸ ${symbol}: max open trades (${openTrades}/${CONFIG.MAX_OPEN_TRADES}) reached`);
+        console.log(`[v11.0] ⏸ ${symbol}: max open trades (${openTrades}/${CONFIG.MAX_OPEN_TRADES}) reached`);
         cycleBlocked++; state.stats.blocked++;
         continue;
       }
@@ -4318,28 +3938,9 @@ async function runCycle() {
       const todayStr = new Date().toISOString().slice(0, 10);
       const todayCount = state.signals.filter(s => s.ts?.slice(0,10) === todayStr).length;
       if (todayCount >= CONFIG.MAX_DAILY_SIGNALS) {
-        console.log(`[v10.4] ⏸ ${symbol}: max daily signals (${todayCount}/${CONFIG.MAX_DAILY_SIGNALS}) reached`);
+        console.log(`[v11.0] ⏸ ${symbol}: max daily signals (${todayCount}/${CONFIG.MAX_DAILY_SIGNALS}) reached`);
         cycleBlocked++; state.stats.blocked++;
         continue;
-      }
-
-      // ✅ Economic calendar guard — block forex/gold near high-impact news
-      if ((cfg.cat === 'forex' || cfg.cat === 'commodity') && forexPausedForNews()) {
-        console.log(`[ECO] ⏸ ${symbol}: paused for news event`);
-        cycleBlocked++; state.stats.blocked++;
-        continue;
-      }
-
-      // ✅ FundingPips daily DD guard — block forex/gold if at 4.5% daily DD
-      if ((cfg.cat === 'forex' || cfg.cat === 'commodity')) {
-        const todayKey2  = new Date().toISOString().slice(0, 10);
-        const todayPnL2  = state.fp.dailyPnL[todayKey2] || 0;
-        const dailyDD2   = Math.abs(Math.min(todayPnL2, 0)) / CONFIG.FP_ACCOUNT_USD * 100;
-        if (dailyDD2 >= 4.5) {
-          console.log(`[FP] 🛑 ${symbol}: daily DD ${dailyDD2.toFixed(1)}% — blocking forex signal`);
-          cycleBlocked++; state.stats.blocked++;
-          continue;
-        }
       }
 
       // ✅ Signal passes all checks
@@ -4382,15 +3983,13 @@ async function runCycle() {
       cycleSignals++;
       savePersist(); // persist state after every new signal
 
-      console.log(`[v10.4] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
+      console.log(`[v11.0] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
       await tgSignal(sig);
       await new Promise(r => setTimeout(r, 500));
 
-    } catch (e) { console.error(`[v10.4] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
+    } catch (e) { console.error(`[v11.0] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
   }
 
-  // ── Economic calendar check (pause forex before high-impact news) ─────────
-  await checkEconomicCalendar();
   // ── Weekly Trade Report ─────────────────────────────────────────────────────
 async function sendWeeklyReport() {
   const weekAgo = Date.now() - 7 * 24 * 3600000;
@@ -4414,10 +4013,6 @@ async function sendWeeklyReport() {
     .map(([id,v]) => `  ${id}: ${v.w}W/${v.l}L`)
     .join('\n');
 
-  // FP P&L this week
-  const fpWeek = Object.entries(state.fp.dailyPnL)
-    .filter(([d]) => new Date(d).getTime() > weekAgo)
-    .reduce((sum,[,v]) => sum + v, 0);
 
   const report = [
     `📊 *Weekly Trade Report*`,
@@ -4427,80 +4022,27 @@ async function sendWeeklyReport() {
     `*Win Rate:* ${wr}%`,
     `*Total signals:* ${weekSigs.length}`,
     ``,
-    `*By Strategy:*
-${stLines || '  No completed trades'}`,
+    `*By Strategy:*\n${stLines || '  No completed trades'}`,
     ``,
-    `*FundingPips (Forex/Gold):*`,
-    `  Week P&L: $${fpWeek.toFixed(2)}`,
-    `  Total P&L: $${(state.fp.totalPnL||0).toFixed(2)}`,
-    `  Phase ${state.fp.phase} progress: ${Math.min(100,(Math.max(0,state.fp.totalPnL)/(CONFIG.FP_ACCOUNT_USD*(state.fp.phase===1?CONFIG.FP_PHASE1_TARGET:CONFIG.FP_PHASE2_TARGET)/100)*100)).toFixed(1)}%`,
+    `*Win Rate by Symbol:*`,
+    ...Object.entries(state.stats.symbolWR).map(([s,v]) => `  ${s}: ${v.wins}W/${v.losses}L`),
   ].join('\n');
 
   await tgSend(report);
   console.log('[Weekly] ✅ Report sent');
 }
 
+
 // ── Economic Calendar — pause forex signals 30min before high-impact news ──────
-// Uses free ForexFactory-style approach: maintain a list of known recurring events
-// and add manual pauses via /pause command for one-off news
-async function checkEconomicCalendar() {
-  // Only affects forex/commodity (not India/Crypto)
-  // Check if we're within 30 minutes of a known high-impact event
-  const now = new Date();
-  const dayUTC  = now.getUTCDay();  // 0=Sun, 5=Fri
-  const hourUTC = now.getUTCHours();
-  const minUTC  = now.getUTCMinutes();
-  const timeUTC = hourUTC * 60 + minUTC; // minutes since midnight UTC
 
-  // Known recurring HIGH-IMPACT events (UTC times, approximate)
-  // These are the most market-moving events — NFP, CPI, FOMC, RBI
-  const HIGH_IMPACT = [
-    // NFP: First Friday of month 13:30 UTC
-    { day: 5, from: 13*60+0, to: 14*60+30, label: 'NFP window' },
-    // US CPI: ~13:30 UTC usually Tuesday/Wednesday mid-month
-    // FOMC: usually Wed 19:00 UTC (8 times/year)
-    { day: 3, from: 18*60+30, to: 20*60+0, label: 'FOMC window (Wed)' },
-    // RBI Policy: Usually during India market hours — auto-handled by India closed gate
-    // ECB: usually Thu 12:15 UTC
-    { day: 4, from: 12*60+0, to: 13*60+0, label: 'ECB window (Thu)' },
-    // BOE: usually Thu 12:00 UTC
-    { day: 4, from: 11*60+45, to: 12*60+30, label: 'BOE window (Thu)' },
-  ];
 
-  for (const event of HIGH_IMPACT) {
-    if (dayUTC === event.day && timeUTC >= event.from - 30 && timeUTC <= event.to) {
-      // Within 30 min before or during event window
-      if (!ECO_PAUSE_REASONS.has(event.label)) {
-        ECO_PAUSE_REASONS.add(event.label);
-        const now2 = Date.now();
-        const key = `eco_${event.label}`;
-        if (!state.fp.warningsSent[key] || now2 - state.fp.warningsSent[key] > 3600000) {
-          state.fp.warningsSent[key] = now2;
-          await tgSend(`⏸ *Economic Calendar Pause*
-${event.label} — Forex/Gold signals paused for safety.
-Will resume after event window.`);
-        }
-      }
-      return; // signal blocked downstream
-    } else {
-      ECO_PAUSE_REASONS.delete(event.label);
-    }
-  }
-}
-
-// Helper: check if forex should be paused due to news
-function forexPausedForNews() {
-  return ECO_PAUSE_REASONS.size > 0;
-}
-
-// ── SMT Divergence check (cross-symbol, forex only) ──────────────────────
+// ── SMT Divergence check ──────────────────────────────────────────────────
   await checkSMT();
   await checkExpiry();
-  await fpWatchdog();
 
   await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
-  console.log(`[v10.4] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
+  console.log(`[v11.0] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
   state.running = false;
 }
 
@@ -4508,8 +4050,8 @@ function forexPausedForNews() {
 //  SECTION 9 — API ENDPOINTS
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  bot: 'Hybrid Trading Bot v10.8.0 — ICT/SMC Engine',
-  version: '10.8.0',
+  bot: 'Hybrid Trading Bot v11.0 — ICT/SMC Engine',
+  version: '11.0',
   strategies: 22,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -4520,7 +4062,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '10.8.0',
+    status: 'OK', version: '11.0',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -4532,27 +4074,25 @@ app.get('/api/health', (req, res) => {
     activeCooldowns: gate.cooldowns().filter(c => c.left > 0).length,
     lastCycle: state.lastCycle,
     marketStatus: {
-      india:     Market.indiaOpen()  ? 'OPEN'   : 'CLOSED',
-      forex:     Market.forexOpen()  ? 'OPEN'   : 'CLOSED',
-      crypto:    'OPEN (24/7)',
+      india:  Market.indiaOpen() ? 'OPEN' : 'CLOSED',
+      crypto: 'OPEN (24/7)',
     },
     dataSources: {
-      finnhub:    CONFIG.FINNHUB_KEY      ? '✅ primary forex/gold' : '⚠️  add FINNHUB_API_KEY',
-      twelvedata: CONFIG.TWELVE_DATA_KEY  ? '✅ fallback forex/gold' : '⚠️  key missing',
-      delta:     '✅ crypto primary (real M15)',
-      coingecko: '✅ crypto fallback (auto if Delta fails)',
+      delta:      '✅ crypto primary (real M15, no key needed)',
+      binance:    '✅ crypto fallback 1',
+      kucoin:     '✅ crypto fallback 2',
+      coingecko:  '✅ crypto fallback 3 (30-min proxy)',
+      dhan:       dhanToken.accessToken === 'placeholder' ? '⏳ no token — POST /api/dhan/token' :
+                  dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 86400000 ? '❌ token expired — refresh now' :
+                  dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 72000000 ? '⚠️  token expiring soon' : '✅ active',
       outcomes: {
         tp1Hits: state.stats.tp1Hits || 0,
         tp2Hits: state.stats.tp2Hits || 0,
         tp3Hits: state.stats.tp3Hits || 0,
         slHits:  state.stats.slHits  || 0,
       },
-      india_risk:    `₹${CONFIG.INDIA_RISK_INR.toLocaleString('en-IN')} per trade`,
-      crypto_risk:   `₹${CONFIG.CRYPTO_RISK_INR.toLocaleString('en-IN')} per trade`,
-      forex_risk:    `$${(CONFIG.FP_ACCOUNT_USD * CONFIG.FP_RISK_PCT / 100).toFixed(0)} (${CONFIG.FP_RISK_PCT}% of $${CONFIG.FP_ACCOUNT_USD} FP)`,
-      dhan: dhanToken.accessToken === 'placeholder' ? '⏳ no token — POST /api/dhan/token' :
-               dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 86400000 ? '❌ token expired — refresh now' :
-               dhanToken.updatedMs && (Date.now() - dhanToken.updatedMs) > 72000000 ? '⚠️  token expiring soon' : '✅ active',
+      india_risk:  `₹${CONFIG.INDIA_RISK_INR.toLocaleString('en-IN')} per trade`,
+      crypto_risk: `₹${CONFIG.CRYPTO_RISK_INR.toLocaleString('en-IN')} per trade`,
     },
   });
 });
@@ -4571,7 +4111,7 @@ app.get('/api/signals/:symbol',  (req, res) => {
 });
 
 app.get('/api/strategies',       (req, res) => res.json({
-  version: '10.7', total: 22,
+  version: '11.0', total: 22,
   note: 'All 16 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
   strategies: [
     { id: 'FVG_OB',       name: 'Fair Value Gap + Order Block',  cat: 'SMC', wr: '60-68%', rr: '1:2-1:4' },
@@ -4700,81 +4240,26 @@ app.get('/api/stats',            (req, res) => {
 });
 
 // Live Dhan token update — no redeploy needed
-// FundingPips challenge state + phase management
-app.get('/api/fp', (req, res) => {
-  const acct    = CONFIG.FP_ACCOUNT_USD;
-  const phase   = state.fp.phase;
-  const target  = phase === 1 ? CONFIG.FP_PHASE1_TARGET : CONFIG.FP_PHASE2_TARGET;
-  const tgtUSD  = acct * target / 100;
-  const progress = Math.max(0, state.fp.totalPnL);
-  const todayKey = new Date().toISOString().slice(0, 10);
-  const todayPnL = state.fp.dailyPnL[todayKey] || 0;
-  res.json({
-    phase,
-    disabledSymbols: CONFIG.DISABLED_SYMBOLS,
-    accountSize:     `$${acct.toLocaleString()}`,
-    riskPerTrade:    `$${(acct * CONFIG.FP_RISK_PCT / 100).toFixed(2)} (${CONFIG.FP_RISK_PCT}%)`,
-    phase_target:    `${target}% = $${tgtUSD.toFixed(0)}`,
-    current_profit:  `$${state.fp.totalPnL.toFixed(2)} (estimated from signals)`,
-    progress:        `${Math.min(100,(progress/tgtUSD*100)).toFixed(1)}%`,
-    today_pnl:       `$${todayPnL.toFixed(2)}`,
-    daily_dd_used:   `${(Math.abs(Math.min(todayPnL,0))/acct*100).toFixed(2)}% of ${CONFIG.FP_DAILY_DD_PCT}%`,
-    total_dd_used:   `${(Math.abs(Math.min(state.fp.totalPnL,0))/acct*100).toFixed(2)}% of ${CONFIG.FP_MAX_DD_PCT}%`,
-    daily_limit_rem: `$${(acct*CONFIG.FP_DAILY_DD_PCT/100 - Math.abs(Math.min(todayPnL,0))).toFixed(2)} remaining`,
-    trading_days:    Object.keys(state.fp.dailyPnL).length,
-    trades:          state.fp.tradesThisPhase,
-    daily_pnl_hist:  state.fp.dailyPnL,
-  });
-});
-
-// Update FP phase + risk settings live
-app.post('/api/fp', (req, res) => {
-  const { phase, riskPct, accountUsd, usdToInr } = req.body;
-  if (phase && [1, 2].includes(parseInt(phase))) {
-    state.fp.phase            = parseInt(phase);
-    state.fp.tradesThisPhase  = 0;
-    console.log(`[FP] Phase updated to ${phase}`);
-    tgSend(`🎯 *FundingPips Phase ${phase} Started*
-Target: ${phase === 1 ? CONFIG.FP_PHASE1_TARGET : CONFIG.FP_PHASE2_TARGET}% = $${(CONFIG.FP_ACCOUNT_USD * (phase === 1 ? CONFIG.FP_PHASE1_TARGET : CONFIG.FP_PHASE2_TARGET)/100).toFixed(0)}
-Risk: $${(CONFIG.FP_ACCOUNT_USD * CONFIG.FP_RISK_PCT / 100).toFixed(0)} per trade`);
-  }
-  if (riskPct)    CONFIG.FP_RISK_PCT    = parseFloat(riskPct);
-  if (accountUsd) CONFIG.FP_ACCOUNT_USD = parseFloat(accountUsd);
-  if (usdToInr)   CONFIG.USD_TO_INR     = parseFloat(usdToInr);
-  if (req.body.maxOpenTrades)  CONFIG.MAX_OPEN_TRADES   = parseInt(req.body.maxOpenTrades);
+// Symbol enable/disable + config live update
+app.post('/api/config', (req, res) => {
+  if (req.body.maxOpenTrades)   CONFIG.MAX_OPEN_TRADES   = parseInt(req.body.maxOpenTrades);
   if (req.body.maxDailySignals) CONFIG.MAX_DAILY_SIGNALS = parseInt(req.body.maxDailySignals);
-  // Enable/disable symbols: { "disable": "DOGEUSDT,SOLUSDT" } or { "enable": "DOGEUSDT" }
+  if (req.body.indiaRisk)       CONFIG.INDIA_RISK_INR    = parseFloat(req.body.indiaRisk);
+  if (req.body.cryptoRisk)      CONFIG.CRYPTO_RISK_INR   = parseFloat(req.body.cryptoRisk);
   if (req.body.disable) {
     const syms = req.body.disable.split(',').map(s => s.trim().toUpperCase());
     syms.forEach(s => { if (!CONFIG.DISABLED_SYMBOLS.includes(s)) CONFIG.DISABLED_SYMBOLS.push(s); });
-    console.log(`[Config] Disabled: ${syms.join(',')}`);
-    tgSend(`⏭ Symbols disabled: ${syms.join(', ')}`).catch(()=>{});
+    tgSend('Symbols disabled: ' + syms.join(', ')).catch(()=>{});
   }
   if (req.body.enable) {
     const syms = req.body.enable.split(',').map(s => s.trim().toUpperCase());
     CONFIG.DISABLED_SYMBOLS = CONFIG.DISABLED_SYMBOLS.filter(s => !syms.includes(s));
-    console.log(`[Config] Enabled: ${syms.join(',')}`);
-    tgSend(`✅ Symbols enabled: ${syms.join(', ')}`).catch(()=>{});
+    tgSend('Symbols enabled: ' + syms.join(', ')).catch(()=>{});
   }
-  res.json({ ok: true, phase: state.fp.phase, riskPct: CONFIG.FP_RISK_PCT,
-    accountUsd: CONFIG.FP_ACCOUNT_USD, maxOpenTrades: CONFIG.MAX_OPEN_TRADES,
-    maxDailySignals: CONFIG.MAX_DAILY_SIGNALS });
-});
-
-// Update account size for position sizing (no redeploy needed)
-app.post('/api/account', (req, res) => {
-  const { size, riskPct } = req.body;
-  if (!size || isNaN(size)) return res.status(400).json({ error: 'Provide size (number)' });
-  // Update per-market risks based on category
-  const cat2 = req.body.cat || 'india';
-  if (cat2 === 'india')   CONFIG.INDIA_RISK_INR  = parseFloat(size);
-  if (cat2 === 'crypto')  CONFIG.CRYPTO_RISK_INR = parseFloat(size);
-  if (cat2 === 'forex')   { CONFIG.FP_RISK_PCT = parseFloat(riskPct || CONFIG.FP_RISK_PCT); }
-  console.log(`[Account] Updated ${cat2}: ₹${parseFloat(size).toLocaleString('en-IN')}`);
-  res.json({ ok: true,
-    india_risk:  `₹${CONFIG.INDIA_RISK_INR}`,
-    crypto_risk: `₹${CONFIG.CRYPTO_RISK_INR}`,
-    forex_risk:  `$${(CONFIG.FP_ACCOUNT_USD * CONFIG.FP_RISK_PCT/100).toFixed(0)}` });
+  res.json({ ok: true, maxOpenTrades: CONFIG.MAX_OPEN_TRADES,
+    maxDailySignals: CONFIG.MAX_DAILY_SIGNALS,
+    india_risk: CONFIG.INDIA_RISK_INR, crypto_risk: CONFIG.CRYPTO_RISK_INR,
+    disabledSymbols: CONFIG.DISABLED_SYMBOLS });
 });
 
 app.post('/api/dhan/token', (req, res) => {
@@ -4836,23 +4321,14 @@ app.post('/tg/webhook', async (req, res) => {
       await tgSend(`📊 *Active Signals (${active.length})*\n\n${lines}`);
 
     } else if (cmd === '/pnl' || cmd === '/p') {
-      const todayKey = new Date().toISOString().slice(0, 10);
-      const todayPnL = state.fp.dailyPnL[todayKey] || 0;
-      const totalPnL = state.fp.totalPnL || 0;
-      const wins = state.stats.tp1Hits || 0;
-      const losses = state.stats.slHits || 0;
-      const total = wins + losses;
-      const wr = total > 0 ? `${Math.round(wins/total*100)}%` : 'N/A';
+      const wins   = state.stats.tp1Hits || 0;
+      const losses = state.stats.slHits  || 0;
+      const total  = wins + losses;
+      const wr     = total > 0 ? `${Math.round(wins/total*100)}%` : 'N/A';
       await tgSend(
-        `💹 *P&L Summary*
-` +
-        `Today (FP): $${todayPnL.toFixed(2)}
-` +
-        `Total (FP): $${totalPnL.toFixed(2)}
-` +
-        `Win rate: ${wr} (${wins}W / ${losses}L)
-` +
-        `FP Phase ${state.fp.phase} | Trades: ${state.fp.tradesThisPhase}`
+        `P&L Summary\n` +
+        `Win rate: ${wr} (${wins}W / ${losses}L / ${state.stats.total} total)\n` +
+        `India risk: Rs${CONFIG.INDIA_RISK_INR}/trade | Crypto risk: Rs${CONFIG.CRYPTO_RISK_INR}/trade`
       );
 
     } else if (cmd === '/pause') {
@@ -4872,7 +4348,7 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
       const val    = parseFloat(text.split(' ')[2]);
       if (market === 'india'  && val) { CONFIG.INDIA_RISK_INR  = val; await tgSend(`✅ India risk → ₹${val.toLocaleString('en-IN')}`); }
       else if (market === 'crypto' && val) { CONFIG.CRYPTO_RISK_INR = val; await tgSend(`✅ Crypto risk → ₹${val.toLocaleString('en-IN')}`); }
-      else if (market === 'forex'  && val) { CONFIG.FP_RISK_PCT = val; await tgSend(`✅ Forex/Gold risk → ${val}% of $${CONFIG.FP_ACCOUNT_USD} (FundingPips)`); }
+      // forex market removed — only india and crypto
       else await tgSend('Usage: /risk india 5000 | /risk crypto 1700 | /risk forex 0.5');
 
     } else if (cmd === '/disable') {
@@ -4900,26 +4376,18 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
       ).join('\n');
       await tgSend(`📋 *All Symbols*\n${lines}\n\nDisabled: ${disabled.length || 'none'}`);
 
-    } else if (cmd === '/econews') {
+      } else if (cmd === '/econews') {
       // Manual news pause: /econews on 60  (pause for 60 min)  /econews off
       if (arg === 'off') {
         ECO_PAUSE_REASONS.clear();
         state.pauseUntil = null;
-        await tgSend('▶️ *Economic pause lifted* — forex signals resumed');
+        await tgSend('Signal pause lifted — bot running normally.');
       } else {
         const mins = parseInt(arg) || 60;
         state.pauseUntil = Date.now() + mins * 60000;
-        ECO_PAUSE_REASONS.add('Manual news pause');
-        await tgSend(`⏸ *Manual news pause* — forex signals paused for ${mins}min`);
+        ECO_PAUSE_REASONS.add('Manual pause');
+        await tgSend(`Bot paused for ${mins}min. Use /econews off to resume.`);
       }
-
-    } else if (cmd === '/phase') {
-      const ph = parseInt(arg);
-      if (ph === 1 || ph === 2) {
-        state.fp.phase = ph;
-        state.fp.tradesThisPhase = 0;
-        await tgSend(`🎯 *FundingPips Phase ${ph} activated*`);
-      } else await tgSend('Usage: /phase 1 or /phase 2');
 
     } else if (cmd === '/stats') {
       const total = state.stats.total || 0;
@@ -4964,12 +4432,7 @@ app.get('/dashboard', (req, res) => {
   const losses = state.stats.slHits  || 0;
   const wr     = wins + losses > 0 ? Math.round(wins/(wins+losses)*100) : 0;
   const todayKey = new Date().toISOString().slice(0,10);
-  const fpPnL  = (state.fp.dailyPnL[todayKey] || 0).toFixed(2);
-  const fpTotal= (state.fp.totalPnL || 0).toFixed(2);
-  const phase  = state.fp.phase;
-  const phaseTgt = phase === 1 ? CONFIG.FP_PHASE1_TARGET : CONFIG.FP_PHASE2_TARGET;
-  const phaseProg= Math.min(100,(Math.max(0,state.fp.totalPnL)/(CONFIG.FP_ACCOUNT_USD*phaseTgt/100)*100)).toFixed(1);
-
+  
   const sigRows = sigs.map(s => {
     const st = s.expired ? '⏱' : s.slHit ? '❌' : s.tp3Hit ? '🏆' : s.tp2Hit ? '✅✅' : s.tp1Hit ? '✅' : '🔵';
     const tp1 = s.tp1Hit ? '✅' : s.levels.tp1 || '-';
@@ -5026,11 +4489,11 @@ app.get('/dashboard', (req, res) => {
 <h2>FundingPips Phase ${phase} Progress</h2>
 <div class="card" style="margin-bottom:16px">
   <div style="display:flex;justify-content:space-between;margin-bottom:6px">
-    <span>Phase ${phase} target: ${phaseTgt}% = $${(CONFIG.FP_ACCOUNT_USD*phaseTgt/100).toFixed(0)}</span>
+    <span>India: Rs${CONFIG.INDIA_RISK_INR}/trade | Crypto: Rs${CONFIG.CRYPTO_RISK_INR}/trade</span>
     <span class="green">${phaseProg}%</span>
   </div>
   <div class="bar-bg"><div class="bar-fill" style="width:${phaseProg}%"></div></div>
-  <div style="margin-top:6px;font-size:11px;color:#8b949e">Risk: $${(CONFIG.FP_ACCOUNT_USD*CONFIG.FP_RISK_PCT/100).toFixed(0)}/trade · Disabled: ${CONFIG.DISABLED_SYMBOLS.join(', ')||'none'}</div>
+  <div style="margin-top:6px;font-size:11px;color:#8b949e">Disabled: ${CONFIG.DISABLED_SYMBOLS.join(', ')||'none'}</div>
 </div>
 
 <h2>Recent Signals</h2>
@@ -5053,24 +4516,24 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v10.8.0 — ICT/SMC ENGINE   ║
+║  HYBRID TRADING BOT v11.0 — ICT/SMC ENGINE     ║
 ║   22 strategies · M15+M5 entry · H1/H4 SL-TP    ║
-║   India NSE/BSE · Crypto · Forex · Commodity    ║
+║   India NSE/BSE (Dhan) · Crypto (Delta Exchange) ║
 ╚══════════════════════════════════════════════════╝
 Port: ${CONFIG.PORT} | Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN} | Cooldown: ${CONFIG.COOLDOWN_MIN}min
-Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Forex:9 · Commodity:2 · Crypto:8) | Auto market hours
+Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Crypto:8) | Market hours auto-managed
   `);
 
   // Give CoinGecko a moment before first cycle (avoid cold-start 429)
   // Connect MongoDB and restore state
   await connectMongo();
   await loadPersist();
-  console.log('[v10.4] Waiting 5s before first cycle (CG rate limit buffer)...');
+  console.log('[v11.0] Waiting 5s before first cycle (CG rate limit buffer)...');
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v10.8.0 Online*
-Markets: India NSE/BSE ${indiaReady ? '✅' : '⏳ (add Dhan token)'} | Forex/Gold ✅ (Finnhub+TwelveData) | Crypto ✅ (Delta + Binance + CoinGecko fallback)
+  await tgSend(`🚀 *Hybrid Trading Bot v11.0 Online*
+Markets: India NSE/BSE (Dhan) | Crypto (Delta Exchange + fallbacks)
 Strategies: 22 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
 ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activate NIFTY/BANKNIFTY/FINNIFTY/SENSEX' : ''}`);
@@ -5089,5 +4552,5 @@ ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activat
   cron.schedule('* * * * *', async () => {
     if (!state.running) await checkExpiry();
   });
-  console.log('[v10.4] Cron scheduled: every 15min at :00/:15/:30/:45 + TP/SL every 1min. Bot running.\n');
+  console.log('[v11.0] Cron scheduled: every 15min at :00/:15/:30/:45 + TP/SL every 1min. Bot running.\n');
 });
