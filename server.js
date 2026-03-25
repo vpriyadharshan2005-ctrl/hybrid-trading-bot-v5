@@ -6,6 +6,14 @@ const fs       = require('fs');
 const PERSIST_FILE = '/tmp/bot_state.json'; // fallback if MongoDB unavailable
 require('dotenv').config();
 
+// ── Global crash guards — prevent silent death on unhandled errors ─────────
+process.on('uncaughtException', err => {
+  console.error('[CRASH] uncaughtException:', err.message, err.stack);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[CRASH] unhandledRejection:', reason);
+});
+
 const app = express();
 app.use(express.json());
 
@@ -39,6 +47,9 @@ const CONFIG = {
 
   // ── Per-symbol enable/disable ────────────────────────────────────────────
   DISABLED_SYMBOLS:   (process.env.DISABLED_SYMBOLS || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean),
+
+  // ── Persistence ──────────────────────────────────────────────────────────
+  MONGODB_URI:        process.env.MONGODB_URI || null,
 };
 
 // ── Symbols — India NSE + Crypto ONLY ─────────────────────────────────────
@@ -3900,6 +3911,7 @@ async function runCycle() {
   }
   state.running = true;
   const t0 = Date.now();
+  try {
   const ist = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
   console.log(`\n[v12.0] ⚡ M15 Cycle — ${ist}`);
 
@@ -4022,13 +4034,17 @@ async function runCycle() {
 
 
   // ── SMT Divergence check ──────────────────────────────────────────────────
-  await checkSMT();
-  await checkExpiry();
+  await checkSMT().catch(e => console.error('[SMT] Error:', e.message));
+  await checkExpiry().catch(e => console.error('[Expiry] Error:', e.message));
 
   await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
   console.log(`[v12.0] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
-  state.running = false;
+  } catch (e) {
+    console.error('[runCycle] Fatal error:', e.message, e.stack?.split('\n')[1]);
+  } finally {
+    state.running = false; // ALWAYS resets — prevents permanent deadlock
+  }
 }
 
 // ═════════════════════════════════════════════════════════════
