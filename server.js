@@ -3664,6 +3664,45 @@ async function loadPersist() {
 
 
 // ── Weekly Trade Report ─────────────────────────────────────────────────────
+async function sendWeeklyReport() {
+  const weekAgo  = Date.now() - 7 * 24 * 3600000;
+  const weekSigs = state.signals.filter(s => new Date(s.ts).getTime() > weekAgo);
+  if (!weekSigs.length) { await tgSend('Weekly Report — No signals this week.'); return; }
+
+  const wins    = weekSigs.filter(s => s.tp1Hit).length;
+  const losses  = weekSigs.filter(s => s.slHit && !s.tp1Hit).length;
+  const pending = weekSigs.filter(s => !s.expired && !s.slHit).length;
+  const wr      = wins + losses > 0 ? Math.round(wins / (wins + losses) * 100) : 0;
+
+  // By-strategy breakdown
+  const bySt = {};
+  weekSigs.forEach(s => {
+    const id = s.strategy?.id || 'UNKNOWN';
+    if (!bySt[id]) bySt[id] = { w: 0, l: 0 };
+    if (s.tp1Hit) bySt[id].w++;
+    if (s.slHit && !s.tp1Hit) bySt[id].l++;
+  });
+  const stLines = Object.entries(bySt)
+    .map(([id, v]) => `  ${id}: ${v.w}W/${v.l}L`)
+    .join('\n');
+
+  const report = [
+    `Weekly Trade Report`,
+    `Week ending: ${new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}`,
+    ``,
+    `Results: ${wins}W / ${losses}L / ${pending} pending`,
+    `Win Rate: ${wr}%`,
+    `Total signals: ${weekSigs.length}`,
+    ``,
+    `By Strategy:\n${stLines || '  No completed trades'}`,
+    ``,
+    `By Symbol:`,
+    ...Object.entries(state.stats.symbolWR).map(([s, v]) => `  ${s}: ${v.wins}W/${v.losses}L`),
+  ].join('\n');
+
+  await tgSend(report);
+  console.log('[Weekly] Report sent');
+}
 
 // ── Economic Calendar — pause forex signals 30min before high-impact news ──────
 
@@ -3981,53 +4020,8 @@ async function runCycle() {
     } catch (e) { console.error(`[v12.0] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
   }
 
-  // ── Weekly Trade Report ─────────────────────────────────────────────────────
-async function sendWeeklyReport() {
-  const weekAgo = Date.now() - 7 * 24 * 3600000;
-  const weekSigs = state.signals.filter(s => new Date(s.ts).getTime() > weekAgo);
-  if (!weekSigs.length) { await tgSend('📊 *Weekly Report* — No signals this week.'); return; }
 
-  const wins    = weekSigs.filter(s => s.tp1Hit).length;
-  const losses  = weekSigs.filter(s => s.slHit && !s.tp1Hit).length;
-  const pending = weekSigs.filter(s => !s.expired && !s.slHit).length;
-  const wr      = wins + losses > 0 ? Math.round(wins/(wins+losses)*100) : 0;
-
-  // Group by strategy
-  const bySt = {};
-  weekSigs.forEach(s => {
-    const id = s.strategy?.id || 'UNKNOWN';
-    if (!bySt[id]) bySt[id] = { w: 0, l: 0 };
-    if (s.tp1Hit) bySt[id].w++;
-    if (s.slHit && !s.tp1Hit) bySt[id].l++;
-  });
-  const stLines = Object.entries(bySt)
-    .map(([id,v]) => `  ${id}: ${v.w}W/${v.l}L`)
-    .join('\n');
-
-
-  const report = [
-    `📊 *Weekly Trade Report*`,
-    `Week ending: ${new Date().toLocaleDateString('en-IN', {timeZone:'Asia/Kolkata'})}`,
-    ``,
-    `*Results:* ${wins}W / ${losses}L / ${pending} pending`,
-    `*Win Rate:* ${wr}%`,
-    `*Total signals:* ${weekSigs.length}`,
-    ``,
-    `*By Strategy:*\n${stLines || '  No completed trades'}`,
-    ``,
-    `*Win Rate by Symbol:*`,
-    ...Object.entries(state.stats.symbolWR).map(([s,v]) => `  ${s}: ${v.wins}W/${v.losses}L`),
-  ].join('\n');
-
-  await tgSend(report);
-  console.log('[Weekly] ✅ Report sent');
-}
-
-
-// ── Economic Calendar — pause forex signals 30min before high-impact news ──────
-
-
-// ── SMT Divergence check ──────────────────────────────────────────────────
+  // ── SMT Divergence check ──────────────────────────────────────────────────
   await checkSMT();
   await checkExpiry();
 
