@@ -18,7 +18,7 @@ const app = express();
 app.use(express.json());
 
 // ─────────────────────────────────────────────────────────────
-//  HYBRID TRADING BOT v12.0 — ICT/SMC PRECISION ENGINE
+//  HYBRID TRADING BOT v12.3 — ICT/SMC PRECISION ENGINE
 //  22 strategies · M15+M5 entry · H1/H4 structure SL/TP
 //  Markets: India NSE/BSE (Dhan) | Crypto (Delta Exchange + fallbacks)
 // ─────────────────────────────────────────────────────────────
@@ -4105,14 +4105,14 @@ async function runCycle() {
   // ── Pause guard ─────────────────────────────────────────────────────────
   if (state.pauseUntil && Date.now() < state.pauseUntil) {
     const left = Math.ceil((state.pauseUntil - Date.now()) / 60000);
-    console.log(`[v12.0] ⏸ Bot paused — ${left}m remaining`);
+    console.log(`[v12.3] ⏸ Bot paused — ${left}m remaining`);
     return;
   }
   state.running = true;
   const t0 = Date.now();
   try {
   const ist = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  console.log(`\n[v12.0] ⚡ M15 Cycle — ${ist}`);
+  console.log(`\n[v12.3] ⚡ M15 Cycle — ${ist}`);
 
   // Prefetch all Delta crypto symbols
   const deltaSyms = Object.values(SYMBOLS).filter(s => s.src === 'delta').map(s => s.deltaSymbol);
@@ -4174,7 +4174,7 @@ async function runCycle() {
 
       // ── Disabled symbol check ──────────────────────────────────
       if (CONFIG.DISABLED_SYMBOLS.includes(symbol)) {
-        console.log(`[v12.0] ⏭ ${symbol}: disabled via DISABLED_SYMBOLS`);
+        console.log(`[v12.3] ⏭ ${symbol}: disabled via DISABLED_SYMBOLS`);
         continue;
       }
 
@@ -4191,32 +4191,32 @@ async function runCycle() {
             await tgSend(`🔴 *${catLabel[cfg.cat] || cfg.cat.charAt(0).toUpperCase()+cfg.cat.slice(1)} Market Closed*\n${Market.closedMessage(cfg.cat, symbol)}`);
           }
         }
-        console.log(`[v12.0] 🔴 ${symbol}: ${cfg.cat} market closed`);
+        console.log(`[v12.3] 🔴 ${symbol}: ${cfg.cat} market closed`);
         continue;
       }
 
       // ── Fetch candles ──────────────────────────────────────
       const mtf = await dataFetcher.fetchMTF(symbol);
-      if (!mtf?.m15?.length) { console.log(`[v12.0] ⚠️  No data: ${symbol}`); continue; }
+      if (!mtf?.m15?.length) { console.log(`[v12.3] ⚠️  No data: ${symbol}`); continue; }
 
       // ── Build signal ───────────────────────────────────────
       const sig      = Builder.build(symbol, mtf.m15, mtf.source, mtf, cycleExtras[symbol] || {});
       const curPrice = mtf.m15[mtf.m15.length - 1].close;
 
-      if (!sig) { console.log(`[v12.0] ℹ️  No signal: ${symbol}`); continue; }
+      if (!sig) { console.log(`[v12.3] ℹ️  No signal: ${symbol}`); continue; }
 
       // ── Gate check ─────────────────────────────────────────
       const g = gate.check(sig, curPrice, state.signals.filter(s => s.ts && Date.now() - new Date(s.ts).getTime() < 900000));
       if (!g.ok) {
         cycleBlocked++; state.stats.blocked++;
-        console.log(`[v12.0] 🚫 ${symbol}: ${g.why}`);
+        console.log(`[v12.3] 🚫 ${symbol}: ${g.why}`);
         continue;
       }
 
       // ✅ Max open trades guard
       const openTrades = state.signals.filter(s => !s.expired && !s.slHit).length;
       if (openTrades >= CONFIG.MAX_OPEN_TRADES) {
-        console.log(`[v12.0] ⏸ ${symbol}: max open trades (${openTrades}/${CONFIG.MAX_OPEN_TRADES}) reached`);
+        console.log(`[v12.3] ⏸ ${symbol}: max open trades (${openTrades}/${CONFIG.MAX_OPEN_TRADES}) reached`);
         cycleBlocked++; state.stats.blocked++;
         continue;
       }
@@ -4225,7 +4225,7 @@ async function runCycle() {
       const todayStr = new Date().toISOString().slice(0, 10);
       const todayCount = state.signals.filter(s => s.ts?.slice(0,10) === todayStr).length;
       if (todayCount >= CONFIG.MAX_DAILY_SIGNALS) {
-        console.log(`[v12.0] ⏸ ${symbol}: max daily signals (${todayCount}/${CONFIG.MAX_DAILY_SIGNALS}) reached`);
+        console.log(`[v12.3] ⏸ ${symbol}: max daily signals (${todayCount}/${CONFIG.MAX_DAILY_SIGNALS}) reached`);
         cycleBlocked++; state.stats.blocked++;
         continue;
       }
@@ -4270,11 +4270,11 @@ async function runCycle() {
       cycleSignals++;
       savePersist(); // persist state after every new signal
 
-      console.log(`[v12.0] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
+      console.log(`[v12.3] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
       await tgSignal(sig);
       await new Promise(r => setTimeout(r, 500));
 
-    } catch (e) { console.error(`[v12.0] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
+    } catch (e) { console.error(`[v12.3] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
   }
 
 
@@ -4284,7 +4284,7 @@ async function runCycle() {
 
   await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
-  console.log(`[v12.0] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
+  console.log(`[v12.3] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
   } catch (e) {
     console.error('[runCycle] Fatal error:', e.message, e.stack?.split('\n')[1]);
   } finally {
@@ -4296,8 +4296,8 @@ async function runCycle() {
 //  SECTION 9 — API ENDPOINTS
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  bot: 'Hybrid Trading Bot v12.2 — ICT/SMC Engine',
-  version: '12.0',
+  bot: 'Hybrid Trading Bot v12.3 — ICT/SMC Engine',
+  version: '12.3',
   strategies: 22,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -4308,7 +4308,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '12.0',
+    status: 'OK', version: '12.3',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -4357,7 +4357,7 @@ app.get('/api/signals/:symbol',  (req, res) => {
 });
 
 app.get('/api/strategies',       (req, res) => res.json({
-  version: '12.0', total: 22,
+  version: '12.3', total: 25,
   note: 'All 25 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
   strategies: [
     { id: 'FVG_OB',       name: 'Fair Value Gap + Order Block',  cat: 'SMC', wr: '60-68%', rr: '1:2-1:4' },
@@ -5084,7 +5084,7 @@ app.get('/dashboard', (req, res) => {
 
   res.send(`<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hybrid Trading Bot v12.2</title>
+<title>Hybrid Trading Bot v12.3</title>
 <meta http-equiv="refresh" content="30">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -5105,7 +5105,7 @@ app.get('/dashboard', (req, res) => {
   .bar-fill { background: #3fb950; border-radius: 4px; height: 8px; }
   .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; background: #21262d; }
 </style></head><body>
-<h1>🚀 Hybrid Trading Bot v12.2 <span class="tag">${Object.keys(SYMBOLS).length} symbols · 25 strategies</span></h1>
+<h1>🚀 Hybrid Trading Bot v12.3 <span class="tag">${Object.keys(SYMBOLS).length} symbols · 25 strategies</span></h1>
 
 <div class="grid">
   <div class="card"><div class="val ${active.length > 0 ? 'green' : ''}">${active.length}</div><div class="lbl">Active Signals</div></div>
@@ -5146,7 +5146,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v12.2 — ICT/SMC ENGINE     ║
+║  HYBRID TRADING BOT v12.3 — ICT/SMC ENGINE     ║
 ║   25 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE (Dhan) · Crypto (Delta Exchange) ║
 ╚══════════════════════════════════════════════════╝
@@ -5158,11 +5158,11 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Crypto:8) | Market hours aut
   // Connect MongoDB and restore state
   await connectMongo();
   await loadPersist();
-  console.log('[v12.2] Waiting 5s before first cycle (CG rate limit buffer)...');
+  console.log('[v12.3] Waiting 5s before first cycle (CG rate limit buffer)...');
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v12.0 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v12.3 Online*
 Markets: India NSE/BSE (Dhan) | Crypto (Delta Exchange + fallbacks)
 Strategies: 22 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -5182,5 +5182,5 @@ ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activat
   cron.schedule('* * * * *', async () => {
     if (!state.running) await checkExpiry();
   });
-  console.log('[v12.0] Cron scheduled: every 15min at :00/:15/:30/:45 + TP/SL every 1min. Bot running.\n');
+  console.log('[v12.3] Cron scheduled: every 15min at :00/:15/:30/:45 + TP/SL every 1min. Bot running.\n');
 });
