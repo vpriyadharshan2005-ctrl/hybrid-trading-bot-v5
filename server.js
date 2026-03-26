@@ -2462,186 +2462,174 @@ class Builder {
 
       case 'FVG_OB':
         // SL: below H1 swing low nearest to FVG zone (BUY)
-        // If H1 swing available → use it (structural). Otherwise → below FVG bottom - 0.5 ATR
+        // If H1 swing available → use it (structural). Otherwise → below FVG bottom - 0.8 ATR
         // Logic: if price breaks BELOW the H1 swing that created the FVG, setup is invalidated
         if (isBuy) {
           sl = h1LowBelow
-            ? f(h1LowBelow.v - h1Atr * 0.15)           // below H1 swing low
-            : f(sig.sl_ref.val - atr * 0.5);            // below FVG bottom
+            ? f(h1LowBelow.v - h1Atr * 0.3)           // below H1 swing low (raised buffer)
+            : f(sig.sl_ref.val - atr * 0.8);           // below FVG bottom
         } else {
           sl = h1HighAbove
-            ? f(h1HighAbove.v + h1Atr * 0.15)
-            : f(sig.sl_ref.val + atr * 0.5);
+            ? f(h1HighAbove.v + h1Atr * 0.3)
+            : f(sig.sl_ref.val + atr * 0.8);
         }
         break;
 
       case 'LIQ_SWEEP':
-        // SL: beyond the FULL wick extreme + 0.5 ATR
+        // SL: beyond the FULL wick extreme + 0.8 ATR (raised from 0.5 — noise buffer)
         // Logic: if price goes back BELOW the sweep low, manipulation was real — no reversal
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)  // below wick low
-          : f(sig.sl_ref.val + atr * 0.5); // above wick high
+          ? f(sig.sl_ref.val - atr * 0.8)  // below wick low
+          : f(sig.sl_ref.val + atr * 0.8); // above wick high
         break;
 
       case 'CHOCH':
-        // SL: below break candle low - 0.5 ATR
+        // SL: below break candle low - 0.8 ATR (raised from 0.5)
         // Logic: if break candle is fully negated, structure shift failed
-        // 0.5 ATR ensures noise (avg 0.3 ATR) can't reach SL
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)  // below break candle low
-          : f(sig.sl_ref.val + atr * 0.5); // above break candle high
+          ? f(sig.sl_ref.val - atr * 0.8)  // below break candle low
+          : f(sig.sl_ref.val + atr * 0.8); // above break candle high
         break;
 
       case 'FPB':
-        // SL: 1.0 ATR beyond the broken level
-        // Logic: if price goes 1 ATR through the level, it was a fake break
+        // SL: 1.2 ATR beyond the broken level (raised from 1.0)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 1.0)  // 1 ATR below broken level
-          : f(sig.sl_ref.val + atr * 1.0);
+          ? f(sig.sl_ref.val - atr * 1.2)
+          : f(sig.sl_ref.val + atr * 1.2);
         break;
 
       case 'OTE':
-        // SL: below H1 OB bottom - 0.5 ATR (H1 structural level)
-        // Logic: OTE is a pullback INTO institutional zone. If OB is broken, no reversal.
+        // SL: below H1 OB bottom - 0.8 ATR (raised from 0.5)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)  // below H1 OB bottom
-          : f(sig.sl_ref.val + atr * 0.5); // above H1 OB top
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'BREAKER':
-        // SL: below breaker block bottom - 0.5 ATR
-        // Logic: if original OB is fully broken, the breaker concept is invalidated
+        // SL: below breaker block bottom - 0.8 ATR (raised from 0.5)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)
-          : f(sig.sl_ref.val + atr * 0.5);
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'SILVER_BULLET':
-        // SL: below FVG bottom - 0.5 ATR (kill zone structure)
-        // Logic: FVG in kill zone is the entry reason. Below FVG = setup invalid.
+        // SL: below FVG bottom - 0.8 ATR (raised from 0.5)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)
-          : f(sig.sl_ref.val + atr * 0.5);
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'ORB':
-        // SL: opposite side of ORB range - 0.5 ATR
-        // Logic: full ORB range reclaim = breakout failed. 0.5 ATR prevents noise hits.
-        sl = f(isBuy ? sig.sl_ref.val - atr * 0.5 : sig.sl_ref.val + atr * 0.5);
+        // SL: opposite side of ORB range - 0.8 ATR (raised from 0.5)
+        sl = f(isBuy ? sig.sl_ref.val - atr * 0.8 : sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'CRT':
-        // SL: below HTF candle wick extreme - 0.5 ATR
-        // Logic: CRT setup is based on the wick sweep. If price goes below the wick, AMD failed.
+        // SL: below HTF candle wick extreme - 0.8 ATR (raised from 0.5)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)  // below H1/H4 wick low
-          : f(sig.sl_ref.val + atr * 0.5); // above H1/H4 wick high
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'PO3':
-        // SL: below manipulation sweep extreme - 0.5 ATR
-        // Logic: PO3 entry is AFTER price sweeps Asian range and closes back inside.
-        // If price goes below the sweep low again, manipulation was not complete.
+        // SL: below manipulation sweep extreme - 0.8 ATR (raised from 0.5)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)
-          : f(sig.sl_ref.val + atr * 0.5);
-        break;
-
-      case 'FVG_BOS_HTF':
-        // SL: H1 swing low below the BOS candle (strongest structural anchor)
-        // Logic: HTF combo requires all 3 TF aligned. H1 swing low is the structural SL.
-        if (isBuy) {
-          sl = h1LowBelow
-            ? f(h1LowBelow.v - h1Atr * 0.15)
-            : f(sig.sl_ref.val - atr * 0.5);
-        } else {
-          sl = h1HighAbove
-            ? f(h1HighAbove.v + h1Atr * 0.15)
-            : f(sig.sl_ref.val + atr * 0.5);
-        }
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'EQH_EQL':
-        // SL: beyond sweep wick + 0.5 ATR (below EQL sweep or above EQH sweep)
+        // SL: beyond sweep wick + 0.8 ATR (raised from 0.5)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)
-          : f(sig.sl_ref.val + atr * 0.5);
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'GAP_GO':
-        // SL: below gap candle low - 0.5 ATR (India NSE — noise ~20pts on NIFTY)
+        // SL: below gap candle low - 0.8 ATR (raised from 0.5)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)
-          : f(sig.sl_ref.val + atr * 0.5);
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'SESS_RAID':
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)
-          : f(sig.sl_ref.val + atr * 0.5);
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'PDH_PDL':
-        // SL: beyond day level sweep + 0.5 ATR
+        // SL: beyond day level sweep + 0.8 ATR (raised from 0.5)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)
-          : f(sig.sl_ref.val + atr * 0.5);
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'TURTLE_SOUP':
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)
-          : f(sig.sl_ref.val + atr * 0.5);
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'RSI_DIV':
-        // SL: beyond the swing extreme that formed the divergence + 0.5 ATR
-        // Logic: if price goes ABOVE the divergence high (SELL), pattern fails
+        // SL: beyond the swing extreme + 0.8 ATR (raised from 0.5)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)   // below the recent low
-          : f(sig.sl_ref.val + atr * 0.5);  // above the recent high
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'BB_SQUEEZE':
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.3)
-          : f(sig.sl_ref.val + atr * 0.3);
+          ? f(sig.sl_ref.val - atr * 0.5)  // BB squeeze: tighter ok (volatility context)
+          : f(sig.sl_ref.val + atr * 0.5);
         break;
 
       case 'JUDAS_SWING':
-        // SL: beyond the Judas Swing extreme (false move high/low)
+        // SL: beyond the Judas Swing extreme + 0.8 ATR (raised from 0.5)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)   // below false breakdown low
-          : f(sig.sl_ref.val + atr * 0.5);  // above false breakout high
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       case 'FIB_CONF':
-        // SL: below/above fib confluence zone + 1.0 ATR
+        // SL: below/above fib confluence zone + 0.5 ATR (raised from 0.3)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.3)
-          : f(sig.sl_ref.val + atr * 0.3);
+          ? f(sig.sl_ref.val - atr * 0.5)
+          : f(sig.sl_ref.val + atr * 0.5);
         break;
 
       case 'SUNDAY_GAP':
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.3)
-          : f(sig.sl_ref.val + atr * 0.3);
+          ? f(sig.sl_ref.val - atr * 0.5)
+          : f(sig.sl_ref.val + atr * 0.5);
         break;
 
       case 'IFVG':
-        // SL: beyond the IFVG zone boundary + 0.5 ATR
-        // Logic: if price breaks the full IFVG zone, polarity flip failed
-        // BUY (bull IFVG): SL below zone bottom | SELL (bear IFVG): SL above zone top
+        // SL: beyond the IFVG zone boundary + 0.8 ATR (raised from 0.5)
         sl = isBuy
-          ? f(sig.sl_ref.val - atr * 0.5)   // below bearish IFVG bottom
-          : f(sig.sl_ref.val + atr * 0.5);  // above bullish IFVG top
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
         break;
 
       default:
         // Fallback: H1 structural SL (always wider than M15 noise)
         sl = isBuy
-          ? f(h1LowBelow ? h1LowBelow.v - h1Atr * 0.15 : price - atr * 2.5)
-          : f(h1HighAbove ? h1HighAbove.v + h1Atr * 0.15 : price + atr * 2.5);
+          ? f(h1LowBelow ? h1LowBelow.v - h1Atr * 0.3 : price - atr * 2.5)
+          : f(h1HighAbove ? h1HighAbove.v + h1Atr * 0.3 : price + atr * 2.5);
+    }
+
+    // ── Minimum SL distance gate: SL must be at least 1.0 × ATR from entry ───
+    // Prevents SL so tight that normal candle noise hits it (the main cause of fake SL hits)
+    // If SL is closer than 1.0 ATR, push it out to 1.0 ATR
+    if (sl && entry !== null) {
+      const slDist = Math.abs(parseFloat(entry) - parseFloat(sl));
+      const minSLDist = atr * 1.0;
+      if (slDist < minSLDist) {
+        sl = isBuy
+          ? f(parseFloat(entry) - minSLDist)
+          : f(parseFloat(entry) + minSLDist);
+        console.log(`[Levels] SL pushed out to min 1.0 ATR: ${sl} (was only ${slDist.toFixed(4)} from entry)`);
+      }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3075,7 +3063,7 @@ class DeltaFetcher {
   async fetchLivePrice(symbol) {
     await this._wait();
     try {
-      const headers = { 'Accept': 'application/json', 'User-Agent': 'HybridTradingBot/10.7' };
+      const headers = { 'Accept': 'application/json', 'User-Agent': 'HybridTradingBot/12.2' };
       // If a read-only API key is provided, attach it for higher rate limits
       if (process.env.DELTA_API_KEY) headers['api-key'] = process.env.DELTA_API_KEY;
 
@@ -3180,7 +3168,7 @@ class KuCoinFallback {
     try {
       const res = await axios.get(`${this.baseUrl}/api/v1/market/candles`, {
         params: { symbol: kSym, type: kInterval },
-        headers: { 'User-Agent': 'HybridTradingBot/10.3' },
+        headers: { 'User-Agent': 'HybridTradingBot/12.2' },
         timeout: 15000,
       });
       if (!res.data?.data?.length) return null;
@@ -4308,7 +4296,7 @@ async function runCycle() {
 //  SECTION 9 — API ENDPOINTS
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  bot: 'Hybrid Trading Bot v11.0 — ICT/SMC Engine',
+  bot: 'Hybrid Trading Bot v12.2 — ICT/SMC Engine',
   version: '12.0',
   strategies: 22,
   symbols: Object.keys(SYMBOLS).length,
@@ -4370,7 +4358,7 @@ app.get('/api/signals/:symbol',  (req, res) => {
 
 app.get('/api/strategies',       (req, res) => res.json({
   version: '12.0', total: 22,
-  note: 'All 16 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
+  note: 'All 25 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
   strategies: [
     { id: 'FVG_OB',       name: 'Fair Value Gap + Order Block',  cat: 'SMC', wr: '60-68%', rr: '1:2-1:4' },
     { id: 'LIQ_SWEEP',    name: 'Liquidity Sweep',               cat: 'ICT', wr: '62-70%', rr: '1:2-1:5' },
@@ -4742,11 +4730,11 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
 
           if (isBull && last.close > last.open && h1Tr !== 'BEARISH') {
             return { id:'MICRO_SB', name:'Micro Silver Bullet BUY (KZ + FVG retest)', dir:'BUY', score: 82,
-              sl: fvg.bot - atr * 0.3, tp1: price + atr * 1.5, tp2: price + atr * 2.5 };
+              sl: fvg.bot - atr * 0.5, tp1: price + atr * 1.5, tp2: price + atr * 2.5 };
           }
           if (!isBull && last.close < last.open && h1Tr !== 'BULLISH') {
             return { id:'MICRO_SB', name:'Micro Silver Bullet SELL (KZ + FVG retest)', dir:'SELL', score: 82,
-              sl: fvg.top + atr * 0.3, tp1: price - atr * 1.5, tp2: price - atr * 2.5 };
+              sl: fvg.top + atr * 0.5, tp1: price - atr * 1.5, tp2: price - atr * 2.5 };
           }
           return null;
         },
@@ -4794,14 +4782,14 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
               prev.low <= eqLow + atr * 0.2 && price > eqLow) {
             if (h4Tr === 'BEARISH') return null; // don't buy into strong bear trend
             return { id:'LIQ_MAGNET', name:`Liq Magnet BUY (SSL ${Ind.fmt(eqLow,dec)} swept)`, dir:'BUY', score: 78,
-              sl: prev.low - atr * 0.2, tp1: price + atr * 1.5, tp2: eqHigh || price + atr * 2.5 };
+              sl: prev.low - atr * 0.5, tp1: price + atr * 1.5, tp2: eqHigh || price + atr * 2.5 };
           }
           // SELL: price approaching equal highs (BSL) with bearish displacement
           if (eqHigh && last.close < last.open && strongCandle &&
               prev.high >= eqHigh - atr * 0.2 && price < eqHigh) {
             if (h4Tr === 'BULLISH') return null;
             return { id:'LIQ_MAGNET', name:`Liq Magnet SELL (BSL ${Ind.fmt(eqHigh,dec)} swept)`, dir:'SELL', score: 78,
-              sl: prev.high + atr * 0.2, tp1: price - atr * 1.5, tp2: eqLow || price - atr * 2.5 };
+              sl: prev.high + atr * 0.5, tp1: price - atr * 1.5, tp2: eqLow || price - atr * 2.5 };
           }
           return null;
         },
@@ -4834,14 +4822,14 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
               && last.close > keyL && last.close > last.open) {
             if (h4Tr === 'BEARISH' && h1Tr === 'BEARISH') return null; // both bearish = skip
             return { id:'STOP_HUNT', name:`Stop Hunt BUY (wick to ${Ind.fmt(last.low,dec)}, KL ${Ind.fmt(keyL,dec)})`, dir:'BUY', score: 80,
-              sl: last.low - atr * 0.15, tp1: price + atr * 1.5, tp2: keyH || price + atr * 2.5 };
+              sl: last.low - atr * 0.5, tp1: price + atr * 1.5, tp2: keyH || price + atr * 2.5 };
           }
           // SELL: wick spiked above key swing high, body closed back below it
           if (keyH && upperWick >= bodySize * 1.5 && last.high > keyH + atr * 0.05
               && last.close < keyH && last.close < last.open) {
             if (h4Tr === 'BULLISH' && h1Tr === 'BULLISH') return null;
             return { id:'STOP_HUNT', name:`Stop Hunt SELL (wick to ${Ind.fmt(last.high,dec)}, KH ${Ind.fmt(keyH,dec)})`, dir:'SELL', score: 80,
-              sl: last.high + atr * 0.15, tp1: price - atr * 1.5, tp2: keyL || price - atr * 2.5 };
+              sl: last.high + atr * 0.5, tp1: price - atr * 1.5, tp2: keyL || price - atr * 2.5 };
           }
           return null;
         },
@@ -4879,7 +4867,7 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
             const wickRej  = (last.low < e9) && (last.close > e9); // wicked below 9 EMA, closed above
             if (nearEma9 && (bullRej || wickRej)) {
               return { id:'EMA_STACK', name:`EMA Stack BUY (9>${e9.toFixed(0)} > 21>${e21.toFixed(0)} > 50>${e50.toFixed(0)})`, dir:'BUY', score: 76,
-                sl: Math.min(last.low, prev.low) - atr * 0.2, tp1: price + atr * 1.5, tp2: price + atr * 2.5 };
+                sl: Math.min(last.low, prev.low) - atr * 0.5, tp1: price + atr * 1.5, tp2: price + atr * 2.5 };
             }
           }
           // BEAR STACK: 9 < 21 < 50, price rallied to 9 EMA, rejection
@@ -4889,7 +4877,7 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
             const wickRej  = (last.high > e9) && (last.close < e9);
             if (nearEma9 && (bearRej || wickRej)) {
               return { id:'EMA_STACK', name:`EMA Stack SELL (9<${e9.toFixed(0)} < 21<${e21.toFixed(0)} < 50<${e50.toFixed(0)})`, dir:'SELL', score: 76,
-                sl: Math.max(last.high, prev.high) + atr * 0.2, tp1: price - atr * 1.5, tp2: price - atr * 2.5 };
+                sl: Math.max(last.high, prev.high) + atr * 0.5, tp1: price - atr * 1.5, tp2: price - atr * 2.5 };
             }
           }
           return null;
@@ -4937,14 +4925,14 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
               && last.close > last.open && bodySize >= atr * 0.3) {
             if (h4Tr === 'BEARISH') return null;
             return { id:'ORB_TRAP', name:`ORB Trap BUY (false break below ${Ind.fmt(orbL,dec)})`, dir:'BUY', score: 79,
-              sl: prev.low - atr * 0.2, tp1: orbH, tp2: orbH + orbRange * 0.5 };
+              sl: prev.low - atr * 0.5, tp1: orbH, tp2: orbH + orbRange * 0.5 };
           }
           // SELL TRAP: prev candle broke ABOVE orbH, last candle closes back INSIDE range
           if (prev.high > orbH + atr * 0.05 && last.close < orbH
               && last.close < last.open && bodySize >= atr * 0.3) {
             if (h4Tr === 'BULLISH') return null;
             return { id:'ORB_TRAP', name:`ORB Trap SELL (false break above ${Ind.fmt(orbH,dec)})`, dir:'SELL', score: 79,
-              sl: prev.high + atr * 0.2, tp1: orbL, tp2: orbL - orbRange * 0.5 };
+              sl: prev.high + atr * 0.5, tp1: orbL, tp2: orbL - orbRange * 0.5 };
           }
           return null;
         },
@@ -5069,7 +5057,12 @@ app.get('/dashboard', (req, res) => {
   const losses = state.stats.slHits  || 0;
   const wr     = wins + losses > 0 ? Math.round(wins/(wins+losses)*100) : 0;
   const todayKey = new Date().toISOString().slice(0,10);
-  
+
+  // FP variables — stub values (FP tracking removed, kept for dashboard template)
+  const fpPnL    = '0.00';
+  const fpTotal  = '0.00';
+  const phase    = 1;
+  const phaseProg = 0;
   const sigRows = sigs.map(s => {
     const st = s.expired ? '⏱' : s.slHit ? '❌' : s.tp3Hit ? '🏆' : s.tp2Hit ? '✅✅' : s.tp1Hit ? '✅' : '🔵';
     const tp1 = s.tp1Hit ? '✅' : s.levels.tp1 || '-';
@@ -5091,7 +5084,7 @@ app.get('/dashboard', (req, res) => {
 
   res.send(`<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hybrid Trading Bot v10.3</title>
+<title>Hybrid Trading Bot v12.2</title>
 <meta http-equiv="refresh" content="30">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -5112,7 +5105,7 @@ app.get('/dashboard', (req, res) => {
   .bar-fill { background: #3fb950; border-radius: 4px; height: 8px; }
   .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; background: #21262d; }
 </style></head><body>
-<h1>🚀 Hybrid Trading Bot v10.3 <span class="tag">${Object.keys(SYMBOLS).length} symbols · 16 strategies</span></h1>
+<h1>🚀 Hybrid Trading Bot v12.2 <span class="tag">${Object.keys(SYMBOLS).length} symbols · 25 strategies</span></h1>
 
 <div class="grid">
   <div class="card"><div class="val ${active.length > 0 ? 'green' : ''}">${active.length}</div><div class="lbl">Active Signals</div></div>
@@ -5153,8 +5146,8 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v12.0 — ICT/SMC ENGINE     ║
-║   22 strategies · M15+M5 entry · H1/H4 SL-TP    ║
+║  HYBRID TRADING BOT v12.2 — ICT/SMC ENGINE     ║
+║   25 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE (Dhan) · Crypto (Delta Exchange) ║
 ╚══════════════════════════════════════════════════╝
 Port: ${CONFIG.PORT} | Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN} | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -5165,7 +5158,7 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Crypto:8) | Market hours aut
   // Connect MongoDB and restore state
   await connectMongo();
   await loadPersist();
-  console.log('[v12.0] Waiting 5s before first cycle (CG rate limit buffer)...');
+  console.log('[v12.2] Waiting 5s before first cycle (CG rate limit buffer)...');
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
