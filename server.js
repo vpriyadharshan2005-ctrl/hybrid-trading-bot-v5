@@ -18,7 +18,7 @@ const app = express();
 app.use(express.json());
 
 // ─────────────────────────────────────────────────────────────
-//  HYBRID TRADING BOT v12.3 — ICT/SMC PRECISION ENGINE
+//  HYBRID TRADING BOT v13.1 — ICT/SMC PRECISION ENGINE
 //  22 strategies · M15+M5 entry · H1/H4 structure SL/TP
 //  Markets: India NSE/BSE (Dhan) | Crypto (Delta Exchange + fallbacks)
 // ─────────────────────────────────────────────────────────────
@@ -30,7 +30,7 @@ const CONFIG = {
   DELTA_URL:          'https://api.india.delta.exchange', // No API key needed
   CG_URL:             'https://api.coingecko.com/api/v3',  // Fallback for crypto
   DHAN_URL:           'https://api.dhan.co',
-  SIGNAL_QUALITY_MIN: 80,
+  SIGNAL_QUALITY_MIN: 85,
   CANDLE_LIMIT:       130,   // M15 candles to fetch
   MAX_SIGNALS:        150,
   MAX_OPEN_TRADES:    4,    // max simultaneous active signals (prevents overtrading)
@@ -140,7 +140,12 @@ const Market = {
 
   // ICT Kill zones (UTC)
   inKillZone(cat) {
-    if (cat === 'crypto') return true;
+    if (cat === 'crypto') {
+      // Crypto kill zones: Asia open (00-02 UTC), London open (08-10 UTC), NY open (13-16 UTC)
+      const hC = new Date().getUTCHours(), mC = new Date().getUTCMinutes();
+      const tC = hC + mC / 60;
+      return (tC >= 0 && tC <= 2) || (tC >= 8 && tC <= 10) || (tC >= 13 && tC <= 16);
+    }
     if (cat === 'india') {
       const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
       const t   = now.getHours() * 60 + now.getMinutes();
@@ -481,8 +486,14 @@ class Detectors {
       const dlast  = daily[daily.length - 1];
       const dprev  = daily[daily.length - 2];
       // Daily candle direction — use last 2 daily candles for bias
-      const d2Bull = dlast.close > dlast.open && dprev.close > dprev.open;
-      const d2Bear = dlast.close < dlast.open && dprev.close < dprev.open;
+      // 3-candle majority rule — more reliable than 2-candle
+      const d3 = daily[daily.length - 3];
+      const bull1 = dlast.close > dlast.open, bull2 = dprev.close > dprev.open;
+      const bull3 = d3 ? d3.close > d3.open : bull2;
+      const bullCount = [bull1, bull2, bull3].filter(Boolean).length;
+      const bearCount = 3 - bullCount;
+      const d2Bull = bullCount >= 2;
+      const d2Bear = bearCount >= 2;
       if (d2Bull) { dailyBias = 'BULLISH'; dailySellOk = false; }
       else if (d2Bear) { dailyBias = 'BEARISH'; dailyBullOk = false; }
       // Single candle: weaker signal — allow both but note bias
@@ -583,17 +594,33 @@ class Detectors {
 
     const results = [];
     const runners = [
-      this.fvgOB, this.liqSweep, this.choch, this.fpb, this.ote,
-      this.breaker, this.silverBullet, this.orb, this.crt, this.po3,
-      this.fvgBosHTF,
-      this.eqhEql, this.gapGo, this.sessRaid,
-      this.pdhPdl, this.turtleSoup,
-      this.rsiDivergence, this.bbSqueeze,
-      this.judaSwing, this.fibConfluence, this.sundayGapFill,
-      this.ifvg,  // IFVG — Inversion Fair Value Gap (broken FVG flips polarity)
-      this.vwapReversion,  // VWAP Mean Reversion (India only)
-      this.fundingSqueeze, // Funding Rate Squeeze (Crypto only)
-      this.altcoinRotation, // Altcoin Rotation after BTC impulse (Crypto only)
+      // ── ICT Core (highest WR) ──────────────────────────────────────────────
+      this.fvgOB,        // Fair Value Gap + Order Block (60-68% WR)
+      this.liqSweep,     // Liquidity Sweep reversal (62-70% WR)
+      this.choch,        // Market Structure Shift / ChoCh (65-72% WR)
+      this.fpb,          // First Pullback after ChoCh (65-70% WR)
+      this.ote,          // Optimal Trade Entry fib 62-79% (65-72% WR)
+      this.breaker,      // Breaker Block — failed OB flip (60-68% WR)
+      this.silverBullet, // ICT Silver Bullet kill zone (68-75% WR)
+      this.crt,          // Candle Range Theory H1/H4 wick (65-72% WR)
+      this.po3,          // Power of Three / AMD (65-72% WR)
+      this.fvgBosHTF,    // FVG + BoS + HTF combo (68-75% WR)
+      // ── Structure & Price Action ──────────────────────────────────────────
+      this.orb,          // Opening Range Breakout (55-65% WR, India/Crypto open)
+      this.eqhEql,       // Equal Highs/Lows Raid (62-70% WR)
+      this.gapGo,        // Gap & Go (India open 09:15) (60-68% WR)
+      this.sessRaid,     // Session High/Low Raid (63-70% WR)
+      this.pdhPdl,       // Previous Day H/L Raid (65-72% WR)
+      this.turtleSoup,   // Turtle Soup false break (65-72% WR)
+      this.judaSwing,    // Judas Swing false breakout (70-78% WR)
+      this.ifvg,         // Inversion FVG — broken FVG flips (65-72% WR)
+      // ── Technical Confirmation ────────────────────────────────────────────
+      this.rsiDivergence, // RSI Divergence (63-70% WR)
+      // ── Cross-Asset ───────────────────────────────────────────────────────
+      this.fundingSqueeze, // Funding Rate Squeeze — Crypto only (70-76% WR)
+      // ── New Strategies ────────────────────────────────────────────────────
+      this.displacementEntry, // Displacement + 50% retracement entry (68-75% WR)
+      this.niftyObPullback,   // NIFTY H1 OB + M5 pullback (India, 70-76% WR)
     ];
     // Per-symbol strategy exclusions (e.g. DOGE: no CHOCH/OTE/FPB)
     const symCfg = Object.values(SYMBOLS).find(s =>
@@ -619,6 +646,12 @@ class Detectors {
           // Daily bias gate
           if (!x.dailyBullOk && sig.dir === 'BUY')  continue;
           if (!x.dailySellOk && sig.dir === 'SELL') continue;
+          // ── H4 + H1 BOTH against direction = hard block ───────────────────
+          // If H4 is BEARISH AND H1 is BEARISH → BUY is trading against 2 HTF trends
+          // Even if M15 is bullish (just a pullback), this is a losing trade
+          // This was the cause of the BTC and LTC SL hits on 27/3/2026
+          if (sig.dir === 'BUY'  && x.h4Tr === 'BEARISH' && x.h1Tr === 'BEARISH') continue;
+          if (sig.dir === 'SELL' && x.h4Tr === 'BULLISH' && x.h1Tr === 'BULLISH') continue;
           results.push(sig);
         }
       } catch { /* skip */ }
@@ -1400,73 +1433,10 @@ class Detectors {
   }
 
   // ══════════════════════════════════════════════════════════
-  //  18. BB SQUEEZE BREAKOUT (new from strategies.py comparison)
-  //  Bollinger Bands narrow (low volatility) → expand with volume
-  //  Catches explosive breakouts from consolidation
-  //  Best for: Crypto Asian session ranges, Gold pre-London
-  //  Filter: H4 trend direction prevents counter-trend signals
-  // ══════════════════════════════════════════════════════════
-  static bbSqueeze(x, m15) {
-    const { price, atr, h4Tr, h1Tr, kz, volGood, volSpike, last } = x;
-    if (!m15 || m15.length < 25) return null;
-
-    const closes = m15.map(c => c.close);
-    const vols   = m15.map(c => c.volume || 1);
-    const bb     = Ind.bb(closes, 20);
-    if (!bb || !bb.squeeze) return null; // must be in squeeze
-
-    // Squeeze released = breakout happening
-    // Require volume spike for confirmation (not just price)
-    if (!volSpike && !volGood) return null;
-
-    const avgVol = vols.slice(-20).reduce((s,v) => s+v,0) / 20;
-    const curVol = vols[vols.length-1];
-    const volRatio = curVol / avgVol;
-    if (volRatio < 1.3) return null; // need at least 1.3x volume
-
-    // Direction: determined by H4 trend (prevent counter-trend)
-    // If H4 is bullish → BUY breakout. If bearish → SELL breakout.
-    // If neutral → use price position relative to BB middle
-    let dir;
-    if (h4Tr === 'BULLISH') dir = 'BUY';
-    else if (h4Tr === 'BEARISH') dir = 'SELL';
-    else dir = price > bb.middle ? 'BUY' : 'SELL'; // H4 neutral → use BB midline
-
-    // Extra filter: price must be breaking in the direction
-    if (dir === 'BUY'  && price < bb.middle) return null; // price below middle = not bullish
-    if (dir === 'SELL' && price > bb.middle) return null; // price above middle = not bearish
-
-    const score = 76
-      + (h4Tr === (dir === 'BUY' ? 'BULLISH' : 'BEARISH') ? 8 : 0)
-      + (h1Tr === (dir === 'BUY' ? 'BULLISH' : 'BEARISH') ? 4 : 0)
-      + (kz ? 4 : 0)
-      + (volRatio > 2.0 ? 4 : volRatio > 1.5 ? 2 : 0); // bigger vol = stronger signal
-
-    return {
-      id: 'BB_SQUEEZE', name: `BB Squeeze Breakout (vol ${volRatio.toFixed(1)}x)`,
-      dir, score,
-      sl_ref: {
-        type: 'bb_squeeze',
-        val:  dir === 'BUY' ? bb.lower : bb.upper, // SL at opposite BB band
-      },
-      tp_ref: {
-        tp1_type: 'bb_target',
-        tp1_val:  dir === 'BUY'
-          ? price + (bb.upper - bb.lower) * 0.7   // TP1 = 70% of band width above
-          : price - (bb.upper - bb.lower) * 0.7,
-      },
-    };
-  }
-
-  // ══════════════════════════════════════════════════════════
-  //  22. IFVG — INVERSION FAIR VALUE GAP ⭐
-  //  A bullish FVG that price BREAKS BELOW = flips to bearish IFVG (resistance)
-  //  A bearish FVG that price BREAKS ABOVE = flips to bullish IFVG (support)
-  //  When price RETURNS to the IFVG zone = institutional level holds again
-  //  This is the one concept our FVG_OB misses — broken FVGs not retested ones
-  //  Classic ICT combo: LiqSweep → MSS → IFVG retest = highest WR sequence
-  //  WR: 65-72% standalone | 75-80% when confirmed by recent LiqSweep + MSS
-  //  Markets: ALL — especially BTC/ETH, Gold, GBPJPY
+  //  IFVG — INVERSION FAIR VALUE GAP ⭐
+  //  FVG that was broken (mitigated) then flips polarity.
+  //  Bullish FVG broken → becomes bearish IFVG resistance.
+  //  WR: 65-72% | All markets
   // ══════════════════════════════════════════════════════════
   static ifvg(x, m15) {
     const { price, atr, h4Tr, h1Tr, kz, volOk, last } = x;
@@ -1620,188 +1590,14 @@ class Detectors {
   }
 
   // ══════════════════════════════════════════════════════════
-  //  20. FIBONACCI CONFLUENCE ZONE ⭐
-  //  Multiple fib levels from different swings cluster at same price
-  //  When 50% from one swing AND 61.8% from another = high probability
-  //  Institutions use fib heavily — clustered levels are magnetic
-  //  Entry: Price in confluence zone (within 0.3% of cluster)
-  //  SL: Below/above the fib confluence zone + 0.5 ATR
-  //  TP: Next swing high/low
-  //  Markets: ALL — especially Gold and GBPJPY
-  //  WR: 65-72% with H4 trend alignment
-  // ══════════════════════════════════════════════════════════
-  static fibConfluence(x, m15) {
-    const { price, atr, h4Tr, h1Tr, kz, swH, swL, volGood } = x;
-    if (!volGood) return null;
-    if (swH.length < 3 || swL.length < 3) return null;
-
-    const isBullH4 = h4Tr === 'BULLISH';
-    const isBearH4 = h4Tr === 'BEARISH';
-    if (!isBullH4 && !isBearH4) return null; // need H4 directional bias
-
-    const fibs = [0.382, 0.5, 0.618, 0.705, 0.786];
-    const tolerance = atr * 0.3; // levels within 0.3 ATR = confluence
-    const confluenceZones = [];
-
-    // Calculate fib levels from last 3 swing combinations
-    const swingCombos = [
-      [swH[swH.length-1].v, swL[swL.length-1].v],
-      [swH[swH.length-2].v, swL[swL.length-1].v],
-      [swH[swH.length-1].v, swL[swL.length-2].v],
-    ];
-
-    for (const [high, low] of swingCombos) {
-      const range = high - low;
-      if (range < atr * 2) continue; // swing too small
-      for (const fib of fibs) {
-        // Retracement levels (BUY zone = bullish retracement)
-        const retraceBull = high - range * fib; // pull back level for BUY
-        const retraceBear = low  + range * fib; // pull back level for SELL
-        confluenceZones.push({ level: retraceBull, dir: 'BUY', fib });
-        confluenceZones.push({ level: retraceBear, dir: 'SELL', fib });
-      }
-    }
-
-    // Find zones where 2+ fib levels are within tolerance of each other AND near price
-    let buyCount = 0, sellCount = 0, buyLevel = 0, sellLevel = 0;
-    for (const z of confluenceZones) {
-      const nearPrice = Math.abs(z.level - price) < tolerance;
-      const nearby = confluenceZones.filter(z2 =>
-        z2 !== z && z2.dir === z.dir && Math.abs(z2.level - z.level) < tolerance
-      );
-      if (nearPrice && nearby.length >= 1) {
-        if (z.dir === 'BUY')  { buyCount++;  buyLevel  = z.level; }
-        if (z.dir === 'SELL') { sellCount++; sellLevel = z.level; }
-      }
-    }
-
-    // BUY: price at fib confluence in bullish H4 context
-    if (buyCount >= 2 && isBullH4 && price > buyLevel - tolerance && price < buyLevel + tolerance) {
-      const last = x.last;
-      if (!last || last.close <= last.open) return null; // need bullish M15 close
-      const score = 74
-        + (h4Tr === 'BULLISH' ? 8 : 0)
-        + (h1Tr === 'BULLISH' ? 4 : 0)
-        + (buyCount >= 3 ? 4 : 0) // triple confluence = extra bonus
-        + (kz ? 4 : 0);
-      return {
-        id: 'FIB_CONF', name: `Fib Confluence BUY (${buyCount}x levels)`,
-        dir: 'BUY', score,
-        sl_ref: { type: 'fib_zone_low', val: buyLevel - atr * 1.0 },
-        tp_ref: { tp1_type: 'next_swing', tp1_val: swH[swH.length-1].v },
-      };
-    }
-
-    // SELL: price at fib confluence in bearish H4 context
-    if (sellCount >= 2 && isBearH4 && price > sellLevel - tolerance && price < sellLevel + tolerance) {
-      const last = x.last;
-      if (!last || last.close >= last.open) return null; // need bearish M15 close
-      const score = 74
-        + (h4Tr === 'BEARISH' ? 8 : 0)
-        + (h1Tr === 'BEARISH' ? 4 : 0)
-        + (sellCount >= 3 ? 4 : 0)
-        + (kz ? 4 : 0);
-      return {
-        id: 'FIB_CONF', name: `Fib Confluence SELL (${sellCount}x levels)`,
-        dir: 'SELL', score,
-        sl_ref: { type: 'fib_zone_high', val: sellLevel + atr * 1.0 },
-        tp_ref: { tp1_type: 'next_swing', tp1_val: swL[swL.length-1].v },
-      };
-    }
-    return null;
-  }
-
-  // ══════════════════════════════════════════════════════════
-  //  21. SUNDAY GAP FILL ⭐ (Forex only)
-  //  Forex gaps at Sunday open — fills 80%+ of time
-  //  Pure statistical edge: markets don't like price gaps
-  //  Entry: Sunday open price (gap from Friday close)
-  //  Direction: ALWAYS toward Friday close (gap fill direction)
-  //  SL: Beyond the Sunday open + 0.5 ATR (if gap fills wrong)
-  //  TP1: 50% of gap filled | TP2: Full gap filled (Friday close)
-  //  WR: ~80% when gap > 0.1% of price
-  // ══════════════════════════════════════════════════════════
-
-  // ══════════════════════════════════════════════════════════
-  //  23. VWAP MEAN REVERSION (India only)
-  //  Price >2 std dev from VWAP → fade back to VWAP
-  //  Institutional desks always revert to VWAP intraday
-  //  Entry: M15 close back inside 1.5 std dev band after overextension
-  //  SL: Beyond the extreme wick + 0.3 ATR
-  //  TP1: VWAP (50%) | TP2: Opposite 1.5 std dev band
-  //  Markets: India NSE/BSE only (session-based VWAP)
-  //  WR: 63-70% during active India session
-  // ══════════════════════════════════════════════════════════
-  static vwapReversion(x, m15) {
-    const { price, atr, cat, h4Tr, h1Tr, vwap, last, prev, lastBullBody, lastBearBody } = x;
-    if (cat !== 'india') return null;
-    if (!vwap) return null;
-    if (!Market.indiaOpen()) return null;
-
-    // Calculate VWAP std dev from today's candles
-    const now = Date.now();
-    const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-    d.setHours(9, 15, 0, 0);
-    const sessionStart = d.getTime() - 330 * 60000;
-    const todayC = m15.filter(c => c.time >= sessionStart);
-    if (todayC.length < 4) return null;
-
-    const tps = todayC.map(c => (c.high + c.low + c.close) / 3);
-    const mean = tps.reduce((s, v) => s + v, 0) / tps.length;
-    const variance = tps.reduce((s, v) => s + (v - mean) ** 2, 0) / tps.length;
-    const std = Math.sqrt(variance);
-    if (std < atr * 0.1) return null; // not enough variance
-
-    const vwapUpper2 = vwap + 2 * std;
-    const vwapLower2 = vwap - 2 * std;
-    const vwapUpper1 = vwap + 1.5 * std;
-    const vwapLower1 = vwap - 1.5 * std;
-
-    // BUY: price was below -2 std, now M15 close back above -1.5 std
-    if (prev.low < vwapLower2 && last.close > vwapLower1 && lastBullBody) {
-      const score = 72
-        + (h4Tr === 'BULLISH' ? 8 : 0)
-        + (h1Tr === 'BULLISH' ? 5 : 0)
-        + (price < vwap ? 4 : 0); // still below VWAP = more room to run
-      return {
-        id: 'VWAP_REV', name: `VWAP Mean Reversion BUY (${((vwap - price) / atr).toFixed(1)} ATR below VWAP)`,
-        dir: 'BUY', score,
-        sl_ref: { type: 'vwap_extreme', val: prev.low - atr * 0.3 },
-        tp_ref: { tp1_type: 'vwap', tp1_val: vwap, tp2_val: vwapUpper1 },
-      };
-    }
-
-    // SELL: price was above +2 std, now M15 close back below +1.5 std
-    if (prev.high > vwapUpper2 && last.close < vwapUpper1 && lastBearBody) {
-      const score = 72
-        + (h4Tr === 'BEARISH' ? 8 : 0)
-        + (h1Tr === 'BEARISH' ? 5 : 0)
-        + (price > vwap ? 4 : 0);
-      return {
-        id: 'VWAP_REV', name: `VWAP Mean Reversion SELL (${((price - vwap) / atr).toFixed(1)} ATR above VWAP)`,
-        dir: 'SELL', score,
-        sl_ref: { type: 'vwap_extreme', val: prev.high + atr * 0.3 },
-        tp_ref: { tp1_type: 'vwap', tp1_val: vwap, tp2_val: vwapLower1 },
-      };
-    }
-    return null;
-  }
-
-  // ══════════════════════════════════════════════════════════
-  //  24. FUNDING RATE SQUEEZE (Crypto only)
-  //  Extremely positive funding → longs paying shorts → squeeze
-  //  When funding > 0.08% AND price loses momentum → SELL
-  //  When funding < -0.08% AND price holds → BUY
-  //  Delta Exchange exposes funding via public tickers endpoint
-  //  SL: Last swing high + 0.5 ATR (for SELL) / swing low - 0.5 ATR (BUY)
-  //  TP1: 1.5 ATR | TP2: 3 ATR (funding squeezes move fast)
-  //  WR: 65-72% when momentum confirmation present
+  //  FUNDING SQUEEZE — Crypto extreme funding → reversal
+  //  When funding rate is extreme, longs/shorts are overextended.
+  //  WR: 70-76% | Crypto only
   // ══════════════════════════════════════════════════════════
   static fundingSqueeze(x, m15) {
-    const { price, atr, cat, h1Tr, last, lastBearBody, lastBullBody, swH, swL } = x;
+    const { cat, price, atr, h4Tr, lastBullBody, lastBearBody, swH, swL } = x;
     if (cat !== 'crypto') return null;
-    if (!x.fundingRate) return null; // populated by dataFetcher at cycle time
-    const fr = x.fundingRate; // e.g. 0.0010 = 0.10%
+    if (!x.fundingRate) return null;
 
     const frHigh = Math.abs(fr) >= 0.0008; // 0.08% threshold
     if (!frHigh) return null;
@@ -1838,201 +1634,6 @@ class Detectors {
     return null;
   }
 
-  // ══════════════════════════════════════════════════════════
-  //  25. ALTCOIN ROTATION (Crypto only)
-  //  BTC breaks out → buy the laggard altcoin that hasn't moved yet
-  //  Pure momentum rotation — institutions move BTC first, alts follow
-  //  Logic: BTC M15 +1.5% move in last 2 candles → scan alts for <0.3% move
-  //  Entry: Laggard alt's last M15 close
-  //  SL: Laggard alt's last swing low - 0.3 ATR
-  //  TP1: 1x BTC move | TP2: 1.5x BTC move (alts overshoot)
-  //  WR: 62-70% when BTC move is clean impulse (not choppy)
-  //  Note: this fires on the LAGGARD symbol, not on BTC itself
-  // ══════════════════════════════════════════════════════════
-  static altcoinRotation(x, m15) {
-    const { price, atr, cat, last, h1Tr, swL, swH } = x;
-    if (cat !== 'crypto') return null;
-    if (!x.btcMove) return null; // populated by runCycle before strategy run
-
-    const btcMove = x.btcMove; // e.g. 0.018 = 1.8% BTC move
-    const thisMove = x.thisSymMove || 0; // this symbol's move same period
-
-    // BTC must have moved significantly
-    if (Math.abs(btcMove) < 0.015) return null; // <1.5% = not a real BTC impulse
-
-    // This altcoin must be lagging (moved less than 30% of BTC's move)
-    if (Math.abs(thisMove) >= Math.abs(btcMove) * 0.3) return null;
-
-    // Direction must match BTC move
-    const isBull = btcMove > 0;
-    if (isBull && last.close < last.open) return null; // need bullish alt candle
-    if (!isBull && last.close > last.open) return null;
-
-    // H1 trend must at least not be opposing
-    if (isBull && h1Tr === 'BEARISH') return null;
-    if (!isBull && h1Tr === 'BULLISH') return null;
-
-    const lagRatio = (1 - Math.abs(thisMove) / Math.abs(btcMove)).toFixed(2);
-    const score = 70
-      + (Math.abs(btcMove) >= 0.02 ? 8 : 0)  // BTC >2% = stronger signal
-      + (Math.abs(thisMove) < 0.003 ? 6 : 0)  // alt barely moved = better lag
-      + (h1Tr === (isBull ? 'BULLISH' : 'BEARISH') ? 5 : 0);
-
-    if (isBull) {
-      const keyL = swL.length ? swL[swL.length - 1].v : price - atr;
-      const tp1  = price + Math.abs(btcMove) * price;
-      const tp2  = price + Math.abs(btcMove) * price * 1.5;
-      return {
-        id: 'ALT_ROT', name: `Altcoin Rotation BUY (BTC +${(btcMove*100).toFixed(1)}%, lag ${(lagRatio*100).toFixed(0)}%)`,
-        dir: 'BUY', score,
-        sl_ref: { type: 'swing_low', val: keyL - atr * 0.3 },
-        tp_ref: { tp1_type: 'btc_mirror', tp1_val: tp1, tp2_val: tp2 },
-      };
-    } else {
-      const keyH = swH.length ? swH[swH.length - 1].v : price + atr;
-      const tp1  = price - Math.abs(btcMove) * price;
-      const tp2  = price - Math.abs(btcMove) * price * 1.5;
-      return {
-        id: 'ALT_ROT', name: `Altcoin Rotation SELL (BTC ${(btcMove*100).toFixed(1)}%, lag ${(lagRatio*100).toFixed(0)}%)`,
-        dir: 'SELL', score,
-        sl_ref: { type: 'swing_high', val: keyH + atr * 0.3 },
-        tp_ref: { tp1_type: 'btc_mirror', tp1_val: tp1, tp2_val: tp2 },
-      };
-    }
-  }
-
-  //  TP1: 50% of gap filled | TP2: Full gap filled (Friday close)
-  //  WR: ~80% when gap > 0.1% of price
-  // ══════════════════════════════════════════════════════════
-  static sundayGapFill(x, m15) {
-    const { price, atr, cat } = x;
-    // Forex and commodity only (they gap on Sunday open)
-    if (cat !== 'forex' && cat !== 'commodity') return null;
-    if (!m15 || m15.length < 10) return null;
-
-    // Only fires Sunday (UTC day 0) during forex open window (21:00-23:00 UTC)
-    const nowUTC  = new Date();
-    const dayUTC  = nowUTC.getUTCDay();
-    const hourUTC = nowUTC.getUTCHours();
-    if (dayUTC !== 0) return null;           // must be Sunday
-    if (hourUTC < 21 || hourUTC > 23) return null; // must be 21:00-23:00 UTC
-
-    // Find the gap: compare current open with last candle from Friday
-    // Last Friday candle = last candle before a gap of >24 hours
-    let fridayClose = null;
-    let sundayOpen  = null;
-
-    for (let i = m15.length - 1; i >= 1; i--) {
-      const gap = m15[i].time - m15[i-1].time;
-      if (gap > 24 * 3600 * 1000) {
-        // This is the weekend gap
-        fridayClose = m15[i-1].close;
-        sundayOpen  = m15[i].open;
-        break;
-      }
-    }
-
-    if (!fridayClose || !sundayOpen) return null;
-
-    const gapSize = Math.abs(sundayOpen - fridayClose);
-    const gapPct  = gapSize / fridayClose;
-    if (gapPct < 0.001) return null; // gap must be > 0.1% to trade
-
-    // Direction: always fill toward Friday close
-    const isBuy = sundayOpen < fridayClose; // gapped DOWN → fill UP
-    const last  = x.last;
-    if (!last) return null;
-
-    // Confirm: current price should still be on the gap side
-    if (isBuy  && price >= fridayClose) return null; // gap already filled
-    if (!isBuy && price <= fridayClose) return null;
-
-    const score = 78; // fixed score — pure statistical edge, no structure needed
-    return {
-      id: 'SUNDAY_GAP', name: `Sunday Gap Fill ${isBuy ? '(gap up toward ' : '(gap down toward '}${fridayClose.toFixed(4)})`,
-      dir: isBuy ? 'BUY' : 'SELL', score,
-      sl_ref: { type: 'gap_open', val: isBuy ? sundayOpen - atr * 0.5 : sundayOpen + atr * 0.5 },
-      tp_ref: {
-        tp1_type: 'gap_half',  tp1_val: isBuy ? sundayOpen + gapSize * 0.5 : sundayOpen - gapSize * 0.5,
-        tp2_val:  fridayClose, // TP2 = full gap filled = Friday close
-      },
-    };
-  }
-
-  // ══════════════════════════════════════════════════════════
-  //  15. PREVIOUS DAY HIGH/LOW (PDH/PDL) ⭐
-  //  Prior day's H/L swept → reverse back inside day range
-  //  Most watched intraday level by ALL institutional traders
-  //  Entry: M15 close back ABOVE PDL (BUY) / BELOW PDH (SELL)
-  //  SL:    beyond sweep wick + 0.5 ATR
-  //  TP1:   prior day midpoint | TP2: opposite PDH/PDL
-  //  Works: ALL markets. Critical for India NSE (daily).
-  // ══════════════════════════════════════════════════════════
-  static pdhPdl(x, m15) {
-    const { price, atr, cat, h4Tr, h1POI, kz,
-            lastBullBody, lastBearBody, volGood } = x;
-    if (!volGood) return null;
-    const last = x.last, prev = x.prev;
-
-    // Build prior day candles from M15 data
-    const istOffset  = 330 * 60000; // +5:30 IST
-    const now        = new Date();
-    const todayIST   = new Date(now.getTime() + istOffset);
-    todayIST.setUTCHours(0,0,0,0);
-    const todayStartMs = todayIST.getTime() - istOffset;
-
-    // For forex/crypto: use UTC day boundary
-    const todayUTC   = new Date(); todayUTC.setUTCHours(0,0,0,0);
-    const startMs    = cat === 'india' ? todayStartMs : todayUTC.getTime();
-
-    const priorDay   = m15.filter(cx => cx.time < startMs);
-    if (priorDay.length < 4) return null;
-
-    const pdh = Math.max(...priorDay.map(cx => cx.high));
-    const pdl = Math.min(...priorDay.map(cx => cx.low));
-    const pdMid = (pdh + pdl) / 2;
-    const dayRange = pdh - pdl;
-    if (dayRange < atr * 0.5) return null; // day too narrow
-
-    // ── BUY: PDL swept, M15 closes back above PDL ──────────────
-    if (prev.low < pdl - atr * 0.05 && last.close > pdl && lastBullBody) {
-      const sweepDepth = pdl - prev.low;
-      if (sweepDepth < atr * 0.15) return null;
-      const score = 80
-        + (h4Tr === 'BULLISH' ? 8 : 0)
-        + (h1POI ? 6 : 0)
-        + (kz ? 4 : 0)
-        + (x.volSpike ? 4 : 0);
-      return {
-        id: 'PDH_PDL', name: 'PDL Raid', dir: 'BUY', score,
-        sl_ref: { type: 'pdl_sweep', val: prev.low },
-        tp_ref: { tp1_type: 'pd_mid', tp1_val: pdMid, tp2_val: pdh },
-      };
-    }
-
-    // ── SELL: PDH swept, M15 closes back below PDH ─────────────
-    if (prev.high > pdh + atr * 0.05 && last.close < pdh && lastBearBody) {
-      const sweepDepth = prev.high - pdh;
-      if (sweepDepth < atr * 0.15) return null;
-      const score = 80
-        + (h4Tr === 'BEARISH' ? 8 : 0)
-        + (h1POI ? 6 : 0)
-        + (kz ? 4 : 0)
-        + (x.volSpike ? 4 : 0);
-      return {
-        id: 'PDH_PDL', name: 'PDH Raid', dir: 'SELL', score,
-        sl_ref: { type: 'pdh_sweep', val: prev.high },
-        tp_ref: { tp1_type: 'pd_mid', tp1_val: pdMid, tp2_val: pdl },
-      };
-    }
-    return null;
-  }
-
-  // ══════════════════════════════════════════════════════════
-  //  16. TURTLE SOUP
-  //  Multi-candle false break (2-5 candles outside level)
-  //  → violent reversal back inside (LiqSweep misses this)
-  //  Entry: M15 close back inside range after 2-5 candle false break
   //  SL:    beyond the false break extreme + 0.5 ATR
   //  TP1:   origin of false break | TP2: H1 swing
   //  Works: ALL — especially ranging markets, Gold, India, BTC
@@ -2135,10 +1736,129 @@ class Detectors {
     }
     return null;
   }
-}
 
+  // ══════════════════════════════════════════════════════════
+  //  NEW 1. DISPLACEMENT ENTRY ⭐
+  //  ICT concept: after a displacement candle (strong impulse > 1.5 ATR body),
+  //  price often retraces 50% of that candle before continuing.
+  //  Enter at the 50% level with the original displacement direction.
+  //  WR: 68-75% | Best: BTC, ETH, NIFTY, BANKNIFTY
+  // ══════════════════════════════════════════════════════════
+  static displacementEntry(x, m15) {
+    const { c, price, atr, h4Tr, h1Tr, tr, kz, volOk, lastBullBody, lastBearBody } = x;
+    if (!volOk) return null;
 
-class Builder {
+    // Look for a displacement candle in last 5 M15 candles (not the current one)
+    const lookback = c.slice(-6, -1); // last 5 confirmed candles
+    for (let i = lookback.length - 1; i >= 0; i--) {
+      const d = lookback[i];
+      const body = Math.abs(d.close - d.open);
+      if (body < atr * 1.5) continue; // must be strong displacement
+
+      const isBullDisp = d.close > d.open;
+      const dispHigh = Math.max(d.open, d.close);
+      const dispLow  = Math.min(d.open, d.close);
+      const disp50   = (d.open + d.close) / 2; // 50% retracement level
+
+      // Check if price has pulled back to the 50% zone (within 0.2 ATR)
+      const at50 = Math.abs(price - disp50) < atr * 0.2;
+      if (!at50) continue;
+
+      // Candles after displacement must not have broken below the displacement low (bull)
+      const afterCandles = c.slice(-(c.length - (c.length - lookback.length + i) - 1));
+      if (isBullDisp) {
+        // No close below dispLow after displacement
+        if (afterCandles.some(cx => cx.close < dispLow - atr * 0.1)) continue;
+        if (!lastBullBody) continue;
+        if (h1Tr === 'BEARISH' && h4Tr === 'BEARISH') continue;
+        const score = 78
+          + (h4Tr === 'BULLISH' ? 8 : 0)
+          + (h1Tr === 'BULLISH' ? 6 : 0)
+          + (kz ? 5 : 0)
+          + (body > atr * 2.0 ? 4 : 0); // very strong displacement
+        return {
+          id: 'DISP_ENTRY', name: `Displacement Entry BUY (50% of ${(body/atr).toFixed(1)} ATR impulse)`,
+          dir: 'BUY', score,
+          sl_ref: { type: 'disp_low', val: dispLow },
+          tp_ref: { tp1_type: 'disp_high', tp1_val: dispHigh },
+          brokenLevel: disp50,
+        };
+      } else {
+        if (afterCandles.some(cx => cx.close > dispHigh + atr * 0.1)) continue;
+        if (!lastBearBody) continue;
+        if (h1Tr === 'BULLISH' && h4Tr === 'BULLISH') continue;
+        const score = 78
+          + (h4Tr === 'BEARISH' ? 8 : 0)
+          + (h1Tr === 'BEARISH' ? 6 : 0)
+          + (kz ? 5 : 0)
+          + (body > atr * 2.0 ? 4 : 0);
+        return {
+          id: 'DISP_ENTRY', name: `Displacement Entry SELL (50% of ${(body/atr).toFixed(1)} ATR impulse)`,
+          dir: 'SELL', score,
+          sl_ref: { type: 'disp_high', val: dispHigh },
+          tp_ref: { tp1_type: 'disp_low', tp1_val: dispLow },
+          brokenLevel: disp50,
+        };
+      }
+    }
+    return null;
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  NEW 2. NIFTY / BANKNIFTY H1 OB PULLBACK ⭐ (India only)
+  //  India-specific: NIFTY/BANKNIFTY respect H1 Order Blocks
+  //  extremely well. When an H1 OB is identified and price
+  //  pulls back to it with a bullish/bearish M15 close, enter.
+  //  WR: 70-76% | Only: NIFTY, BANKNIFTY
+  // ══════════════════════════════════════════════════════════
+  static niftyObPullback(x, m15, h1) {
+    const { c, price, atr, h4Tr, tr, cat, lastBullBody, lastBearBody, volOk } = x;
+    // India NSE only
+    if (cat !== 'india') return null;
+    if (!volOk) return null;
+    if (!h1 || h1.length < 20) return null;
+
+    const h1Atr = Ind.atr(h1);
+    const h1OBs = Ind.findOBs(h1, h1Atr);
+    if (!h1OBs.length) return null;
+
+    // Find H1 OBs that price is currently retesting
+    for (const ob of h1OBs.slice(-6)) {
+      const inZone = price >= ob.bot - h1Atr * 0.15 && price <= ob.top + h1Atr * 0.15;
+      if (!inZone) continue;
+
+      // Price must have moved away from this OB and returned (real retest)
+      const obAge = c.length - ob.i; // how many M15 candles ago the OB formed
+      if (obAge < 4 || obAge > 40) continue; // too fresh or too stale
+
+      const isBull = ob.type === 'bull';
+      if (isBull && !lastBullBody) continue;
+      if (!isBull && !lastBearBody) continue;
+      if (isBull && h4Tr === 'BEARISH') continue;
+      if (!isBull && h4Tr === 'BULLISH') continue;
+
+      // Opening session bonus — most reliable during India KZ
+      const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+      const t = now.getHours() * 60 + now.getMinutes();
+      const inIndiaKZ = (t >= 555 && t <= 615) || (t >= 840 && t <= 915);
+
+      const score = 80
+        + (h4Tr === (isBull ? 'BULLISH' : 'BEARISH') ? 10 : 0)
+        + (inIndiaKZ ? 8 : 0)
+        + (tr === (isBull ? 'BULLISH' : 'BEARISH') ? 4 : 0);
+
+      return {
+        id: 'NIFTY_OB', name: `${isBull ? 'Bullish' : 'Bearish'} H1 OB Pullback (India)`,
+        dir: isBull ? 'BUY' : 'SELL', score,
+        sl_ref: { type: isBull ? 'ob_bot' : 'ob_top', val: isBull ? ob.bot : ob.top },
+        tp_ref: { tp1_type: isBull ? 'ob_top' : 'ob_bot', tp1_val: isBull ? ob.top : ob.bot },
+      };
+    }
+    return null;
+  }
+
+  // ── fundingSqueeze ─────────────────────────────────────────────────────────
+
 
   static build(symbol, m15, source, mtfData, extras = {}) {
     if (!m15 || m15.length < 30) return null;
@@ -2214,6 +1934,17 @@ class Builder {
     // 7. Dead session penalty (-8)
     if (cat !== 'crypto' && cat !== 'india' && Market.session() === 'DEAD') q -= 8;
 
+    // 7b. Counter-trend H4+H1 penalty (-15 for both opposing, -8 for H4 alone)
+    // This is the most important penalty — trading against 2 higher timeframes
+    // is the primary cause of SL hits even on "valid" M15 setups
+    if (isBuy) {
+      if (ctx2.h4Tr === 'BEARISH' && ctx2.h1Tr === 'BEARISH') q -= 15; // both HTFs opposing = near fatal
+      else if (ctx2.h4Tr === 'BEARISH') q -= 8;                         // H4 alone opposing = significant
+    } else {
+      if (ctx2.h4Tr === 'BULLISH' && ctx2.h1Tr === 'BULLISH') q -= 15;
+      else if (ctx2.h4Tr === 'BULLISH') q -= 8;
+    }
+
     // 8. BB 2σ overextension gate (-6 penalty)
     //    If price is already >2 std deviations from 20-period mean,
     //    a BUY in overbought territory / SELL in oversold = chasing the move
@@ -2263,7 +1994,17 @@ class Builder {
     }
 
     const quality = Math.min(100, Math.round(q));
-    if (quality < CONFIG.SIGNAL_QUALITY_MIN) return null;
+    // Per-strategy quality floors — weaker strategies need higher confirmation
+    const stratFloors = {
+      'FVG_OB': 82, 'LIQ_SWEEP': 83, 'CHOCH': 84, 'FPB': 83,
+      'OTE': 84, 'BREAKER': 82, 'SILVER_BULLET': 85, 'CRT': 83,
+      'PO3': 83, 'FVG_BOS_HTF': 85, 'ORB': 83, 'EQH_EQL': 83,
+      'GAP_GO': 82, 'SESS_RAID': 82, 'PDH_PDL': 83, 'TURTLE_SOUP': 83,
+      'JUDAS_SWING': 84, 'IFVG': 83, 'RSI_DIV': 83,
+      'FUNDING_SQZ': 84, 'DISP_ENTRY': 83, 'NIFTY_OB': 84,
+    };
+    const stratFloor = stratFloors[best.id] || CONFIG.SIGNAL_QUALITY_MIN;
+    if (quality < Math.max(CONFIG.SIGNAL_QUALITY_MIN, stratFloor)) return null;
 
     // Build levels from live candle data
     const lvls = this.levels(best, m5, m15, h1, h4, cat);
@@ -2611,6 +2352,20 @@ class Builder {
           : f(sig.sl_ref.val + atr * 0.8);
         break;
 
+      case 'DISP_ENTRY':
+        // SL: below/above the displacement candle extreme + 0.8 ATR
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
+        break;
+
+      case 'NIFTY_OB':
+        // SL: below/above the H1 OB using H1 ATR for proper structural buffer
+        sl = isBuy
+          ? (h1LowBelow ? f(h1LowBelow.v - h1Atr * 0.3) : f(sig.sl_ref.val - h1Atr * 0.5))
+          : (h1HighAbove ? f(h1HighAbove.v + h1Atr * 0.3) : f(sig.sl_ref.val + h1Atr * 0.5));
+        break;
+
       default:
         // Fallback: H1 structural SL (always wider than M15 noise)
         sl = isBuy
@@ -2618,17 +2373,17 @@ class Builder {
           : f(h1HighAbove ? h1HighAbove.v + h1Atr * 0.3 : price + atr * 2.5);
     }
 
-    // ── Minimum SL distance gate: SL must be at least 1.0 × ATR from entry ───
-    // Prevents SL so tight that normal candle noise hits it (the main cause of fake SL hits)
-    // If SL is closer than 1.0 ATR, push it out to 1.0 ATR
+    // ── Minimum SL distance gate: SL must be at least 1.5 × ATR from entry ───
+    // 1.0 ATR was still getting hit by normal candle noise (e.g. LTC 27/3/2026)
+    // 1.5 ATR gives a proper structural buffer beyond intracandle wicks
     if (sl && entry !== null) {
       const slDist = Math.abs(parseFloat(entry) - parseFloat(sl));
-      const minSLDist = atr * 1.0;
+      const minSLDist = atr * 1.5;
       if (slDist < minSLDist) {
         sl = isBuy
           ? f(parseFloat(entry) - minSLDist)
           : f(parseFloat(entry) + minSLDist);
-        console.log(`[Levels] SL pushed out to min 1.0 ATR: ${sl} (was only ${slDist.toFixed(4)} from entry)`);
+        console.log(`[Levels] SL pushed out to min 1.5 ATR: ${sl} (was ${slDist.toFixed(4)} from entry)`);
       }
     }
 
@@ -2644,9 +2399,12 @@ class Builder {
         // TP1 = opposite edge of FVG/OB (gap fill / zone flip)
         // TP2 = next H1 swing high/low
         tp1 = f(sig.tp_ref.tp1_val);
+        // Only use H1 swing if it's meaningfully beyond TP1 (>1 ATR away)
+        const h1AboveValid = h1HighAboveTP && Math.abs(h1HighAboveTP.v - parseFloat(tp1)) > atr;
+        const h1BelowValid = h1LowBelowTP  && Math.abs(parseFloat(tp1) - h1LowBelowTP.v)  > atr;
         tp2 = isBuy
-          ? f(h1HighAboveTP?.v || (sig.tp_ref.tp1_val + Math.abs(sig.tp_ref.tp1_val - (entry || price))))
-          : f(h1LowBelowTP?.v  || (sig.tp_ref.tp1_val - Math.abs((entry || price) - sig.tp_ref.tp1_val)));
+          ? f(h1AboveValid ? h1HighAboveTP.v : sig.tp_ref.tp1_val + Math.abs(sig.tp_ref.tp1_val - (entry || price)))
+          : f(h1BelowValid ? h1LowBelowTP.v  : sig.tp_ref.tp1_val - Math.abs((entry || price) - sig.tp_ref.tp1_val));
         break;
 
       case 'LIQ_SWEEP':
@@ -2942,9 +2700,9 @@ class Builder {
     if (sl && tp1 && entry) {
       const risk   = Math.abs(entry - sl);
       const reward = Math.abs(tp1   - entry);
-      if (risk > 0 && reward / risk < 1.5) {
-        tp1 = isBuy ? f(entry + risk * 1.5) : f(entry - risk * 1.5);
-        console.log(`[Levels] TP1 extended to min 1:1.5 RR: ${tp1}`);
+      if (risk > 0 && reward / risk < 2.0) {
+        tp1 = isBuy ? f(entry + risk * 2.0) : f(entry - risk * 2.0);
+        console.log(`[Levels] TP1 extended to min 1:2 RR: ${tp1}`);
       }
     }
     // After TP1 fix, ensure TP2 and TP3 are still beyond TP1 (strict ordering)
@@ -3693,7 +3451,15 @@ async function checkExpiry() {
       }
       continue;
     }
-    const price = mtf.data.m15[mtf.data.m15.length - 1].close;
+    // Use live ticker for crypto (more accurate than last candle close)
+    let price = mtf.data.m15[mtf.data.m15.length - 1].close;
+    if (sig.cat === 'crypto' && sig.source !== 'cache') {
+      const cfg2 = SYMBOLS[sig.symbol];
+      if (cfg2?.deltaSymbol) {
+        const livePx = await delta.fetchLivePrice(cfg2.deltaSymbol).catch(() => null);
+        if (livePx && !isNaN(livePx)) price = livePx;
+      }
+    }
     const isBuy = sig.dir === 'BUY';
     const lvls  = sig.levels;
 
@@ -4105,14 +3871,14 @@ async function runCycle() {
   // ── Pause guard ─────────────────────────────────────────────────────────
   if (state.pauseUntil && Date.now() < state.pauseUntil) {
     const left = Math.ceil((state.pauseUntil - Date.now()) / 60000);
-    console.log(`[v12.3] ⏸ Bot paused — ${left}m remaining`);
+    console.log(`[v13.1] ⏸ Bot paused — ${left}m remaining`);
     return;
   }
   state.running = true;
   const t0 = Date.now();
   try {
   const ist = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  console.log(`\n[v12.3] ⚡ M15 Cycle — ${ist}`);
+  console.log(`\n[v13.1] ⚡ M15 Cycle — ${ist}`);
 
   // Prefetch all Delta crypto symbols
   const deltaSyms = Object.values(SYMBOLS).filter(s => s.src === 'delta').map(s => s.deltaSymbol);
@@ -4174,7 +3940,7 @@ async function runCycle() {
 
       // ── Disabled symbol check ──────────────────────────────────
       if (CONFIG.DISABLED_SYMBOLS.includes(symbol)) {
-        console.log(`[v12.3] ⏭ ${symbol}: disabled via DISABLED_SYMBOLS`);
+        console.log(`[v13.1] ⏭ ${symbol}: disabled via DISABLED_SYMBOLS`);
         continue;
       }
 
@@ -4191,32 +3957,32 @@ async function runCycle() {
             await tgSend(`🔴 *${catLabel[cfg.cat] || cfg.cat.charAt(0).toUpperCase()+cfg.cat.slice(1)} Market Closed*\n${Market.closedMessage(cfg.cat, symbol)}`);
           }
         }
-        console.log(`[v12.3] 🔴 ${symbol}: ${cfg.cat} market closed`);
+        console.log(`[v13.1] 🔴 ${symbol}: ${cfg.cat} market closed`);
         continue;
       }
 
       // ── Fetch candles ──────────────────────────────────────
       const mtf = await dataFetcher.fetchMTF(symbol);
-      if (!mtf?.m15?.length) { console.log(`[v12.3] ⚠️  No data: ${symbol}`); continue; }
+      if (!mtf?.m15?.length) { console.log(`[v13.1] ⚠️  No data: ${symbol}`); continue; }
 
       // ── Build signal ───────────────────────────────────────
       const sig      = Builder.build(symbol, mtf.m15, mtf.source, mtf, cycleExtras[symbol] || {});
       const curPrice = mtf.m15[mtf.m15.length - 1].close;
 
-      if (!sig) { console.log(`[v12.3] ℹ️  No signal: ${symbol}`); continue; }
+      if (!sig) { console.log(`[v13.1] ℹ️  No signal: ${symbol}`); continue; }
 
       // ── Gate check ─────────────────────────────────────────
       const g = gate.check(sig, curPrice, state.signals.filter(s => s.ts && Date.now() - new Date(s.ts).getTime() < 900000));
       if (!g.ok) {
         cycleBlocked++; state.stats.blocked++;
-        console.log(`[v12.3] 🚫 ${symbol}: ${g.why}`);
+        console.log(`[v13.1] 🚫 ${symbol}: ${g.why}`);
         continue;
       }
 
       // ✅ Max open trades guard
       const openTrades = state.signals.filter(s => !s.expired && !s.slHit).length;
       if (openTrades >= CONFIG.MAX_OPEN_TRADES) {
-        console.log(`[v12.3] ⏸ ${symbol}: max open trades (${openTrades}/${CONFIG.MAX_OPEN_TRADES}) reached`);
+        console.log(`[v13.1] ⏸ ${symbol}: max open trades (${openTrades}/${CONFIG.MAX_OPEN_TRADES}) reached`);
         cycleBlocked++; state.stats.blocked++;
         continue;
       }
@@ -4225,7 +3991,7 @@ async function runCycle() {
       const todayStr = new Date().toISOString().slice(0, 10);
       const todayCount = state.signals.filter(s => s.ts?.slice(0,10) === todayStr).length;
       if (todayCount >= CONFIG.MAX_DAILY_SIGNALS) {
-        console.log(`[v12.3] ⏸ ${symbol}: max daily signals (${todayCount}/${CONFIG.MAX_DAILY_SIGNALS}) reached`);
+        console.log(`[v13.1] ⏸ ${symbol}: max daily signals (${todayCount}/${CONFIG.MAX_DAILY_SIGNALS}) reached`);
         cycleBlocked++; state.stats.blocked++;
         continue;
       }
@@ -4270,11 +4036,11 @@ async function runCycle() {
       cycleSignals++;
       savePersist(); // persist state after every new signal
 
-      console.log(`[v12.3] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
+      console.log(`[v13.1] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
       await tgSignal(sig);
       await new Promise(r => setTimeout(r, 500));
 
-    } catch (e) { console.error(`[v12.3] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
+    } catch (e) { console.error(`[v13.1] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
   }
 
 
@@ -4284,7 +4050,7 @@ async function runCycle() {
 
   await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
-  console.log(`[v12.3] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
+  console.log(`[v13.1] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
   } catch (e) {
     console.error('[runCycle] Fatal error:', e.message, e.stack?.split('\n')[1]);
   } finally {
@@ -4296,8 +4062,8 @@ async function runCycle() {
 //  SECTION 9 — API ENDPOINTS
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  bot: 'Hybrid Trading Bot v12.3 — ICT/SMC Engine',
-  version: '12.3',
+  bot: 'Hybrid Trading Bot v13.1 — ICT/SMC Engine',
+  version: '13.1',
   strategies: 22,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -4308,7 +4074,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '12.3',
+    status: 'OK', version: '13.1',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -4357,7 +4123,7 @@ app.get('/api/signals/:symbol',  (req, res) => {
 });
 
 app.get('/api/strategies',       (req, res) => res.json({
-  version: '12.3', total: 25,
+  version: '13.1', total: 22,
   note: 'All 25 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
   strategies: [
     { id: 'FVG_OB',       name: 'Fair Value Gap + Order Block',  cat: 'SMC', wr: '60-68%', rr: '1:2-1:4' },
@@ -4378,14 +4144,9 @@ app.get('/api/strategies',       (req, res) => res.json({
     { id: 'TURTLE_SOUP',  name: 'Turtle Soup (Multi-Candle Sweep)', cat: 'ICT',   wr: '65-72%', rr: '1:2-1:4' },
     { id: 'SMT_DIV',      name: 'SMT Divergence (Cross-Symbol)',    cat: 'ICT',   wr: '70-78%', rr: '1:3-1:6' },
     { id: 'RSI_DIV',      name: 'RSI Divergence (Price/Momentum)',  cat: 'TECH',  wr: '63-70%', rr: '1:2-1:4' },
-    { id: 'BB_SQUEEZE',   name: 'BB Squeeze Breakout (Volatility)', cat: 'TECH',  wr: '62-68%', rr: '1:2-1:3' },
     { id: 'JUDAS_SWING',  name: 'ICT Judas Swing (Session Manipulation)', cat: 'ICT', wr: '70-78%', rr: '1:2-1:4' },
-    { id: 'FIB_CONF',     name: 'Fibonacci Confluence Zone',          cat: 'MATH', wr: '65-72%', rr: '1:2-1:4' },
-    { id: 'SUNDAY_GAP',   name: 'Sunday Gap Fill (Forex)',            cat: 'STAT', wr: '75-82%', rr: '1:1.5-1:3' },
     { id: 'IFVG',         name: 'Inversion FVG (broken FVG flips)',    cat: 'ICT',  wr: '65-72%', rr: '1:2-1:4' },
-    { id: 'VWAP_REV',     name: 'VWAP Mean Reversion',                 cat: 'TECH', wr: '63-70%', rr: '1:1.5-1:2', markets: 'India only' },
     { id: 'FUNDING_SQZ',  name: 'Funding Rate Squeeze',                cat: 'QUANT',wr: '65-72%', rr: '1:1.5-1:3', markets: 'Crypto only' },
-    { id: 'ALT_ROT',      name: 'Altcoin Rotation (BTC impulse lag)',  cat: 'QUANT',wr: '62-70%', rr: '1:1.5-1:2.5', markets: 'Crypto only' },
   ],
 }));
 
@@ -4691,58 +4452,8 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
         // Highest-accuracy ICT scalp: requires time window + liquidity sweep + FVG retest.
         // Fires ONLY during 3 ICT kill zones. Kill zone + sweep + FVG = 3-layer confluence.
         // Research: 68-76% WR when all 3 layers present. Pure institutional model.
-        MICRO_SB(m15, h1, h4, cat) {
-          const c   = Ind.confirmed(m15);
-          if (c.length < 20) return null;
-          const atr  = Ind.atr(c);
-          const last = c[c.length - 1];
-          const prev = c[c.length - 2];
-          const cls  = c.map(x => x.close);
-          const price = cls[cls.length - 1];
+        MICRO_SB() { return null; }, // removed — redundant with SILVER_BULLET
 
-          // Must be in ICT kill zone
-          const nowUTC = new Date();
-          const hUTC = nowUTC.getUTCHours() + nowUTC.getUTCMinutes() / 60;
-          // India kill zones (IST = UTC+5:30): 09:15-10:00 and 14:00-15:15
-          // Crypto kill zones (UTC): London open 08-10, NY open 13-15, NY PM 19-20
-          let inKZ = false;
-          if (cat === 'india') {
-            const hIST = (hUTC + 5.5) % 24;
-            inKZ = (hIST >= 9.25 && hIST <= 10.0) || (hIST >= 14.0 && hIST <= 15.25);
-          } else {
-            inKZ = (hUTC >= 8 && hUTC <= 10) || (hUTC >= 13 && hUTC <= 15) || (hUTC >= 19 && hUTC <= 20);
-          }
-          if (!inKZ) return null;
-
-          // Find fresh FVG (max 3 candles old)
-          const fvgs = Ind.findFVGs(c, atr);
-          const freshFVG = fvgs.filter(f => (c.length - 1 - f.i) <= 3 && (f.top - f.bot) >= atr * 0.4);
-          if (!freshFVG.length) return null;
-
-          // Price must be retesting the FVG right now
-          const fvg = freshFVG[freshFVG.length - 1];
-          const inFVG = price >= fvg.bot - atr * 0.15 && price <= fvg.top + atr * 0.15;
-          if (!inFVG) return null;
-
-          // Require MSS (ChoCh): last candle must close opposite to fvg direction
-          const h1Tr = h1?.length >= 5 ? Ind.trend(h1) : 'NEUTRAL';
-          const isBull = fvg.type === 'bull';
-
-          if (isBull && last.close > last.open && h1Tr !== 'BEARISH') {
-            return { id:'MICRO_SB', name:'Micro Silver Bullet BUY (KZ + FVG retest)', dir:'BUY', score: 82,
-              sl: fvg.bot - atr * 0.5, tp1: price + atr * 1.5, tp2: price + atr * 2.5 };
-          }
-          if (!isBull && last.close < last.open && h1Tr !== 'BULLISH') {
-            return { id:'MICRO_SB', name:'Micro Silver Bullet SELL (KZ + FVG retest)', dir:'SELL', score: 82,
-              sl: fvg.top + atr * 0.5, tp1: price - atr * 1.5, tp2: price - atr * 2.5 };
-          }
-          return null;
-        },
-
-        // ── 2. LIQUIDITY MAGNET SCALP (equal highs/lows + displacement toward them)
-        // Price clusters equal highs/lows → institutions will run them.
-        // When price displaces toward that pool with a strong candle = high-prob entry.
-        // Research: 70-76% WR. Equal levels = resting stop orders = guaranteed target.
         LIQ_MAGNET(m15, h1, h4, cat) {
           const c    = Ind.confirmed(m15);
           if (c.length < 20) return null;
@@ -4838,56 +4549,8 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
         // Classic institutional momentum scalp. When all 3 EMAs stack in order and
         // price pulls back cleanly to the 9 EMA with a rejection candle = high-prob entry.
         // Research: 68-74% WR in trending markets. Extremely clean risk definition.
-        EMA_STACK(m15, h1, h4, cat) {
-          const c    = Ind.confirmed(m15);
-          if (c.length < 55) return null;
-          const cls  = c.map(x => x.close);
-          const atr  = Ind.atr(c);
-          const price = cls[cls.length - 1];
-          const last = c[c.length - 1];
-          const prev = c[c.length - 2];
+        EMA_STACK() { return null; }, // removed — lagging indicator alone
 
-          // Calculate 9, 21, 50 EMAs
-          const ema = (arr, p) => {
-            const k = 2 / (p + 1);
-            let e = arr.slice(0, p).reduce((s,v)=>s+v,0)/p;
-            for (let i = p; i < arr.length; i++) e = arr[i] * k + e * (1 - k);
-            return e;
-          };
-          const e9  = ema(cls, 9);
-          const e21 = ema(cls, 21);
-          const e50 = ema(cls, 50);
-          const h4Tr = h4?.length >= 5 ? Ind.trend(h4) : 'NEUTRAL';
-          const dec  = Ind.dec(price);
-
-          // BULL STACK: 9 > 21 > 50, price pulled back to 9 EMA, rejection
-          if (e9 > e21 && e21 > e50 && h4Tr !== 'BEARISH') {
-            const nearEma9 = price >= e9 - atr * 0.3 && price <= e9 + atr * 0.3;
-            const bullRej  = last.close > last.open && prev.close < prev.open; // prev red, last green
-            const wickRej  = (last.low < e9) && (last.close > e9); // wicked below 9 EMA, closed above
-            if (nearEma9 && (bullRej || wickRej)) {
-              return { id:'EMA_STACK', name:`EMA Stack BUY (9>${e9.toFixed(0)} > 21>${e21.toFixed(0)} > 50>${e50.toFixed(0)})`, dir:'BUY', score: 76,
-                sl: Math.min(last.low, prev.low) - atr * 0.5, tp1: price + atr * 1.5, tp2: price + atr * 2.5 };
-            }
-          }
-          // BEAR STACK: 9 < 21 < 50, price rallied to 9 EMA, rejection
-          if (e9 < e21 && e21 < e50 && h4Tr !== 'BULLISH') {
-            const nearEma9 = price >= e9 - atr * 0.3 && price <= e9 + atr * 0.3;
-            const bearRej  = last.close < last.open && prev.close > prev.open;
-            const wickRej  = (last.high > e9) && (last.close < e9);
-            if (nearEma9 && (bearRej || wickRej)) {
-              return { id:'EMA_STACK', name:`EMA Stack SELL (9<${e9.toFixed(0)} < 21<${e21.toFixed(0)} < 50<${e50.toFixed(0)})`, dir:'SELL', score: 76,
-                sl: Math.max(last.high, prev.high) + atr * 0.5, tp1: price - atr * 1.5, tp2: price - atr * 2.5 };
-            }
-          }
-          return null;
-        },
-
-        // ── 5. OPENING RANGE TRAP (ORB false break + reversal — India only)
-        // India NSE: First 15-min candle sets the range. If price breaks out then
-        // immediately reverses back inside with a strong candle = trapped breakout traders.
-        // Crypto: Uses first H1 range of the UTC session as the "opening range".
-        // Research: 70-76% WR on NSE. One of the most reliable India intraday setups.
         ORB_TRAP(m15, h1, h4, cat) {
           const c    = Ind.confirmed(m15);
           if (c.length < 10) return null;
@@ -5084,7 +4747,7 @@ app.get('/dashboard', (req, res) => {
 
   res.send(`<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hybrid Trading Bot v12.3</title>
+<title>Hybrid Trading Bot v13.1</title>
 <meta http-equiv="refresh" content="30">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -5105,7 +4768,7 @@ app.get('/dashboard', (req, res) => {
   .bar-fill { background: #3fb950; border-radius: 4px; height: 8px; }
   .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; background: #21262d; }
 </style></head><body>
-<h1>🚀 Hybrid Trading Bot v12.3 <span class="tag">${Object.keys(SYMBOLS).length} symbols · 25 strategies</span></h1>
+<h1>🚀 Hybrid Trading Bot v13.1 <span class="tag">${Object.keys(SYMBOLS).length} symbols · 25 strategies</span></h1>
 
 <div class="grid">
   <div class="card"><div class="val ${active.length > 0 ? 'green' : ''}">${active.length}</div><div class="lbl">Active Signals</div></div>
@@ -5146,7 +4809,7 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v12.3 — ICT/SMC ENGINE     ║
+║  HYBRID TRADING BOT v13.1 — ICT/SMC ENGINE     ║
 ║   25 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE (Dhan) · Crypto (Delta Exchange) ║
 ╚══════════════════════════════════════════════════╝
@@ -5158,11 +4821,11 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Crypto:8) | Market hours aut
   // Connect MongoDB and restore state
   await connectMongo();
   await loadPersist();
-  console.log('[v12.3] Waiting 5s before first cycle (CG rate limit buffer)...');
+  console.log('[v13.1] Waiting 5s before first cycle (CG rate limit buffer)...');
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v12.3 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v13.1 Online*
 Markets: India NSE/BSE (Dhan) | Crypto (Delta Exchange + fallbacks)
 Strategies: 22 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -5182,5 +4845,5 @@ ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activat
   cron.schedule('* * * * *', async () => {
     if (!state.running) await checkExpiry();
   });
-  console.log('[v12.3] Cron scheduled: every 15min at :00/:15/:30/:45 + TP/SL every 1min. Bot running.\n');
+  console.log('[v13.1] Cron scheduled: every 15min at :00/:15/:30/:45 + TP/SL every 1min. Bot running.\n');
 });
