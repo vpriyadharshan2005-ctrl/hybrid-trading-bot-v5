@@ -18,7 +18,7 @@ const app = express();
 app.use(express.json());
 
 // ─────────────────────────────────────────────────────────────
-//  HYBRID TRADING BOT v13.1 — ICT/SMC PRECISION ENGINE
+//  HYBRID TRADING BOT v13.2 — ICT/SMC PRECISION ENGINE
 //  22 strategies · M15+M5 entry · H1/H4 structure SL/TP
 //  Markets: India NSE/BSE (Dhan) | Crypto (Delta Exchange + fallbacks)
 // ─────────────────────────────────────────────────────────────
@@ -618,6 +618,8 @@ class Detectors {
       this.rsiDivergence, // RSI Divergence (63-70% WR)
       // ── Cross-Asset ───────────────────────────────────────────────────────
       this.fundingSqueeze, // Funding Rate Squeeze — Crypto only (70-76% WR)
+      this.vwapReversion,  // VWAP Mean Reversion — India only (63-70% WR)
+      this.altcoinRotation, // Altcoin Rotation after BTC impulse — Crypto only (62-70% WR)
       // ── New Strategies ────────────────────────────────────────────────────
       this.displacementEntry, // Displacement + 50% retracement entry (68-75% WR)
       this.niftyObPullback,   // NIFTY H1 OB + M5 pullback (India, 70-76% WR)
@@ -1595,9 +1597,10 @@ class Detectors {
   //  WR: 70-76% | Crypto only
   // ══════════════════════════════════════════════════════════
   static fundingSqueeze(x, m15) {
-    const { cat, price, atr, h4Tr, lastBullBody, lastBearBody, swH, swL } = x;
+    const { cat, price, atr, h1Tr, h4Tr, lastBullBody, lastBearBody, swH, swL } = x;
     if (cat !== 'crypto') return null;
     if (!x.fundingRate) return null;
+    const fr = x.fundingRate; // e.g. 0.0010 = 0.10%
 
     const frHigh = Math.abs(fr) >= 0.0008; // 0.08% threshold
     if (!frHigh) return null;
@@ -1632,6 +1635,122 @@ class Detectors {
       };
     }
     return null;
+  }
+
+  //  SL:    beyond the false break extreme + 0.5 ATR
+  //  TP1:   origin of false break | TP2: H1 swing
+  //  Works: ALL — especially ranging markets, Gold, India, BTC
+  // ══════════════════════════════════════════════════════════
+
+  // ══════════════════════════════════════════════════════════
+  //  VWAP MEAN REVERSION (India only)
+  //  Price >2 std dev from VWAP → fade back to VWAP
+  //  Institutional desks always revert to VWAP intraday
+  //  Entry: M15 close back inside 1.5 std dev after overextension
+  //  SL: Beyond wick extreme + 0.3 ATR | TP1: VWAP | TP2: Opp band
+  //  Markets: India NSE/BSE only (session VWAP)
+  //  WR: 63-70%
+  // ══════════════════════════════════════════════════════════
+  static vwapReversion(x, m15) {
+    const { price, atr, cat, h4Tr, h1Tr, vwap, last, prev, lastBullBody, lastBearBody } = x;
+    if (cat !== 'india') return null;
+    if (!vwap) return null;
+    if (!Market.indiaOpen()) return null;
+
+    const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    d.setHours(9, 15, 0, 0);
+    const sessionStart = d.getTime() - 330 * 60000;
+    const todayC = m15.filter(c => c.time >= sessionStart);
+    if (todayC.length < 4) return null;
+
+    const tps = todayC.map(c => (c.high + c.low + c.close) / 3);
+    const mean = tps.reduce((s, v) => s + v, 0) / tps.length;
+    const variance = tps.reduce((s, v) => s + (v - mean) ** 2, 0) / tps.length;
+    const std = Math.sqrt(variance);
+    if (std < atr * 0.1) return null;
+
+    const vwapUpper2 = vwap + 2 * std;
+    const vwapLower2 = vwap - 2 * std;
+    const vwapUpper1 = vwap + 1.5 * std;
+    const vwapLower1 = vwap - 1.5 * std;
+
+    // BUY: price was below -2 std, now M15 close back above -1.5 std
+    if (prev.low < vwapLower2 && last.close > vwapLower1 && lastBullBody) {
+      const score = 74
+        + (h4Tr === 'BULLISH' ? 8 : 0)
+        + (h1Tr === 'BULLISH' ? 5 : 0)
+        + (price < vwap ? 4 : 0);
+      return {
+        id: 'VWAP_REV', name: `VWAP Mean Reversion BUY (${((vwap - price) / atr).toFixed(1)} ATR below VWAP)`,
+        dir: 'BUY', score,
+        sl_ref: { type: 'vwap_extreme', val: prev.low - atr * 0.3 },
+        tp_ref: { tp1_type: 'vwap', tp1_val: vwap, tp2_val: vwapUpper1 },
+      };
+    }
+    // SELL: price was above +2 std, now M15 close back below +1.5 std
+    if (prev.high > vwapUpper2 && last.close < vwapUpper1 && lastBearBody) {
+      const score = 74
+        + (h4Tr === 'BEARISH' ? 8 : 0)
+        + (h1Tr === 'BEARISH' ? 5 : 0)
+        + (price > vwap ? 4 : 0);
+      return {
+        id: 'VWAP_REV', name: `VWAP Mean Reversion SELL (${((price - vwap) / atr).toFixed(1)} ATR above VWAP)`,
+        dir: 'SELL', score,
+        sl_ref: { type: 'vwap_extreme', val: prev.high + atr * 0.3 },
+        tp_ref: { tp1_type: 'vwap', tp1_val: vwap, tp2_val: vwapLower1 },
+      };
+    }
+    return null;
+  }
+
+  // ══════════════════════════════════════════════════════════
+  //  ALTCOIN ROTATION (Crypto only)
+  //  BTC breaks out >1.5% in 2 candles → buy laggard alt
+  //  Alts always follow BTC impulse with a delay
+  //  Entry: Laggard alt's last M15 close
+  //  SL: Swing low/high - 0.3 ATR | TP1: Mirror BTC move | TP2: 1.5x move
+  //  WR: 62-70% when BTC move is clean (not choppy)
+  // ══════════════════════════════════════════════════════════
+  static altcoinRotation(x, m15) {
+    const { price, atr, cat, last, h1Tr, swL, swH } = x;
+    if (cat !== 'crypto') return null;
+    if (!x.btcMove) return null;
+
+    const btcMove = x.btcMove;
+    const thisMove = x.thisSymMove || 0;
+
+    if (Math.abs(btcMove) < 0.015) return null; // BTC must move >1.5%
+    if (Math.abs(thisMove) >= Math.abs(btcMove) * 0.3) return null; // alt must be lagging
+
+    const isBull = btcMove > 0;
+    if (isBull && last.close < last.open) return null;
+    if (!isBull && last.close > last.open) return null;
+    if (isBull && h1Tr === 'BEARISH') return null;
+    if (!isBull && h1Tr === 'BULLISH') return null;
+
+    const lagRatio = (1 - Math.abs(thisMove) / Math.abs(btcMove)).toFixed(2);
+    const score = 72
+      + (Math.abs(btcMove) >= 0.02 ? 8 : 0)
+      + (Math.abs(thisMove) < 0.003 ? 6 : 0)
+      + (h1Tr === (isBull ? 'BULLISH' : 'BEARISH') ? 5 : 0);
+
+    if (isBull) {
+      const keyL = swL.length ? swL[swL.length - 1].v : price - atr;
+      return {
+        id: 'ALT_ROT', name: `Altcoin Rotation BUY (BTC +${(btcMove*100).toFixed(1)}%, lag ${(lagRatio*100).toFixed(0)}%)`,
+        dir: 'BUY', score,
+        sl_ref: { type: 'swing_low', val: keyL - atr * 0.3 },
+        tp_ref: { tp1_type: 'btc_mirror', tp1_val: price + Math.abs(btcMove) * price, tp2_val: price + Math.abs(btcMove) * price * 1.5 },
+      };
+    } else {
+      const keyH = swH.length ? swH[swH.length - 1].v : price + atr;
+      return {
+        id: 'ALT_ROT', name: `Altcoin Rotation SELL (BTC ${(btcMove*100).toFixed(1)}%, lag ${(lagRatio*100).toFixed(0)}%)`,
+        dir: 'SELL', score,
+        sl_ref: { type: 'swing_high', val: keyH + atr * 0.3 },
+        tp_ref: { tp1_type: 'btc_mirror', tp1_val: price - Math.abs(btcMove) * price, tp2_val: price - Math.abs(btcMove) * price * 1.5 },
+      };
+    }
   }
 
   //  SL:    beyond the false break extreme + 0.5 ATR
@@ -2002,6 +2121,7 @@ class Detectors {
       'GAP_GO': 82, 'SESS_RAID': 82, 'PDH_PDL': 83, 'TURTLE_SOUP': 83,
       'JUDAS_SWING': 84, 'IFVG': 83, 'RSI_DIV': 83,
       'FUNDING_SQZ': 84, 'DISP_ENTRY': 83, 'NIFTY_OB': 84,
+      'VWAP_REV': 83, 'ALT_ROT': 83,
     };
     const stratFloor = stratFloors[best.id] || CONFIG.SIGNAL_QUALITY_MIN;
     if (quality < Math.max(CONFIG.SIGNAL_QUALITY_MIN, stratFloor)) return null;
@@ -2366,6 +2486,22 @@ class Detectors {
           : (h1HighAbove ? f(h1HighAbove.v + h1Atr * 0.3) : f(sig.sl_ref.val + h1Atr * 0.5));
         break;
 
+      case 'VWAP_REV':
+        // SL: beyond the VWAP overextension extreme + 0.8 ATR
+        // Logic: if price goes back beyond the extreme wick, VWAP reversion failed
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
+        break;
+
+      case 'ALT_ROT':
+        // SL: beyond the laggard alt's swing extreme + 0.5 ATR
+        // Logic: BTC rotation thesis fails if alt breaks its own swing structure
+        sl = isBuy
+          ? f(sig.sl_ref.val - atr * 0.8)
+          : f(sig.sl_ref.val + atr * 0.8);
+        break;
+
       default:
         // Fallback: H1 structural SL (always wider than M15 noise)
         sl = isBuy
@@ -2570,6 +2706,18 @@ class Detectors {
         tp2 = isBuy
           ? f(h1HighAboveTP?.v || tp1 + atr * 2.5)
           : f(h1LowBelowTP?.v  || tp1 - atr * 2.5);
+        break;
+
+      case 'VWAP_REV':
+        // TP1 = VWAP (mean) | TP2 = opposite VWAP std dev band
+        tp1 = f(sig.tp_ref.tp1_val); // = VWAP
+        tp2 = f(sig.tp_ref.tp2_val); // = opposite 1.5 std band
+        break;
+
+      case 'ALT_ROT':
+        // TP1 = mirror of BTC move | TP2 = 1.5× BTC move (alts overshoot)
+        tp1 = f(sig.tp_ref.tp1_val);
+        tp2 = f(sig.tp_ref.tp2_val);
         break;
 
       default:
@@ -3871,14 +4019,14 @@ async function runCycle() {
   // ── Pause guard ─────────────────────────────────────────────────────────
   if (state.pauseUntil && Date.now() < state.pauseUntil) {
     const left = Math.ceil((state.pauseUntil - Date.now()) / 60000);
-    console.log(`[v13.1] ⏸ Bot paused — ${left}m remaining`);
+    console.log(`[v13.2] ⏸ Bot paused — ${left}m remaining`);
     return;
   }
   state.running = true;
   const t0 = Date.now();
   try {
   const ist = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-  console.log(`\n[v13.1] ⚡ M15 Cycle — ${ist}`);
+  console.log(`\n[v13.2] ⚡ M15 Cycle — ${ist}`);
 
   // Prefetch all Delta crypto symbols
   const deltaSyms = Object.values(SYMBOLS).filter(s => s.src === 'delta').map(s => s.deltaSymbol);
@@ -3940,7 +4088,7 @@ async function runCycle() {
 
       // ── Disabled symbol check ──────────────────────────────────
       if (CONFIG.DISABLED_SYMBOLS.includes(symbol)) {
-        console.log(`[v13.1] ⏭ ${symbol}: disabled via DISABLED_SYMBOLS`);
+        console.log(`[v13.2] ⏭ ${symbol}: disabled via DISABLED_SYMBOLS`);
         continue;
       }
 
@@ -3957,32 +4105,32 @@ async function runCycle() {
             await tgSend(`🔴 *${catLabel[cfg.cat] || cfg.cat.charAt(0).toUpperCase()+cfg.cat.slice(1)} Market Closed*\n${Market.closedMessage(cfg.cat, symbol)}`);
           }
         }
-        console.log(`[v13.1] 🔴 ${symbol}: ${cfg.cat} market closed`);
+        console.log(`[v13.2] 🔴 ${symbol}: ${cfg.cat} market closed`);
         continue;
       }
 
       // ── Fetch candles ──────────────────────────────────────
       const mtf = await dataFetcher.fetchMTF(symbol);
-      if (!mtf?.m15?.length) { console.log(`[v13.1] ⚠️  No data: ${symbol}`); continue; }
+      if (!mtf?.m15?.length) { console.log(`[v13.2] ⚠️  No data: ${symbol}`); continue; }
 
       // ── Build signal ───────────────────────────────────────
       const sig      = Builder.build(symbol, mtf.m15, mtf.source, mtf, cycleExtras[symbol] || {});
       const curPrice = mtf.m15[mtf.m15.length - 1].close;
 
-      if (!sig) { console.log(`[v13.1] ℹ️  No signal: ${symbol}`); continue; }
+      if (!sig) { console.log(`[v13.2] ℹ️  No signal: ${symbol}`); continue; }
 
       // ── Gate check ─────────────────────────────────────────
       const g = gate.check(sig, curPrice, state.signals.filter(s => s.ts && Date.now() - new Date(s.ts).getTime() < 900000));
       if (!g.ok) {
         cycleBlocked++; state.stats.blocked++;
-        console.log(`[v13.1] 🚫 ${symbol}: ${g.why}`);
+        console.log(`[v13.2] 🚫 ${symbol}: ${g.why}`);
         continue;
       }
 
       // ✅ Max open trades guard
       const openTrades = state.signals.filter(s => !s.expired && !s.slHit).length;
       if (openTrades >= CONFIG.MAX_OPEN_TRADES) {
-        console.log(`[v13.1] ⏸ ${symbol}: max open trades (${openTrades}/${CONFIG.MAX_OPEN_TRADES}) reached`);
+        console.log(`[v13.2] ⏸ ${symbol}: max open trades (${openTrades}/${CONFIG.MAX_OPEN_TRADES}) reached`);
         cycleBlocked++; state.stats.blocked++;
         continue;
       }
@@ -3991,7 +4139,7 @@ async function runCycle() {
       const todayStr = new Date().toISOString().slice(0, 10);
       const todayCount = state.signals.filter(s => s.ts?.slice(0,10) === todayStr).length;
       if (todayCount >= CONFIG.MAX_DAILY_SIGNALS) {
-        console.log(`[v13.1] ⏸ ${symbol}: max daily signals (${todayCount}/${CONFIG.MAX_DAILY_SIGNALS}) reached`);
+        console.log(`[v13.2] ⏸ ${symbol}: max daily signals (${todayCount}/${CONFIG.MAX_DAILY_SIGNALS}) reached`);
         cycleBlocked++; state.stats.blocked++;
         continue;
       }
@@ -4036,11 +4184,11 @@ async function runCycle() {
       cycleSignals++;
       savePersist(); // persist state after every new signal
 
-      console.log(`[v13.1] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
+      console.log(`[v13.2] ✅ ${sig.dir} ${symbol} | Q:${sig.quality} | ${sig.strategy.id} | ${sig.mtf.align} | ${sig.mtf.pd?.zone}`);
       await tgSignal(sig);
       await new Promise(r => setTimeout(r, 500));
 
-    } catch (e) { console.error(`[v13.1] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
+    } catch (e) { console.error(`[v13.2] Error ${symbol}:`, e.message, e.stack?.split('\n')[1]); }
   }
 
 
@@ -4050,7 +4198,7 @@ async function runCycle() {
 
   await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
-  console.log(`[v13.1] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
+  console.log(`[v13.2] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
   } catch (e) {
     console.error('[runCycle] Fatal error:', e.message, e.stack?.split('\n')[1]);
   } finally {
@@ -4062,8 +4210,8 @@ async function runCycle() {
 //  SECTION 9 — API ENDPOINTS
 // ═════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({
-  bot: 'Hybrid Trading Bot v13.1 — ICT/SMC Engine',
-  version: '13.1',
+  bot: 'Hybrid Trading Bot v13.2 — ICT/SMC Engine',
+  version: '13.2',
   strategies: 22,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
@@ -4074,7 +4222,7 @@ app.get('/', (req, res) => res.json({
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
   res.json({
-    status: 'OK', version: '13.1',
+    status: 'OK', version: '13.2',
     uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m ${up%60}s`,
     totalSignals: state.stats.total,
     blocked: state.stats.blocked,
@@ -4123,8 +4271,8 @@ app.get('/api/signals/:symbol',  (req, res) => {
 });
 
 app.get('/api/strategies',       (req, res) => res.json({
-  version: '13.1', total: 22,
-  note: 'All 25 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
+  version: '13.2', total: 22,
+  note: 'All 27 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
   strategies: [
     { id: 'FVG_OB',       name: 'Fair Value Gap + Order Block',  cat: 'SMC', wr: '60-68%', rr: '1:2-1:4' },
     { id: 'LIQ_SWEEP',    name: 'Liquidity Sweep',               cat: 'ICT', wr: '62-70%', rr: '1:2-1:5' },
@@ -4147,6 +4295,10 @@ app.get('/api/strategies',       (req, res) => res.json({
     { id: 'JUDAS_SWING',  name: 'ICT Judas Swing (Session Manipulation)', cat: 'ICT', wr: '70-78%', rr: '1:2-1:4' },
     { id: 'IFVG',         name: 'Inversion FVG (broken FVG flips)',    cat: 'ICT',  wr: '65-72%', rr: '1:2-1:4' },
     { id: 'FUNDING_SQZ',  name: 'Funding Rate Squeeze',                cat: 'QUANT',wr: '65-72%', rr: '1:1.5-1:3', markets: 'Crypto only' },
+    { id: 'VWAP_REV',     name: 'VWAP Mean Reversion',                 cat: 'TECH', wr: '63-70%', rr: '1:1.5-1:2', markets: 'India only' },
+    { id: 'ALT_ROT',      name: 'Altcoin Rotation (BTC impulse lag)',  cat: 'QUANT',wr: '62-70%', rr: '1:1.5-1:2.5', markets: 'Crypto only' },
+    { id: 'DISP_ENTRY',   name: 'Displacement + 50% Retracement',      cat: 'ICT',  wr: '68-75%', rr: '1:2-1:4' },
+    { id: 'NIFTY_OB',     name: 'NIFTY/BANKNIFTY H1 OB Pullback',     cat: 'ICT',  wr: '70-76%', rr: '1:2-1:4', markets: 'India only' },
   ],
 }));
 
@@ -4747,7 +4899,7 @@ app.get('/dashboard', (req, res) => {
 
   res.send(`<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hybrid Trading Bot v13.1</title>
+<title>Hybrid Trading Bot v13.2</title>
 <meta http-equiv="refresh" content="30">
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -4768,7 +4920,7 @@ app.get('/dashboard', (req, res) => {
   .bar-fill { background: #3fb950; border-radius: 4px; height: 8px; }
   .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; background: #21262d; }
 </style></head><body>
-<h1>🚀 Hybrid Trading Bot v13.1 <span class="tag">${Object.keys(SYMBOLS).length} symbols · 25 strategies</span></h1>
+<h1>🚀 Hybrid Trading Bot v13.2 <span class="tag">${Object.keys(SYMBOLS).length} symbols · 27 strategies</span></h1>
 
 <div class="grid">
   <div class="card"><div class="val ${active.length > 0 ? 'green' : ''}">${active.length}</div><div class="lbl">Active Signals</div></div>
@@ -4809,8 +4961,8 @@ app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.listen(CONFIG.PORT, async () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║  HYBRID TRADING BOT v13.1 — ICT/SMC ENGINE     ║
-║   25 strategies · M15+M5 entry · H1/H4 SL-TP    ║
+║  HYBRID TRADING BOT v13.2 — ICT/SMC ENGINE     ║
+║   27 strategies · M15+M5 entry · H1/H4 SL-TP    ║
 ║   India NSE/BSE (Dhan) · Crypto (Delta Exchange) ║
 ╚══════════════════════════════════════════════════╝
 Port: ${CONFIG.PORT} | Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN} | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -4821,11 +4973,11 @@ Symbols: ${Object.keys(SYMBOLS).length} (India:5 · Crypto:8) | Market hours aut
   // Connect MongoDB and restore state
   await connectMongo();
   await loadPersist();
-  console.log('[v13.1] Waiting 5s before first cycle (CG rate limit buffer)...');
+  console.log('[v13.2] Waiting 5s before first cycle (CG rate limit buffer)...');
   await new Promise(r => setTimeout(r, 5000));
   // Startup Telegram notification
   const indiaReady = dhanToken.accessToken !== 'placeholder';
-  await tgSend(`🚀 *Hybrid Trading Bot v13.1 Online*
+  await tgSend(`🚀 *Hybrid Trading Bot v13.2 Online*
 Markets: India NSE/BSE (Dhan) | Crypto (Delta Exchange + fallbacks)
 Strategies: 22 ICT/SMC | Entry: M15+M5 | SL: H1 structure
 Quality gate: ${CONFIG.SIGNAL_QUALITY_MIN}/100 | Cooldown: ${CONFIG.COOLDOWN_MIN}min
@@ -4845,5 +4997,5 @@ ${!indiaReady ? '\n⚠️ India symbols offline\nPOST /api/dhan/token to activat
   cron.schedule('* * * * *', async () => {
     if (!state.running) await checkExpiry();
   });
-  console.log('[v13.1] Cron scheduled: every 15min at :00/:15/:30/:45 + TP/SL every 1min. Bot running.\n');
+  console.log('[v13.2] Cron scheduled: every 15min at :00/:15/:30/:45 + TP/SL every 1min. Bot running.\n');
 });
