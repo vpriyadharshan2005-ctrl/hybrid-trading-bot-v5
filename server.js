@@ -3189,6 +3189,30 @@ class DhanFetcher {
       return null;
     }
   }
+
+  // ── Live LTP (Last Traded Price) for India symbols ────────────────────────
+  // Uses Dhan /v2/marketfeed/ltp — returns real-time NSE index price.
+  // Called right before Telegram send so the signal shows current price.
+  // Falls back silently if token expired or API fails.
+  async fetchLTP(symbol) {
+    const tk = dhanToken.accessToken !== 'placeholder' ? dhanToken.accessToken : null;
+    const cl = dhanToken.clientId    !== 'placeholder' ? dhanToken.clientId    : null;
+    if (!tk || !cl) return null;
+    const cfg = SYMBOLS[symbol];
+    if (!cfg?.dhanId) return null;
+    try {
+      const res = await axios.post(`${CONFIG.DHAN_URL}/v2/marketfeed/ltp`, {
+        [cfg.seg || 'IDX_I']: [cfg.dhanId],
+      }, {
+        headers: { 'access-token': tk, 'client-id': cl, 'Content-Type': 'application/json' },
+        timeout: 5000,
+      });
+      // Dhan response: { data: { IDX_I: { "13": { ltp: 22345.5 } } } }
+      const segData = res.data?.data?.[cfg.seg || 'IDX_I'];
+      const ltp = segData?.[cfg.dhanId]?.ltp;
+      return ltp ? parseFloat(ltp) : null;
+    } catch (_) { return null; }
+  }
 }
 
 class DataFetcher {
@@ -3599,14 +3623,19 @@ async function checkExpiry() {
       }
       continue;
     }
-    // Use live ticker for crypto (more accurate than last candle close)
+    // Use live ticker for real-time TP/SL detection (not stale candle close)
+    // Crypto: Delta Exchange real-time ticker
+    // India: Dhan LTP (real NSE price — catches intracandle TP wicks)
     let price = mtf.data.m15[mtf.data.m15.length - 1].close;
-    if (sig.cat === 'crypto' && sig.source !== 'cache') {
+    if (sig.cat === 'crypto') {
       const cfg2 = SYMBOLS[sig.symbol];
       if (cfg2?.deltaSymbol) {
         const livePx = await delta.fetchLivePrice(cfg2.deltaSymbol).catch(() => null);
         if (livePx && !isNaN(livePx)) price = livePx;
       }
+    } else if (sig.cat === 'india') {
+      const ltpPx = await dataFetcher.dhan.fetchLTP(sig.symbol).catch(() => null);
+      if (ltpPx && !isNaN(ltpPx)) price = ltpPx;
     }
     const isBuy = sig.dir === 'BUY';
     const lvls  = sig.levels;
@@ -3779,9 +3808,23 @@ async function loadPersist() {
     const active = data.signals.filter(s => !s.expired && !s.slHit);
     state.signals = data.signals;
     console.log(`[Persist] ✅ ${data.signals.length} signals (${active.length} active)`);
-    if (active.length) tgSend(`♻️ *Bot Restarted — ${active.length} active signal(s) restored*`).catch(()=>{});
+    if (active.length) {
+      const now = Date.now();
+      const lines = active.map(s => {
+        const age = Math.floor((now - new Date(s.ts).getTime()) / 60000);
+        const expired = s.expiresAt && new Date(s.expiresAt) < new Date();
+        return `${s.dir === 'BUY' ? '🟢' : '🔴'} ${s.symbol} ${s.dir} | Entry: ${s.levels?.entry} | SL: ${s.levels?.sl}` +
+               `\n  TP1: ${s.levels?.tp1}${s.tp1Hit ? ' ✅' : ''} | Age: ${age}min${expired ? ' ⚠️ EXPIRED' : ''}`;
+      }).join('\n─\n');
+      // Mark already-expired signals
+      active.forEach(s => { if (s.expiresAt && new Date(s.expiresAt) < new Date()) s.expired = true; });
+      const stillActive = active.filter(s => !s.expired);
+      tgSend(
+        `♻️ *Bot Restarted — ${stillActive.length} active signal(s) restored*\n` +
+        `⚠️ Check each signal manually — price may have moved during downtime.\n\n${lines}`
+      ).catch(() => {});
+    }
   }
-  // fp removed
   if (data.stats) state.stats = { ...state.stats, ...data.stats };
 }
 
@@ -4148,12 +4191,16 @@ async function runCycle() {
       gate.record(sig);
 
       // ── Enrich with live price (RIGHT before Telegram send) ───────────────
-      // For crypto: fetch real-time ticker from Delta Exchange /v2/tickers
-      // For forex/India: use last confirmed M15 candle close (already fresh)
+      // Crypto: real-time ticker from Delta Exchange /v2/tickers
+      // India: real-time LTP from Dhan /v2/marketfeed/ltp
+      // Fallback: last M15 candle close (already fresh, max 15min old)
       try {
         let livePx = null;
         if (cfg.cat === 'crypto' && cfg.deltaSymbol) {
           livePx = await delta.fetchLivePrice(cfg.deltaSymbol);
+        } else if (cfg.cat === 'india') {
+          livePx = await dataFetcher.dhan.fetchLTP(symbol);
+          if (livePx) console.log(`[Dhan LTP] ${symbol}: ₹${livePx}`);
         }
         if (!livePx) {
           // Fallback: last M15 close (already in signal as entry for most strategies)
@@ -4199,6 +4246,7 @@ async function runCycle() {
   await checkDhanTokenAge();
   state.lastCycle = { signals: cycleSignals, blocked: cycleBlocked, ms: Date.now() - t0, ts: new Date().toISOString() };
   console.log(`[v13.2] ✅ Done — ${cycleSignals} signals | ${cycleBlocked} blocked | ${Date.now() - t0}ms\n`);
+  savePersist(); // auto-save every cycle — survives Render restarts without MongoDB
   } catch (e) {
     console.error('[runCycle] Fatal error:', e.message, e.stack?.split('\n')[1]);
   } finally {
@@ -4212,12 +4260,27 @@ async function runCycle() {
 app.get('/', (req, res) => res.json({
   bot: 'Hybrid Trading Bot v13.2 — ICT/SMC Engine',
   version: '13.2',
-  strategies: 22,
+  strategies: 27,
   symbols: Object.keys(SYMBOLS).length,
   timeframe: 'M15 entry | H1/H4 SL-TP',
-  markets: 'India NSE/BSE · Crypto · Forex · Commodity',
+  markets: 'India NSE/BSE · Crypto (Delta Exchange)',
   status: 'OPERATIONAL',
 }));
+
+// ── /ping — lightweight keepalive for UptimeRobot ──────────────────────────
+// UptimeRobot: monitor type HTTP(s), URL = https://your-bot.onrender.com/ping
+// Interval: every 5 minutes. Expected status: 200.
+// This prevents Render free tier from spinning down between M15 cycles.
+app.get('/ping', (req, res) => {
+  const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
+  res.json({
+    ok: true,
+    uptime: `${Math.floor(up/3600)}h ${Math.floor((up%3600)/60)}m`,
+    lastCycle: state.lastCycle?.ts || 'none',
+    openTrades: state.signals.filter(s => !s.expired && !s.slHit).length,
+    ts: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST',
+  });
+});
 
 app.get('/api/health', (req, res) => {
   const up = Math.floor((Date.now() - state.stats.startTime) / 1000);
@@ -4572,14 +4635,16 @@ Resumes at ${new Date(state.pauseUntil).toLocaleTimeString('en-IN', { timeZone: 
         `/status — show active signals\n` +
         `/pnl — today's P&L + win rate\n` +
         `/stats — signal statistics\n` +
-        `/scan — scalp scan: NIFTY/BNIFTY/BTC/ETH/XRP (market-hours aware)\n` +
+        `/scan — scalp scan: NIFTY/BNIFTY/BTC/ETH/XRP\n` +
         `/pause [mins] — pause signals (default 120min)\n` +
         `/resume — resume signals\n` +
-        `/risk india 6000 — set India risk\n` +
+        `/risk india 6000 — set India risk per trade\n` +
+        `/risk crypto 1700 — set Crypto risk per trade\n` +
         `/disable DOGEUSDT — disable a symbol\n` +
         `/enable DOGEUSDT — enable a symbol\n` +
         `/symbols — list all symbols + status\n` +
-        `/help — this message`;
+        `/help — this message\n\n` +
+        `🌐 UptimeRobot: ping /ping every 5min to keep bot alive`;
       await tgSend(helpMsg);
 
     } else if (cmd === '/scan') {
