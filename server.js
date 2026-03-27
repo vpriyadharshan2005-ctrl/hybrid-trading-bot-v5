@@ -4334,7 +4334,7 @@ app.get('/api/signals/:symbol',  (req, res) => {
 });
 
 app.get('/api/strategies',       (req, res) => res.json({
-  version: '13.2', total: 22,
+  version: '13.2', total: 24,
   note: 'All 27 strategies use M15 entry. SL/TP derived from live candle structure per strategy.',
   strategies: [
     { id: 'FVG_OB',       name: 'Fair Value Gap + Order Block',  cat: 'SMC', wr: '60-68%', rr: '1:2-1:4' },
