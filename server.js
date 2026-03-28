@@ -1978,6 +1978,12 @@ class Detectors {
 
   // ── fundingSqueeze ─────────────────────────────────────────────────────────
 
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Builder — signal construction, quality scoring, SL/TP calculation
+// ═════════════════════════════════════════════════════════════════════════════
+class Builder {
 
   static build(symbol, m15, source, mtfData, extras = {}) {
     if (!m15 || m15.length < 30) return null;
